@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.3.5
+// @version      0.3.6
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.3.5';
+    const VERSION = '0.3.6';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -464,6 +464,9 @@
             if (!actualTotal && totalLogCost) {
                 actualTotal = totalQty > 0 ? Math.round(totalLogCost * (qty / totalQty)) : totalLogCost;
             }
+            const mvEach = catalogItem ? Math.max(0, Number(catalogItem.marketValue || 0)) : 0;
+            const mvTotal = mvEach * qty;
+            const billedTotal = billable(actualTotal, mvTotal);
 
             const duplicate = liveTransactions().find(function (tx) {
                 return tx.type === 'PURCHASE' && tx.apiLogId === id &&
@@ -489,8 +492,9 @@
                 itemId: wl.itemId || itemId,
                 qty: qty,
                 actualTotal: actualTotal,
-                mvTotal: 0,
-                billableTotal: actualTotal,
+                mvTotal: mvTotal,
+                mvEach: mvEach,
+                billableTotal: billedTotal,
                 amount: actualTotal,
                 source: 'Item Market',
                 destination: 'Personal Inventory',
@@ -498,7 +502,7 @@
                 personId: state.settings.playerId,
                 notes: 'API-confirmed Item Market purchase. Seller ID: ' +
                     String(data.seller == null ? 'unknown' : data.seller) +
-                    '. Purchase-time MV pending reconciliation.',
+                    '. Purchase-time MV frozen at ' + money(mvTotal) + (actualTotal > mvTotal && mvTotal > 0 ? '; actual cost was above MV.' : '; billing uses the greater of actual cost or MV.'),
                 ownership: 'PERSONAL',
                 status: 'PENDING',
                 detectionMethod: 'API_CONFIRMED',
@@ -572,7 +576,7 @@
                 if (!item) return;
                 const id = String(item.id || item.item_id || '').trim();
                 const name = String(item.name || item.item_name || '').trim();
-                if (id && name) out.push({ id: id, name: name });
+                if (id && name) out.push({ id: id, name: name, marketValue: Number(item.market_value || item.marketValue || item.value || 0) || 0 });
             });
         } else if (source && typeof source === 'object') {
             Object.keys(source).forEach(function (key) {
@@ -580,7 +584,7 @@
                 if (!item || typeof item !== 'object') return;
                 const id = String(item.id || item.item_id || key || '').trim();
                 const name = String(item.name || item.item_name || '').trim();
-                if (id && name) out.push({ id: id, name: name });
+                if (id && name) out.push({ id: id, name: name, marketValue: Number(item.market_value || item.marketValue || item.value || 0) || 0 });
             });
         }
         return out.sort(function (a, b) { return a.name.localeCompare(b.name); });
@@ -868,7 +872,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.3.5 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.3.6 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -1010,9 +1014,9 @@
             Number(tx.mvTotal || 0) ? 'MV at Event: ' + money(tx.mvTotal) : null,
             tx.type === 'PURCHASE' ? 'Billable: ' + money(tx.billableTotal) : null,
             tx.type === 'PURCHASE'
-                ? 'Pricing Rule: ' + (aboveMV
-                    ? 'Actual cost used - purchase was above MV'
-                    : 'MV used when purchase cost was below MV')
+                ? 'Pricing Rule: ' + (Number(tx.mvTotal || 0) <= 0
+                    ? 'MV unavailable - actual cost used'
+                    : (aboveMV ? 'Actual cost used - purchase was above MV' : 'MV used when purchase cost was at or below MV'))
                 : null,
             'Status: ' + tx.status,
             tx.notes ? 'Notes: ' + tx.notes : null
@@ -1127,7 +1131,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release recognizes the observed Torn Item Market purchase log structure (items[], cost_total, cost_each, seller), resolves item IDs through the Torn item catalog, and creates Pending whitelisted purchases automatically while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
+            'v' + VERSION + ' performs no Torn game actions. This release freezes Torn item market value at purchase detection and bills the greater of actual purchase cost or purchase-time MV for API-confirmed Item Market purchases while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
         '</div></div>';
     }
 
