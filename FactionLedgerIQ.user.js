@@ -1,0 +1,836 @@
+// ==UserScript==
+// @name         FactionLedgerIQ
+// @namespace    FactionLedgerIQ
+// @version      0.1.0
+// @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
+// @match        *://www.torn.com/*
+// @match        *://torn.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const VERSION = '0.1.0';
+    const STATE_KEY = 'factionledgeriq_state_v1';
+    const DOCK_ID = 'factionledgeriq-dock-btn';
+    const PANEL_ID = 'factionledgeriq-panel';
+    const STYLE_ID = 'factionledgeriq-style';
+
+    const EVENT_TYPES = [
+        ['PURCHASE', 'Personal Purchase'],
+        ['ARMORY_IN', 'Deposit to Faction Armory'],
+        ['ARMORY_OUT', 'Withdraw from Faction Armory'],
+        ['DISPLAY_IN', 'Add to Display Case'],
+        ['DISPLAY_OUT', 'Remove from Display Case'],
+        ['SALE', 'Faction Item Sale'],
+        ['FACTION_BALANCE_IN', 'Deposit Sale Proceeds to Faction Balance'],
+        ['REFUND', 'Faction Reimbursement / Refund'],
+        ['FACTION_COLLECTION', 'Faction Collects Sale Proceeds']
+    ];
+
+    const DEFAULT_STATE = {
+        schemaVersion: 1,
+        settings: { playerName: '', playerId: '', factionName: '' },
+        whitelist: [],
+        transactions: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+    };
+
+    let state = loadState();
+    let activeTab = 'dashboard';
+    let dockObserver = null;
+    let dockQueued = false;
+
+    function clone(v) { return JSON.parse(JSON.stringify(v)); }
+
+    function loadState() {
+        try {
+            const raw = localStorage.getItem(STATE_KEY);
+            if (!raw) return clone(DEFAULT_STATE);
+            const parsed = JSON.parse(raw);
+            return {
+                ...clone(DEFAULT_STATE),
+                ...parsed,
+                settings: { ...DEFAULT_STATE.settings, ...(parsed.settings || {}) },
+                whitelist: Array.isArray(parsed.whitelist) ? parsed.whitelist : [],
+                transactions: Array.isArray(parsed.transactions) ? parsed.transactions : []
+            };
+        } catch (e) {
+            console.warn('[FactionLedgerIQ] State load failed', e);
+            return clone(DEFAULT_STATE);
+        }
+    }
+
+    function saveState() {
+        state.updatedAt = new Date().toISOString();
+        localStorage.setItem(STATE_KEY, JSON.stringify(state));
+        render();
+    }
+
+    function uid(prefix) {
+        return (prefix || 'FLIQ') + '-' +
+            Date.now().toString(36).toUpperCase() + '-' +
+            Math.random().toString(36).slice(2, 8).toUpperCase();
+    }
+
+    function esc(v) {
+        return String(v == null ? '' : v)
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;')
+            .replaceAll("'", '&#039;');
+    }
+
+    function money(v) {
+        return '$' + Math.round(Number(v || 0)).toLocaleString();
+    }
+
+    function liveTransactions() {
+        return state.transactions.filter(function (tx) { return tx.status !== 'VOID'; });
+    }
+
+    function childrenOf(parentId, type) {
+        return liveTransactions().filter(function (tx) {
+            return tx.parentId === parentId && (!type || tx.type === type);
+        });
+    }
+
+    function billable(actualTotal, mvTotal) {
+        return Math.max(Number(actualTotal || 0), Number(mvTotal || 0));
+    }
+
+    function actor(tx) {
+        const name = tx.personName || state.settings.playerName || 'Unknown';
+        const id = tx.personId || state.settings.playerId || '';
+        return id ? name + ' [' + id + ']' : name;
+    }
+
+    function balances() {
+        let factionOwesMe = 0;
+        let iOweFaction = 0;
+        let readyToCollect = 0;
+        let assetsHeld = 0;
+        let pending = 0;
+
+        liveTransactions().forEach(function (tx) {
+            if (tx.type === 'PURCHASE') {
+                const deposited = tx.status === 'DEPOSITED' ||
+                    childrenOf(tx.id, 'ARMORY_IN').length ||
+                    childrenOf(tx.id, 'DISPLAY_IN').length;
+                const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
+                    return sum + Number(r.amount || r.actualTotal || 0);
+                }, 0);
+
+                if (deposited) {
+                    factionOwesMe += Math.max(0, Number(tx.billableTotal || 0) - refunded);
+                } else {
+                    pending += 1;
+                }
+            }
+
+            if (tx.type === 'SALE') {
+                const deposited = childrenOf(tx.id, 'FACTION_BALANCE_IN').reduce(function (sum, r) {
+                    return sum + Number(r.amount || 0);
+                }, 0);
+                const collected = childrenOf(tx.id, 'FACTION_COLLECTION').reduce(function (sum, r) {
+                    return sum + Number(r.amount || 0);
+                }, 0);
+                const saleAmount = Number(tx.amount || tx.actualTotal || 0);
+
+                iOweFaction += Math.max(0, saleAmount - deposited - collected);
+                readyToCollect += Math.max(0, deposited - collected);
+            }
+
+            if (tx.type === 'ARMORY_OUT' &&
+                tx.ownership === 'FACTION' &&
+                (tx.status === 'HELD' || tx.status === 'DISPLAY')) {
+                assetsHeld += Number(tx.currentValue || tx.mvTotal || 0);
+            }
+        });
+
+        return { factionOwesMe, iOweFaction, readyToCollect, assetsHeld, pending };
+    }
+
+    function injectStyles() {
+        if (document.getElementById(STYLE_ID)) return;
+
+        const css = [
+            '#' + DOCK_ID + '{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;width:24px;height:24px;padding:0;border-radius:4px;background:#26384d;color:#fff;border:1px solid rgba(255,255,255,.28);font-weight:800;font-size:14px;line-height:1}',
+            '#' + PANEL_ID + '{position:fixed;z-index:2147483000;inset:6vh 2vw auto 2vw;max-width:760px;margin:0 auto;background:#111820;color:#e8edf2;border:1px solid #3b4652;border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.55);font-family:Arial,sans-serif;overflow:hidden}',
+            '#' + PANEL_ID + '.fliq-hidden{display:none}',
+            '#' + PANEL_ID + ' *{box-sizing:border-box}',
+            '.fliq-head{display:flex;align-items:center;justify-content:space-between;padding:11px 12px;background:#18222d;border-bottom:1px solid #34404c}',
+            '.fliq-title{font-weight:800}.fliq-title small{opacity:.55;font-weight:400;margin-left:6px}',
+            '.fliq-close,.fliq-btn{border:1px solid #4a5968;background:#22303e;color:#fff;border-radius:7px;padding:8px 10px}',
+            '.fliq-close{font-size:18px;padding:2px 9px}',
+            '.fliq-tabs{display:flex;overflow-x:auto;background:#141d26;border-bottom:1px solid #34404c}',
+            '.fliq-tab{flex:0 0 auto;border:0;background:transparent;color:#aeb8c2;padding:10px 11px;font-weight:700}',
+            '.fliq-tab.fliq-active{color:#fff;border-bottom:2px solid #6ea8fe}',
+            '.fliq-body{padding:12px;max-height:78vh;overflow:auto}',
+            '.fliq-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}',
+            '.fliq-card,.fliq-item{background:#18222d;border:1px solid #34404c;border-radius:9px;padding:10px}',
+            '.fliq-card b{display:block;font-size:19px;margin-top:5px}',
+            '.fliq-muted{opacity:.66;font-size:12px}.fliq-good{color:#7ddc9b}.fliq-warn{color:#ffcf70}.fliq-bad{color:#ff8d8d}',
+            '.fliq-section{margin:12px 0}.fliq-section h3{margin:0 0 8px;font-size:14px}',
+            '.fliq-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:7px 0}',
+            '.fliq-field{display:flex;flex-direction:column;gap:4px}.fliq-field label{font-size:11px;opacity:.72}',
+            '.fliq-field input,.fliq-field select,.fliq-field textarea{width:100%;border:1px solid #42505f;background:#0f151c;color:#fff;border-radius:6px;padding:8px}',
+            '.fliq-field textarea{min-height:64px;resize:vertical}',
+            '.fliq-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}',
+            '.fliq-btn{cursor:pointer}.fliq-btn-primary{background:#315b86}.fliq-btn-danger{background:#69363b}',
+            '.fliq-list{display:flex;flex-direction:column;gap:7px}.fliq-item-top{display:flex;justify-content:space-between;gap:8px}',
+            '.fliq-pill{display:inline-block;padding:2px 6px;border-radius:999px;background:#293746;font-size:10px}',
+            '.fliq-empty{text-align:center;padding:24px 10px;opacity:.55}',
+            '@media(max-width:560px){.fliq-row{grid-template-columns:1fr}.fliq-grid{grid-template-columns:1fr 1fr}.fliq-tab{padding:9px 8px;font-size:12px}}'
+        ].join('');
+
+        const style = document.createElement('style');
+        style.id = STYLE_ID;
+        style.textContent = css;
+        document.head.appendChild(style);
+    }
+
+    function findDockAnchor() {
+        return document.getElementById('notes_panel_button') ||
+            document.getElementById('people_panel_button');
+    }
+
+    function ensureDockButton() {
+        if (document.getElementById(DOCK_ID)) return;
+
+        const anchor = findDockAnchor();
+        if (!anchor || !anchor.parentNode) return;
+
+        const btn = document.createElement('button');
+        btn.id = DOCK_ID;
+        btn.type = 'button';
+        btn.className = anchor.className;
+        btn.textContent = 'L';
+        btn.title = 'FactionLedgerIQ v' + VERSION;
+        btn.setAttribute('aria-label', 'Open FactionLedgerIQ');
+
+        const box = anchor.getBoundingClientRect();
+        if (box.width >= 18 && box.width <= 64) btn.style.width = Math.round(box.width) + 'px';
+        if (box.height >= 18 && box.height <= 64) btn.style.height = Math.round(box.height) + 'px';
+
+        btn.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            togglePanel();
+        });
+
+        anchor.parentNode.appendChild(btn);
+    }
+
+    function startDockObserver() {
+        if (dockObserver) return;
+
+        dockObserver = new MutationObserver(function () {
+            if (dockQueued) return;
+            dockQueued = true;
+
+            requestAnimationFrame(function () {
+                dockQueued = false;
+                ensureDockButton();
+            });
+        });
+
+        dockObserver.observe(document.body || document.documentElement, {
+            childList: true,
+            subtree: true
+        });
+    }
+
+    function ensurePanel() {
+        if (document.getElementById(PANEL_ID)) return;
+
+        const panel = document.createElement('section');
+        panel.id = PANEL_ID;
+        panel.className = 'fliq-hidden';
+        panel.innerHTML =
+            '<div class="fliq-head">' +
+                '<div class="fliq-title">FactionLedgerIQ <small>v' + VERSION + '</small></div>' +
+                '<button class="fliq-close" data-fliq="close">×</button>' +
+            '</div>' +
+            '<div class="fliq-tabs">' +
+                ['dashboard','pending','inventory','receipts','history','settings'].map(function (t) {
+                    return '<button class="fliq-tab" data-tab="' + t + '">' +
+                        t.charAt(0).toUpperCase() + t.slice(1) + '</button>';
+                }).join('') +
+            '</div>' +
+            '<div class="fliq-body"></div>';
+
+        document.body.appendChild(panel);
+        panel.addEventListener('click', handleClick);
+        panel.addEventListener('submit', handleSubmit);
+        render();
+    }
+
+    function togglePanel(force) {
+        ensurePanel();
+        const panel = document.getElementById(PANEL_ID);
+        const open = force === true ||
+            (force !== false && panel.classList.contains('fliq-hidden'));
+        panel.classList.toggle('fliq-hidden', !open);
+        if (open) render();
+    }
+
+    function render() {
+        const panel = document.getElementById(PANEL_ID);
+        if (!panel) return;
+
+        panel.querySelectorAll('.fliq-tab').forEach(function (btn) {
+            btn.classList.toggle('fliq-active', btn.dataset.tab === activeTab);
+        });
+
+        const body = panel.querySelector('.fliq-body');
+        if (activeTab === 'dashboard') body.innerHTML = renderDashboard();
+        if (activeTab === 'pending') body.innerHTML = renderPending();
+        if (activeTab === 'inventory') body.innerHTML = renderInventory();
+        if (activeTab === 'receipts') body.innerHTML = renderReceipts();
+        if (activeTab === 'history') body.innerHTML = renderHistory();
+        if (activeTab === 'settings') body.innerHTML = renderSettings();
+    }
+
+    function renderDashboard() {
+        const b = balances();
+
+        return '<div class="fliq-grid">' +
+            card('Faction owes me', money(b.factionOwesMe), 'fliq-good') +
+            card('I owe faction', money(b.iOweFaction), 'fliq-bad') +
+            card('Ready for faction to collect', money(b.readyToCollect), 'fliq-warn') +
+            card('Faction assets held', money(b.assetsHeld), '') +
+        '</div>' +
+        '<div class="fliq-section"><h3>Quick Record</h3>' + eventForm() + '</div>' +
+        '<div class="fliq-section"><h3>Ledger Status</h3>' +
+            '<div class="fliq-card">' +
+                '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
+                '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
+                '<div>' + b.pending + ' pending purchase(s)</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.1.0 is the accounting foundation. Automatic Torn detection comes after the base UI and storage are verified in TornPDA.</div>' +
+            '</div>' +
+        '</div>';
+    }
+
+    function card(label, value, cls) {
+        return '<div class="fliq-card"><span class="fliq-muted">' + esc(label) +
+            '</span><b class="' + cls + '">' + esc(value) + '</b></div>';
+    }
+
+    function eventForm() {
+        return '<form id="fliq-event-form" class="fliq-card">' +
+            row(
+                field('Event', '<select name="type">' + EVENT_TYPES.map(function (x) {
+                    return '<option value="' + x[0] + '">' + esc(x[1]) + '</option>';
+                }).join('') + '</select>'),
+                field('Item name', '<input name="itemName" required placeholder="e.g. Xanax">')
+            ) +
+            row(
+                field('Torn item ID (optional)', '<input name="itemId" inputmode="numeric">'),
+                field('Quantity', '<input name="qty" type="number" min="1" value="1" required>')
+            ) +
+            row(
+                field('Actual total / amount', '<input name="actualTotal" type="number" min="0" step="1" placeholder="0">'),
+                field('Market value total', '<input name="mvTotal" type="number" min="0" step="1" placeholder="0">')
+            ) +
+            row(
+                field('Source', '<input name="source" placeholder="Item Market, Bazaar, Armory...">'),
+                field('Destination', '<input name="destination" placeholder="Armory, Display Case...">')
+            ) +
+            row(
+                field('Person name', '<input name="personName" value="' + esc(state.settings.playerName) + '">'),
+                field('Torn ID', '<input name="personId" value="' + esc(state.settings.playerId) + '">')
+            ) +
+            field('Notes', '<textarea name="notes"></textarea>') +
+            '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Record Event</button></div>' +
+        '</form>';
+    }
+
+    function row(a, b) {
+        return '<div class="fliq-row">' + a + b + '</div>';
+    }
+
+    function field(label, control) {
+        return '<div class="fliq-field"><label>' + esc(label) + '</label>' + control + '</div>';
+    }
+
+    function pendingTransactions() {
+        return liveTransactions().filter(function (tx) {
+            return (tx.type === 'PURCHASE' || tx.type === 'ARMORY_OUT') && tx.status === 'PENDING';
+        });
+    }
+
+    function renderPending() {
+        const list = pendingTransactions();
+        if (!list.length) return '<div class="fliq-empty">No pending actions.</div>';
+        return '<div class="fliq-list">' + list.map(function (tx) {
+            return transactionCard(tx, true);
+        }).join('') + '</div>';
+    }
+
+    function displayInventory() {
+        const map = new Map();
+
+        liveTransactions().forEach(function (tx) {
+            const key = String(tx.itemId || tx.itemName || '').toLowerCase();
+            if (!key) return;
+
+            if (!map.has(key)) {
+                map.set(key, { itemName: tx.itemName, itemId: tx.itemId, qty: 0, factionQty: 0 });
+            }
+
+            const item = map.get(key);
+
+            if (tx.type === 'DISPLAY_IN') {
+                item.qty += Number(tx.qty || 0);
+                if (tx.ownership === 'FACTION') item.factionQty += Number(tx.qty || 0);
+            }
+
+            if (tx.type === 'DISPLAY_OUT') {
+                item.qty -= Number(tx.qty || 0);
+                if (tx.ownership === 'FACTION') item.factionQty -= Number(tx.qty || 0);
+            }
+        });
+
+        return Array.from(map.values()).filter(function (x) { return x.qty !== 0; });
+    }
+
+    function renderInventory() {
+        const inventory = displayInventory();
+
+        const inventoryHtml = inventory.length
+            ? '<div class="fliq-list">' + inventory.map(function (x) {
+                return '<div class="fliq-item"><b>' + esc(x.itemName) + '</b>' +
+                    '<div>Tracked qty: ' + Number(x.qty).toLocaleString() + '</div>' +
+                    '<div class="fliq-muted">Faction-owned qty: ' + Number(x.factionQty).toLocaleString() + '</div></div>';
+            }).join('') + '</div>'
+            : '<div class="fliq-empty">No display-case movements recorded yet.</div>';
+
+        const whitelistHtml = state.whitelist.length
+            ? state.whitelist.map(function (w) {
+                return '<div class="fliq-item fliq-item-top"><span>' + esc(w.itemName) +
+                    (w.itemId ? ' <span class="fliq-muted">#' + esc(w.itemId) + '</span>' : '') +
+                    '</span><button class="fliq-btn fliq-btn-danger" data-fliq="remove-whitelist" data-id="' +
+                    esc(w.id) + '">Remove</button></div>';
+            }).join('')
+            : '<div class="fliq-empty">Whitelist is empty.</div>';
+
+        return '<div class="fliq-section"><h3>Display Case Ledger</h3>' + inventoryHtml + '</div>' +
+            '<div class="fliq-section"><h3>Whitelist</h3>' +
+                '<form id="fliq-whitelist-form" class="fliq-card">' +
+                    row(
+                        field('Item name', '<input name="itemName" required>'),
+                        field('Torn item ID (optional)', '<input name="itemId" inputmode="numeric">')
+                    ) +
+                    '<button class="fliq-btn fliq-btn-primary" type="submit">Add to Whitelist</button>' +
+                '</form>' +
+                '<div class="fliq-list" style="margin-top:8px">' + whitelistHtml + '</div>' +
+            '</div>';
+    }
+
+    function receiptText(tx) {
+        const aboveMV = Number(tx.actualTotal || 0) > Number(tx.mvTotal || 0) &&
+            Number(tx.mvTotal || 0) > 0;
+
+        return [
+            'FACTIONLEDGERIQ RECEIPT',
+            'Transaction: ' + tx.id,
+            'Date: ' + new Date(tx.timestamp).toLocaleString(),
+            'Person: ' + actor(tx),
+            'Event: ' + tx.type,
+            'Item: ' + tx.itemName + (tx.itemId ? ' [Item ' + tx.itemId + ']' : ''),
+            'Quantity: ' + Number(tx.qty || 0).toLocaleString(),
+            tx.source ? 'Source: ' + tx.source : null,
+            tx.destination ? 'Destination: ' + tx.destination : null,
+            tx.ownership ? 'Ownership: ' + tx.ownership : null,
+            Number(tx.actualTotal || 0) ? 'Actual Cost/Amount: ' + money(tx.actualTotal) : null,
+            Number(tx.mvTotal || 0) ? 'MV at Event: ' + money(tx.mvTotal) : null,
+            tx.type === 'PURCHASE' ? 'Billable: ' + money(tx.billableTotal) : null,
+            tx.type === 'PURCHASE'
+                ? 'Pricing Rule: ' + (aboveMV
+                    ? 'Actual cost used - purchase was above MV'
+                    : 'MV used when purchase cost was below MV')
+                : null,
+            'Status: ' + tx.status,
+            tx.notes ? 'Notes: ' + tx.notes : null
+        ].filter(Boolean).join('\n');
+    }
+
+    function renderReceipts() {
+        const txs = state.transactions.slice().reverse();
+        if (!txs.length) return '<div class="fliq-empty">No receipts yet.</div>';
+
+        return '<div class="fliq-list">' + txs.map(function (tx) {
+            return '<div class="fliq-item">' +
+                '<div class="fliq-item-top"><b>' + esc(tx.itemName) + ' × ' +
+                    Number(tx.qty || 0).toLocaleString() + '</b><span class="fliq-pill">' +
+                    esc(tx.type) + '</span></div>' +
+                '<div class="fliq-muted">' + esc(tx.id) + ' · ' +
+                    esc(new Date(tx.timestamp).toLocaleString()) + '</div>' +
+                '<div class="fliq-actions"><button class="fliq-btn" data-fliq="copy-receipt" data-id="' +
+                    esc(tx.id) + '">Copy Discord Receipt</button></div>' +
+            '</div>';
+        }).join('') + '</div>';
+    }
+
+    function transactionCard(tx, pendingActions) {
+        let actions = '';
+
+        if (pendingActions && tx.type === 'PURCHASE') {
+            actions =
+                '<div class="fliq-actions">' +
+                    '<button class="fliq-btn" data-fliq="purchase-armory" data-id="' + esc(tx.id) + '">Deposited to Armory</button>' +
+                    '<button class="fliq-btn" data-fliq="purchase-display" data-id="' + esc(tx.id) + '">Deposited to Display</button>' +
+                '</div>';
+        }
+
+        if (pendingActions && tx.type === 'ARMORY_OUT') {
+            actions =
+                '<div class="fliq-actions">' +
+                    '<button class="fliq-btn" data-fliq="armory-display" data-id="' + esc(tx.id) + '">Hold in Display</button>' +
+                    '<button class="fliq-btn" data-fliq="armory-sell" data-id="' + esc(tx.id) + '">Sell for Faction</button>' +
+                    '<button class="fliq-btn" data-fliq="armory-other" data-id="' + esc(tx.id) + '">Other</button>' +
+                '</div>';
+        }
+
+        return '<div class="fliq-item">' +
+            '<div class="fliq-item-top"><b>' + esc(tx.itemName) + ' × ' +
+                Number(tx.qty || 0).toLocaleString() + '</b><span class="fliq-pill">' +
+                esc(tx.type) + '</span></div>' +
+            '<div>' + esc(actor(tx)) + ' · ' + esc(new Date(tx.timestamp).toLocaleString()) + '</div>' +
+            (tx.type === 'PURCHASE'
+                ? '<div>Actual ' + money(tx.actualTotal) + ' · MV ' + money(tx.mvTotal) +
+                    ' · Billable <b>' + money(tx.billableTotal) + '</b></div>'
+                : '') +
+            '<div class="fliq-muted">' + esc(tx.source || '') +
+                (tx.source && tx.destination ? ' → ' : '') + esc(tx.destination || '') +
+                ' · ' + esc(tx.status) + '</div>' +
+            actions +
+            '<div class="fliq-actions">' +
+                '<button class="fliq-btn" data-fliq="copy-receipt" data-id="' + esc(tx.id) + '">Receipt</button>' +
+                (tx.status !== 'VOID'
+                    ? '<button class="fliq-btn fliq-btn-danger" data-fliq="void" data-id="' + esc(tx.id) + '">Void</button>'
+                    : '') +
+            '</div>' +
+        '</div>';
+    }
+
+    function renderHistory() {
+        const txs = state.transactions.slice().reverse();
+        if (!txs.length) return '<div class="fliq-empty">Ledger is empty.</div>';
+        return '<div class="fliq-list">' + txs.map(function (tx) {
+            return transactionCard(tx, false);
+        }).join('') + '</div>';
+    }
+
+    function renderSettings() {
+        return '<form id="fliq-settings-form" class="fliq-card">' +
+            row(
+                field('Your Torn name', '<input name="playerName" value="' + esc(state.settings.playerName) + '" required>'),
+                field('Your Torn ID', '<input name="playerId" value="' + esc(state.settings.playerId) + '" required>')
+            ) +
+            field('Faction name (optional)', '<input name="factionName" value="' + esc(state.settings.factionName) + '">') +
+            '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button></div>' +
+        '</form>' +
+        '<div class="fliq-section"><h3>Backup & Restore</h3><div class="fliq-card">' +
+            '<div class="fliq-muted">Ledger data is stored locally in TornPDA/browser storage. Export backups regularly.</div>' +
+            '<div class="fliq-actions">' +
+                '<button class="fliq-btn" data-fliq="copy-backup">Copy JSON Backup</button>' +
+                '<button class="fliq-btn" data-fliq="download-backup">Download Backup</button>' +
+                '<button class="fliq-btn" data-fliq="import-backup">Import Backup</button>' +
+            '</div>' +
+            '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
+        '</div></div>' +
+        '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
+            'v' + VERSION + ' performs no Torn game actions. This release provides the ledger, accounting rules, whitelist, receipts, manual event testing, backup/restore, and TornPDA docked launcher.' +
+        '</div></div>';
+    }
+
+    function formValue(fd, key) {
+        return String(fd.get(key) || '').trim();
+    }
+
+    function handleSubmit(e) {
+        e.preventDefault();
+        const form = e.target;
+        const fd = new FormData(form);
+
+        if (form.id === 'fliq-settings-form') {
+            state.settings.playerName = formValue(fd, 'playerName');
+            state.settings.playerId = formValue(fd, 'playerId');
+            state.settings.factionName = formValue(fd, 'factionName');
+            saveState();
+            toast('Settings saved');
+            return;
+        }
+
+        if (form.id === 'fliq-whitelist-form') {
+            const itemName = formValue(fd, 'itemName');
+            if (!itemName) return;
+
+            state.whitelist.push({
+                id: uid('WL'),
+                itemName: itemName,
+                itemId: formValue(fd, 'itemId'),
+                createdAt: new Date().toISOString()
+            });
+
+            saveState();
+            toast('Added to whitelist');
+            return;
+        }
+
+        if (form.id === 'fliq-event-form') {
+            const type = formValue(fd, 'type');
+            const qty = Math.max(1, Number(fd.get('qty') || 1));
+            const actualTotal = Math.max(0, Number(fd.get('actualTotal') || 0));
+            const mvTotal = Math.max(0, Number(fd.get('mvTotal') || 0));
+
+            state.transactions.push({
+                id: uid('TX'),
+                chainId: uid('CHAIN'),
+                parentId: null,
+                type: type,
+                timestamp: new Date().toISOString(),
+                itemName: formValue(fd, 'itemName'),
+                itemId: formValue(fd, 'itemId'),
+                qty: qty,
+                actualTotal: actualTotal,
+                mvTotal: mvTotal,
+                billableTotal: type === 'PURCHASE' ? billable(actualTotal, mvTotal) : 0,
+                amount: actualTotal,
+                source: formValue(fd, 'source'),
+                destination: formValue(fd, 'destination'),
+                personName: formValue(fd, 'personName'),
+                personId: formValue(fd, 'personId'),
+                notes: formValue(fd, 'notes'),
+                ownership: type === 'ARMORY_OUT' ? 'FACTION' : (type === 'PURCHASE' ? 'PERSONAL' : ''),
+                status: (type === 'PURCHASE' || type === 'ARMORY_OUT') ? 'PENDING' : 'RECORDED',
+                createdAt: new Date().toISOString()
+            });
+
+            saveState();
+            form.reset();
+            toast('Event recorded');
+        }
+    }
+
+    function addChild(parent, type, overrides) {
+        const child = {
+            ...clone(parent),
+            id: uid('TX'),
+            type: type,
+            parentId: parent.id,
+            chainId: parent.chainId || parent.id,
+            timestamp: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
+            actualTotal: 0,
+            billableTotal: 0,
+            amount: 0,
+            notes: '',
+            status: 'RECORDED',
+            ...(overrides || {})
+        };
+
+        state.transactions.push(child);
+        return child;
+    }
+
+    function handleClick(e) {
+        const tab = e.target.closest('[data-tab]');
+        if (tab) {
+            activeTab = tab.dataset.tab;
+            render();
+            return;
+        }
+
+        const btn = e.target.closest('[data-fliq]');
+        if (!btn) return;
+
+        const action = btn.dataset.fliq;
+        const id = btn.dataset.id;
+        const tx = state.transactions.find(function (x) { return x.id === id; });
+
+        if (action === 'close') {
+            togglePanel(false);
+            return;
+        }
+
+        if (action === 'remove-whitelist') {
+            state.whitelist = state.whitelist.filter(function (x) { return x.id !== id; });
+            saveState();
+            return;
+        }
+
+        if (action === 'copy-receipt' && tx) {
+            copyText(receiptText(tx)).then(function () { toast('Receipt copied'); });
+            return;
+        }
+
+        if (action === 'void' && tx) {
+            const reason = prompt('Reason for void/correction?');
+            if (reason === null) return;
+            tx.status = 'VOID';
+            tx.voidReason = reason.trim() || 'Voided by user';
+            tx.voidedAt = new Date().toISOString();
+            saveState();
+            toast('Transaction voided; audit retained');
+            return;
+        }
+
+        if (action === 'purchase-armory' && tx) {
+            tx.status = 'DEPOSITED';
+            addChild(tx, 'ARMORY_IN', {
+                source: 'Personal Inventory',
+                destination: 'Faction Armory',
+                ownership: 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT'
+            });
+            saveState();
+            return;
+        }
+
+        if (action === 'purchase-display' && tx) {
+            tx.status = 'DEPOSITED';
+            addChild(tx, 'DISPLAY_IN', {
+                source: 'Personal Inventory',
+                destination: 'Display Case',
+                ownership: 'FACTION_AFTER_BILLING'
+            });
+            saveState();
+            return;
+        }
+
+        if (action === 'armory-display' && tx) {
+            tx.status = 'DISPLAY';
+            addChild(tx, 'DISPLAY_IN', {
+                source: 'Faction Armory',
+                destination: 'Display Case',
+                ownership: 'FACTION'
+            });
+            saveState();
+            return;
+        }
+
+        if (action === 'armory-sell' && tx) {
+            tx.status = 'HELD';
+            tx.notes = [tx.notes, 'Purpose: Sell for faction'].filter(Boolean).join(' | ');
+            saveState();
+            return;
+        }
+
+        if (action === 'armory-other' && tx) {
+            const note = prompt('Purpose / note:');
+            if (note === null) return;
+            tx.status = 'OTHER';
+            tx.notes = [tx.notes, note].filter(Boolean).join(' | ');
+            saveState();
+            return;
+        }
+
+        if (action === 'copy-backup') {
+            copyText(JSON.stringify(state, null, 2)).then(function () { toast('Backup copied'); });
+            return;
+        }
+
+        if (action === 'download-backup') {
+            const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'FactionLedgerIQ-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+            a.click();
+            setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+            return;
+        }
+
+        if (action === 'import-backup') {
+            const input = document.getElementById('fliq-import-file');
+            if (!input) return;
+
+            input.onchange = async function () {
+                const file = input.files && input.files[0];
+                if (!file) return;
+
+                try {
+                    const parsed = JSON.parse(await file.text());
+                    if (!parsed || !Array.isArray(parsed.transactions) || !Array.isArray(parsed.whitelist)) {
+                        throw new Error('Invalid backup');
+                    }
+
+                    if (!confirm('Import backup with ' + parsed.transactions.length +
+                        ' transactions? This replaces current local data.')) return;
+
+                    state = {
+                        ...clone(DEFAULT_STATE),
+                        ...parsed,
+                        settings: { ...DEFAULT_STATE.settings, ...(parsed.settings || {}) }
+                    };
+
+                    saveState();
+                    toast('Backup imported');
+                } catch (err) {
+                    alert('FactionLedgerIQ: Could not import that backup.');
+                }
+
+                input.value = '';
+            };
+
+            input.click();
+        }
+    }
+
+    async function copyText(text) {
+        try {
+            await navigator.clipboard.writeText(text);
+        } catch (e) {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            ta.remove();
+        }
+    }
+
+    function toast(message) {
+        let el = document.getElementById('fliq-toast');
+
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'fliq-toast';
+            el.style.cssText =
+                'position:fixed;z-index:2147483647;left:50%;bottom:70px;transform:translateX(-50%);' +
+                'background:#111;color:#fff;border:1px solid #555;border-radius:8px;padding:9px 12px;' +
+                'font:12px Arial;box-shadow:0 4px 18px #0008';
+            document.body.appendChild(el);
+        }
+
+        el.textContent = message;
+        el.style.display = 'block';
+        clearTimeout(el._timer);
+        el._timer = setTimeout(function () { el.style.display = 'none'; }, 1800);
+    }
+
+    function init() {
+        injectStyles();
+        ensurePanel();
+        ensureDockButton();
+        startDockObserver();
+        window.addEventListener('pageshow', ensureDockButton);
+        window.addEventListener('popstate', function () {
+            setTimeout(ensureDockButton, 100);
+        });
+        console.info('[FactionLedgerIQ] v' + VERSION + ' loaded');
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init, { once: true });
+    } else {
+        init();
+    }
+})();
