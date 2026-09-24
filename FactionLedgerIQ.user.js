@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.2.0
+// @version      0.3.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.2.0';
+    const VERSION = '0.3.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -31,8 +31,8 @@
 
     const DEFAULT_STATE = {
         schemaVersion: 1,
-        settings: { playerName: '', playerId: '', factionName: '', autoDetectPurchases: true },
-        detection: { processedFingerprints: [], lastDetectedAt: '', lastSource: '' },
+        settings: { playerName: '', playerId: '', factionName: '', autoDetectPurchases: true, apiKey: '', apiPolling: true, apiPollSeconds: 5 },
+        detection: { processedFingerprints: [], processedLogIds: [], lastDetectedAt: '', lastSource: '', lastApiPollAt: '', lastApiError: '', apiStatus: 'Not configured' },
         whitelist: [],
         transactions: [],
         createdAt: new Date().toISOString(),
@@ -45,6 +45,8 @@
     let dockQueued = false;
     let purchaseObserver = null;
     let purchaseScanQueued = false;
+    let apiPollTimer = null;
+    let apiPollBusy = false;
     const recentClickCaptures = [];
 
     function clone(v) { return JSON.parse(JSON.stringify(v)); }
@@ -313,6 +315,199 @@
         purchaseObserver.observe(document.body || document.documentElement, { childList: true, subtree: true });
     }
 
+    function apiKeyValue() {
+        return String(state.settings.apiKey || '').trim();
+    }
+
+    function apiUrl(path, params) {
+        const q = new URLSearchParams(params || {});
+        q.set('key', apiKeyValue());
+        q.set('comment', 'FactionLedgerIQ');
+        return 'https://api.torn.com/v2/' + path.replace(/^\/+/, '') + '?' + q.toString();
+    }
+
+    async function apiFetch(path, params) {
+        if (!apiKeyValue()) throw new Error('API key not configured');
+        const response = await fetch(apiUrl(path, params), { credentials: 'omit', cache: 'no-store' });
+        const data = await response.json();
+        if (!response.ok || (data && data.error)) {
+            const err = data && data.error;
+            throw new Error(err ? (err.error || err.message || JSON.stringify(err)) : ('HTTP ' + response.status));
+        }
+        return data;
+    }
+
+    function logArray(data) {
+        if (!data) return [];
+        if (Array.isArray(data.log)) return data.log;
+        if (Array.isArray(data.logs)) return data.logs;
+        if (Array.isArray(data)) return data;
+        return [];
+    }
+
+    function logId(log) {
+        return String(log && (log.id || log.log_id || log.logId || log.ID) || '');
+    }
+
+    function logText(log) {
+        return [
+            log && log.title,
+            log && log.text,
+            log && log.log,
+            log && log.category,
+            log && log.type,
+            log && log.data && JSON.stringify(log.data)
+        ].filter(Boolean).join(' ');
+    }
+
+    function markLogProcessed(id) {
+        if (!id) return;
+        state.detection.processedLogIds = Array.isArray(state.detection.processedLogIds)
+            ? state.detection.processedLogIds : [];
+        if (!state.detection.processedLogIds.includes(id)) {
+            state.detection.processedLogIds.push(id);
+            if (state.detection.processedLogIds.length > 1000) {
+                state.detection.processedLogIds = state.detection.processedLogIds.slice(-1000);
+            }
+        }
+    }
+
+    function isLogProcessed(id) {
+        return !!id && Array.isArray(state.detection.processedLogIds) &&
+            state.detection.processedLogIds.includes(id);
+    }
+
+    function reconcileApiPurchase(log) {
+        const id = logId(log);
+        if (!id || isLogProcessed(id)) return false;
+
+        const text = logText(log);
+        if (!/\b(?:bought|purchase|purchased|item market|bazaar|city shop|shop)\b/i.test(text)) return false;
+
+        const data = log.data || {};
+        const itemName = String(
+            data.item_name || data.itemName || data.name ||
+            (data.item && (data.item.name || data.item.item_name)) || ''
+        ).trim();
+        const itemId = String(
+            data.item_id || data.itemId ||
+            (data.item && (data.item.id || data.item.item_id)) || ''
+        ).trim();
+
+        const capture = recentClickCaptures.slice().reverse().find(function (c) {
+            return Date.now() - c.at < 120000 &&
+                (!itemName || !c.itemName ||
+                    normalizeItemName(c.itemName).includes(normalizeItemName(itemName)) ||
+                    normalizeItemName(itemName).includes(normalizeItemName(c.itemName)));
+        }) || null;
+
+        const wl = whitelistMatch(itemName || (capture && capture.itemName), itemId || (capture && capture.itemId));
+        if (!wl) {
+            markLogProcessed(id);
+            return false;
+        }
+
+        const qty = Math.max(1, Number(
+            data.quantity || data.qty || data.amount ||
+            (data.item && (data.item.quantity || data.item.qty)) || 1
+        ));
+        let actualTotal = Number(
+            data.total_cost || data.total || data.cost || data.price || data.money || 0
+        ) || 0;
+        if (!actualTotal && capture) actualTotal = Number(capture.price || 0);
+
+        const existing = liveTransactions().find(function (tx) {
+            return tx.type === 'PURCHASE' &&
+                normalizeItemName(tx.itemName) === normalizeItemName(wl.itemName) &&
+                Math.abs(new Date(tx.timestamp).getTime() - Date.now()) < 180000 &&
+                tx.detectionMethod === 'DOM_CONFIRMATION';
+        });
+
+        if (existing) {
+            existing.apiLogId = id;
+            existing.detectionMethod = 'API_CONFIRMED';
+            existing.notes = 'API-confirmed purchase; DOM context reconciled.';
+            if (!existing.actualTotal && actualTotal) {
+                existing.actualTotal = actualTotal;
+                existing.amount = actualTotal;
+                existing.billableTotal = Math.max(actualTotal, Number(existing.mvTotal || 0));
+            }
+        } else {
+            state.transactions.push({
+                id: uid('TX'),
+                chainId: uid('CHAIN'),
+                parentId: null,
+                type: 'PURCHASE',
+                timestamp: log.timestamp ? new Date(Number(log.timestamp) * 1000).toISOString() : new Date().toISOString(),
+                itemName: wl.itemName || itemName,
+                itemId: wl.itemId || itemId,
+                qty,
+                actualTotal,
+                mvTotal: 0,
+                billableTotal: actualTotal,
+                amount: actualTotal,
+                source: (capture && capture.source) || 'Torn API Log',
+                destination: 'Personal Inventory',
+                personName: state.settings.playerName,
+                personId: state.settings.playerId,
+                notes: 'API-confirmed purchase. Purchase-time MV pending reconciliation.',
+                ownership: 'PERSONAL',
+                status: 'PENDING',
+                detectionMethod: 'API_CONFIRMED',
+                apiLogId: id,
+                createdAt: new Date().toISOString()
+            });
+        }
+
+        markLogProcessed(id);
+        state.detection.lastDetectedAt = new Date().toISOString();
+        state.detection.lastSource = 'Torn API';
+        return true;
+    }
+
+    async function pollApiLogs(showToast) {
+        if (apiPollBusy || !state.settings.apiPolling || !apiKeyValue()) return;
+        apiPollBusy = true;
+        try {
+            const now = Math.floor(Date.now() / 1000);
+            const from = now - 900;
+            const data = await apiFetch('user/log', { from: String(from), to: String(now), limit: '100' });
+            const logs = logArray(data);
+            let changed = false;
+            logs.forEach(function (log) {
+                if (reconcileApiPurchase(log)) changed = true;
+            });
+            state.detection.lastApiPollAt = new Date().toISOString();
+            state.detection.lastApiError = '';
+            state.detection.apiStatus = 'Connected';
+            if (changed) {
+                saveState();
+                toast('API-confirmed purchase detected');
+            } else {
+                localStorage.setItem(STATE_KEY, JSON.stringify(state));
+                if (showToast) toast('API connected · ' + logs.length + ' recent log(s)');
+            }
+        } catch (err) {
+            state.detection.lastApiPollAt = new Date().toISOString();
+            state.detection.lastApiError = String(err && err.message || err);
+            state.detection.apiStatus = 'Error';
+            localStorage.setItem(STATE_KEY, JSON.stringify(state));
+            if (showToast) toast('API test failed');
+        } finally {
+            apiPollBusy = false;
+            render();
+        }
+    }
+
+    function restartApiPolling() {
+        if (apiPollTimer) clearInterval(apiPollTimer);
+        apiPollTimer = null;
+        if (!state.settings.apiPolling || !apiKeyValue()) return;
+        const seconds = Math.max(5, Number(state.settings.apiPollSeconds || 5));
+        apiPollTimer = setInterval(function () { pollApiLogs(false); }, seconds * 1000);
+        setTimeout(function () { pollApiLogs(false); }, 1000);
+    }
+
     function actor(tx) {
         const name = tx.personName || state.settings.playerName || 'Unknown';
         const id = tx.personId || state.settings.playerId || '';
@@ -521,7 +716,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.2.0 purchase detection is active for whitelisted items. Current phase uses Torn page purchase confirmations; API reconciliation and automatic MV-at-purchase capture are next.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.3.0 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -749,7 +944,15 @@
             field('Automatic purchase detection', '<select name="autoDetectPurchases"><option value="true"' +
                 (state.settings.autoDetectPurchases ? ' selected' : '') + '>On</option><option value="false"' +
                 (!state.settings.autoDetectPurchases ? ' selected' : '') + '>Off</option></select>') +
-            '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button></div>' +
+            field('Torn API key', '<input name="apiKey" type="password" autocomplete="off" value="' + esc(state.settings.apiKey || '') + '" placeholder="Stored only in this TornPDA/browser storage">') +
+            row(
+                field('API log polling', '<select name="apiPolling"><option value="true"' + (state.settings.apiPolling ? ' selected' : '') + '>On</option><option value="false"' + (!state.settings.apiPolling ? ' selected' : '') + '>Off</option></select>'),
+                field('Poll interval', '<select name="apiPollSeconds"><option value="5"' + (Number(state.settings.apiPollSeconds) === 5 ? ' selected' : '') + '>5 seconds</option><option value="10"' + (Number(state.settings.apiPollSeconds) === 10 ? ' selected' : '') + '>10 seconds</option><option value="15"' + (Number(state.settings.apiPollSeconds) === 15 ? ' selected' : '') + '>15 seconds</option></select>')
+            ) +
+            '<div class="fliq-muted">API status: ' + esc(state.detection.apiStatus || 'Not configured') +
+                (state.detection.lastApiPollAt ? ' · Last check ' + esc(new Date(state.detection.lastApiPollAt).toLocaleTimeString()) : '') +
+                (state.detection.lastApiError ? '<br>Error: ' + esc(state.detection.lastApiError) : '') + '</div>' +
+            '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button><button class="fliq-btn" type="button" data-fliq="test-api">Test API</button></div>' +
         '</form>' +
         '<div class="fliq-section"><h3>Backup & Restore</h3><div class="fliq-card">' +
             '<div class="fliq-muted">Ledger data is stored locally in TornPDA/browser storage. Export backups regularly.</div>' +
@@ -761,7 +964,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release adds automatic DOM purchase detection for whitelisted purchases while retaining the ledger, accounting rules, receipts, backup/restore, and TornPDA docked launcher.' +
+            'v' + VERSION + ' performs no Torn game actions. This release adds local Torn API log polling and API-confirmed purchase reconciliation while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
         '</div></div>';
     }
 
@@ -779,7 +982,11 @@
             state.settings.playerId = formValue(fd, 'playerId');
             state.settings.factionName = formValue(fd, 'factionName');
             state.settings.autoDetectPurchases = formValue(fd, 'autoDetectPurchases') !== 'false';
+            state.settings.apiKey = formValue(fd, 'apiKey');
+            state.settings.apiPolling = formValue(fd, 'apiPolling') !== 'false';
+            state.settings.apiPollSeconds = Math.max(5, Number(fd.get('apiPollSeconds') || 5));
             saveState();
+            restartApiPolling();
             toast('Settings saved');
             return;
         }
@@ -947,6 +1154,11 @@
             return;
         }
 
+        if (action === 'test-api') {
+            pollApiLogs(true);
+            return;
+        }
+
         if (action === 'copy-backup') {
             copyText(JSON.stringify(state, null, 2)).then(function () { toast('Backup copied'); });
             return;
@@ -1039,6 +1251,7 @@
         ensureDockButton();
         startDockObserver();
         startPurchaseDetection();
+        restartApiPolling();
         window.addEventListener('pageshow', ensureDockButton);
         window.addEventListener('popstate', function () {
             setTimeout(ensureDockButton, 100);
