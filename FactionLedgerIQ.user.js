@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.3.8
+// @version      0.3.9
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.3.8';
+    const VERSION = '0.3.9';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -32,7 +32,7 @@
     const DEFAULT_STATE = {
         schemaVersion: 1,
         settings: { playerName: '', playerId: '', factionName: '', autoDetectPurchases: true, apiKey: '', apiPolling: true, apiPollSeconds: 5 },
-        detection: { processedFingerprints: [], processedLogIds: [], recentApiEvents: [], recentFactionCandidates: [], lastDetectedAt: '', lastSource: '', lastApiPollAt: '', lastApiError: '', apiStatus: 'Not configured' },
+        detection: { processedFingerprints: [], processedLogIds: [], recentApiEvents: [], recentFactionCandidates: [], factionMovementBuffer: [], lastDetectedAt: '', lastSource: '', lastApiPollAt: '', lastApiError: '', apiStatus: 'Not configured' },
         whitelist: [],
         transactions: [],
         createdAt: new Date().toISOString(),
@@ -455,6 +455,103 @@
         return true;
     }
 
+    function factionTransferPart(log) {
+        const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+        const rows = Array.isArray(data.items) ? data.items : (Array.isArray(data.item) ? data.item : []);
+        if (!rows.length || data.faction == null) return null;
+        const actorId = String(state.settings.playerId || '').trim();
+        const sender = data.sender == null ? '' : String(data.sender);
+        const receiver = data.receiver == null ? '' : String(data.receiver);
+        if (!sender && !receiver) return null;
+        if (actorId && sender !== actorId && receiver !== actorId) return null;
+        return {
+            logId: logId(log),
+            timestamp: Number(log.timestamp || 0),
+            factionId: String(data.faction),
+            sender: sender,
+            receiver: receiver,
+            rows: rows.map(function (row) {
+                return { itemId: String(row.id || row.item_id || ''), qty: Math.max(1, Number(row.qty || row.quantity || 1)) };
+            }).filter(function (row) { return row.itemId; })
+        };
+    }
+
+    function movementKey(part, row) {
+        return [part.timestamp, part.factionId, row.itemId, row.qty].join('|');
+    }
+
+    async function reconcileFactionMovement(logs) {
+        const parts = (logs || []).map(factionTransferPart).filter(Boolean);
+        if (!parts.length) return false;
+        try { await ensureItemCatalog(false); } catch (e) {}
+
+        const groups = new Map();
+        parts.forEach(function (part) {
+            part.rows.forEach(function (row) {
+                const key = movementKey(part, row);
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push({ part: part, row: row });
+            });
+        });
+
+        let changed = false;
+        const actorId = String(state.settings.playerId || '').trim();
+        groups.forEach(function (entries, key) {
+            if (liveTransactions().some(function (tx) { return tx.factionMovementKey === key; })) return;
+
+            const senderSide = entries.find(function (x) { return actorId && x.part.sender === actorId; });
+            const receiverSide = entries.find(function (x) { return actorId && x.part.receiver === actorId; });
+            if (!senderSide || !receiverSide) return; // wait for both sides; avoids guessing direction from one log
+
+            const row = senderSide.row;
+            const item = itemCatalog.find(function (x) { return String(x.id) === row.itemId; });
+            const mvEach = item ? Math.max(0, Number(item.marketValue || 0)) : 0;
+            const mvTotal = mvEach * row.qty;
+
+            // Observed paired faction-transfer logs do not themselves identify which side is
+            // the faction ledger direction. Use temporal context: a recent unmatched personal
+            // inventory purchase/deposit intent is ARMORY_IN; otherwise record as ARMORY_OUT
+            // pending purpose. This is conservative and leaves ambiguous cases pending.
+            const recentPersonal = liveTransactions().slice().reverse().find(function (tx) {
+                return tx.type === 'PURCHASE' && tx.status === 'PENDING' &&
+                    String(tx.itemId || '') === row.itemId &&
+                    Math.abs(new Date(tx.timestamp).getTime() - senderSide.part.timestamp * 1000) < 3600000;
+            });
+            const type = recentPersonal ? 'ARMORY_IN' : 'ARMORY_OUT';
+            state.transactions.push({
+                id: uid('TX'),
+                chainId: uid('CHAIN'),
+                parentId: null,
+                type: type,
+                timestamp: new Date(senderSide.part.timestamp * 1000).toISOString(),
+                itemName: item ? item.name : ('Item #' + row.itemId),
+                itemId: row.itemId,
+                qty: row.qty,
+                actualTotal: 0,
+                mvTotal: mvTotal,
+                mvEach: mvEach,
+                billableTotal: type === 'ARMORY_IN' ? mvTotal : 0,
+                amount: 0,
+                source: type === 'ARMORY_IN' ? 'Personal Inventory' : 'Faction Armory',
+                destination: type === 'ARMORY_IN' ? 'Faction Armory' : 'Personal Inventory',
+                personName: state.settings.playerName,
+                personId: state.settings.playerId,
+                notes: type === 'ARMORY_IN'
+                    ? 'API-confirmed faction item movement; personal contribution valued at movement-time MV.'
+                    : 'API-confirmed faction item movement; faction-owned asset held by player. Purpose pending.',
+                ownership: type === 'ARMORY_IN' ? 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' : 'FACTION',
+                status: type === 'ARMORY_IN' ? 'DEPOSITED' : 'PENDING',
+                detectionMethod: 'API_FACTION_PAIRED',
+                factionId: senderSide.part.factionId,
+                factionMovementKey: key,
+                apiLogIds: entries.map(function (x) { return x.part.logId; }).filter(Boolean),
+                createdAt: new Date().toISOString()
+            });
+            changed = true;
+        });
+        return changed;
+    }
+
     async function reconcileApiPurchase(log) {
         const id = logId(log);
         if (!id || isLogProcessed(id)) return false;
@@ -567,6 +664,7 @@
             rememberApiEvents(logs);
             let changed = false;
             logs.forEach(function (log) { rememberFactionCandidate(log); });
+            if (await reconcileFactionMovement(logs)) changed = true;
             for (const log of logs) {
                 if (await reconcileApiPurchase(log)) changed = true;
             }
@@ -575,7 +673,7 @@
             state.detection.apiStatus = 'Connected';
             if (changed) {
                 saveState();
-                toast('API-confirmed purchase detected');
+                toast('API-confirmed ledger activity detected');
             } else {
                 localStorage.setItem(STATE_KEY, JSON.stringify(state));
                 if (showToast) toast('API connected · ' + logs.length + ' recent log(s)');
@@ -905,7 +1003,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.3.8 captures candidate faction armory/display movement logs for safe schema discovery. It does not create ownership or reimbursement entries until the exact Torn movement structure is confirmed.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.3.9 pairs observed faction item-transfer API events and records armory movements with item, quantity, faction, player and movement-time MV. Withdrawals remain pending for purpose selection.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
