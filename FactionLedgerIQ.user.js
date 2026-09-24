@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.3.6
+// @version      0.3.7
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.3.6';
+    const VERSION = '0.3.7';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -576,7 +576,7 @@
                 if (!item) return;
                 const id = String(item.id || item.item_id || '').trim();
                 const name = String(item.name || item.item_name || '').trim();
-                if (id && name) out.push({ id: id, name: name, marketValue: Number(item.market_value || item.marketValue || item.value || 0) || 0 });
+                if (id && name) out.push({ id: id, name: name, marketValue: Number(item.market_value || item.marketValue || (item.value && (item.value.market_price || item.value.market_value)) || 0) || 0 });
             });
         } else if (source && typeof source === 'object') {
             Object.keys(source).forEach(function (key) {
@@ -584,7 +584,7 @@
                 if (!item || typeof item !== 'object') return;
                 const id = String(item.id || item.item_id || key || '').trim();
                 const name = String(item.name || item.item_name || '').trim();
-                if (id && name) out.push({ id: id, name: name, marketValue: Number(item.market_value || item.marketValue || item.value || 0) || 0 });
+                if (id && name) out.push({ id: id, name: name, marketValue: Number(item.market_value || item.marketValue || (item.value && (item.value.market_price || item.value.market_value)) || 0) || 0 });
             });
         }
         return out.sort(function (a, b) { return a.name.localeCompare(b.name); });
@@ -872,7 +872,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.3.6 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.3.7 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -1090,6 +1090,13 @@
         }).join('') + '</div>';
     }
 
+    function renderCatalogDiagnostic() {
+        const beer = itemCatalog.find(function (item) { return String(item.id) === '180'; });
+        if (!itemCatalog.length) return 'Item catalog not loaded yet.';
+        return 'Catalog loaded: ' + itemCatalog.length + ' items' +
+            (beer ? ' · Bottle of Beer MV: ' + money(beer.marketValue || 0) : '');
+    }
+
     function renderApiDiagnostics() {
         const events = Array.isArray(state.detection.recentApiEvents) ? state.detection.recentApiEvents : [];
         if (!events.length) return '<div class="fliq-empty">No recent API events captured yet. Tap Test API first.</div>';
@@ -1120,7 +1127,7 @@
                 (state.detection.lastApiError ? '<br>Error: ' + esc(state.detection.lastApiError) : '') + '</div>' +
             '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button><button class="fliq-btn" type="button" data-fliq="create-api-key">Create FactionLedgerIQ API Key</button><button class="fliq-btn" type="button" data-fliq="test-api">Test API</button><button class="fliq-btn" type="button" data-fliq="toggle-api-diagnostics">Show API Diagnostics</button></div>' +
         '</form>' +
-        '<div id="fliq-api-diagnostics" class="fliq-section" style="display:none"><h3>Recent API Events</h3><div class="fliq-card fliq-muted" style="margin-bottom:8px">Diagnostic output excludes API keys/tokens. Use this to identify Torn log fields.</div>' + renderApiDiagnostics() + '</div>' +
+        '<div id="fliq-api-diagnostics" class="fliq-section" style="display:none"><h3>Recent API Events</h3><div class="fliq-card fliq-muted" style="margin-bottom:8px">Diagnostic output excludes API keys/tokens. ' + esc(renderCatalogDiagnostic()) + '</div>' + renderApiDiagnostics() + '</div>' +
         '<div class="fliq-section"><h3>Backup & Restore</h3><div class="fliq-card">' +
             '<div class="fliq-muted">Ledger data is stored locally in TornPDA/browser storage. Export backups regularly.</div>' +
             '<div class="fliq-actions">' +
@@ -1131,7 +1138,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release freezes Torn item market value at purchase detection and bills the greater of actual purchase cost or purchase-time MV for API-confirmed Item Market purchases while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
+            'v' + VERSION + ' performs no Torn game actions. This release reads API v2 item market value from the nested value.market_price field (with legacy fallbacks), freezes it at purchase detection, and bills the greater of actual cost or purchase-time MV while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
         '</div></div>';
     }
 
