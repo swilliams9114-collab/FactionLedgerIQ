@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.3.7
+// @version      0.3.8
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.3.7';
+    const VERSION = '0.3.8';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -32,7 +32,7 @@
     const DEFAULT_STATE = {
         schemaVersion: 1,
         settings: { playerName: '', playerId: '', factionName: '', autoDetectPurchases: true, apiKey: '', apiPolling: true, apiPollSeconds: 5 },
-        detection: { processedFingerprints: [], processedLogIds: [], recentApiEvents: [], lastDetectedAt: '', lastSource: '', lastApiPollAt: '', lastApiError: '', apiStatus: 'Not configured' },
+        detection: { processedFingerprints: [], processedLogIds: [], recentApiEvents: [], recentFactionCandidates: [], lastDetectedAt: '', lastSource: '', lastApiPollAt: '', lastApiError: '', apiStatus: 'Not configured' },
         whitelist: [],
         transactions: [],
         createdAt: new Date().toISOString(),
@@ -423,6 +423,38 @@
             state.detection.processedLogIds.includes(id);
     }
 
+    function factionMovementCandidate(log) {
+        const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+        const text = logText(log).toLowerCase();
+        const hasFactionHint = /faction|armou?r|display case/.test(text);
+        if (!hasFactionHint) return null;
+
+        // Exclude the already-understood Item Market purchase signature.
+        if (Array.isArray(data.items) && data.items.length &&
+            (data.cost_total != null || data.cost_each != null) && data.seller != null) return null;
+
+        const movementHint = /deposit|deposited|give|gave|add|added|put|store|stored|withdraw|withdrew|take|took|remove|removed|retrieve|retrieved/.test(text);
+        if (!movementHint) return null;
+
+        return {
+            id: logId(log),
+            timestamp: log.timestamp || '',
+            text: text.slice(0, 800),
+            data: safeApiEvent(log) ? safeApiEvent(log).data : {}
+        };
+    }
+
+    function rememberFactionCandidate(log) {
+        const candidate = factionMovementCandidate(log);
+        if (!candidate) return false;
+        state.detection.recentFactionCandidates = Array.isArray(state.detection.recentFactionCandidates)
+            ? state.detection.recentFactionCandidates : [];
+        if (state.detection.recentFactionCandidates.some(function (x) { return x.id === candidate.id; })) return false;
+        state.detection.recentFactionCandidates.unshift(candidate);
+        state.detection.recentFactionCandidates = state.detection.recentFactionCandidates.slice(0, 20);
+        return true;
+    }
+
     async function reconcileApiPurchase(log) {
         const id = logId(log);
         if (!id || isLogProcessed(id)) return false;
@@ -534,6 +566,7 @@
             const logs = logArray(data);
             rememberApiEvents(logs);
             let changed = false;
+            logs.forEach(function (log) { rememberFactionCandidate(log); });
             for (const log of logs) {
                 if (await reconcileApiPurchase(log)) changed = true;
             }
@@ -872,7 +905,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.3.7 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.3.8 captures candidate faction armory/display movement logs for safe schema discovery. It does not create ownership or reimbursement entries until the exact Torn movement structure is confirmed.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -1097,6 +1130,16 @@
             (beer ? ' · Bottle of Beer MV: ' + money(beer.marketValue || 0) : '');
     }
 
+    function renderFactionDiagnostics() {
+        const events = Array.isArray(state.detection.recentFactionCandidates) ? state.detection.recentFactionCandidates : [];
+        if (!events.length) return '<div class="fliq-empty">No faction armory/display movement candidates captured yet.</div>';
+        return '<div class="fliq-list">' + events.map(function (ev, i) {
+            return '<div class="fliq-item"><div class="fliq-item-top"><b>Faction Candidate ' + (i + 1) + '</b><span class="fliq-pill">' +
+                esc(ev.id || 'no id') + '</span></div><pre class="fliq-diag">' +
+                esc(JSON.stringify(ev, null, 2)) + '</pre></div>';
+        }).join('') + '</div>';
+    }
+
     function renderApiDiagnostics() {
         const events = Array.isArray(state.detection.recentApiEvents) ? state.detection.recentApiEvents : [];
         if (!events.length) return '<div class="fliq-empty">No recent API events captured yet. Tap Test API first.</div>';
@@ -1127,7 +1170,7 @@
                 (state.detection.lastApiError ? '<br>Error: ' + esc(state.detection.lastApiError) : '') + '</div>' +
             '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button><button class="fliq-btn" type="button" data-fliq="create-api-key">Create FactionLedgerIQ API Key</button><button class="fliq-btn" type="button" data-fliq="test-api">Test API</button><button class="fliq-btn" type="button" data-fliq="toggle-api-diagnostics">Show API Diagnostics</button></div>' +
         '</form>' +
-        '<div id="fliq-api-diagnostics" class="fliq-section" style="display:none"><h3>Recent API Events</h3><div class="fliq-card fliq-muted" style="margin-bottom:8px">Diagnostic output excludes API keys/tokens. ' + esc(renderCatalogDiagnostic()) + '</div>' + renderApiDiagnostics() + '</div>' +
+        '<div id="fliq-api-diagnostics" class="fliq-section" style="display:none"><h3>Recent API Events</h3><div class="fliq-card fliq-muted" style="margin-bottom:8px">Diagnostic output excludes API keys/tokens. ' + esc(renderCatalogDiagnostic()) + '</div>' + renderApiDiagnostics() + '<h3 style="margin-top:12px">Faction Movement Candidates</h3>' + renderFactionDiagnostics() + '</div>' +
         '<div class="fliq-section"><h3>Backup & Restore</h3><div class="fliq-card">' +
             '<div class="fliq-muted">Ledger data is stored locally in TornPDA/browser storage. Export backups regularly.</div>' +
             '<div class="fliq-actions">' +
