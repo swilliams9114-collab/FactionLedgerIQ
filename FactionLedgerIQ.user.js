@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.3.2
+// @version      0.3.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.3.2';
+    const VERSION = '0.3.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -32,7 +32,7 @@
     const DEFAULT_STATE = {
         schemaVersion: 1,
         settings: { playerName: '', playerId: '', factionName: '', autoDetectPurchases: true, apiKey: '', apiPolling: true, apiPollSeconds: 5 },
-        detection: { processedFingerprints: [], processedLogIds: [], lastDetectedAt: '', lastSource: '', lastApiPollAt: '', lastApiError: '', apiStatus: 'Not configured' },
+        detection: { processedFingerprints: [], processedLogIds: [], recentApiEvents: [], lastDetectedAt: '', lastSource: '', lastApiPollAt: '', lastApiError: '', apiStatus: 'Not configured' },
         whitelist: [],
         transactions: [],
         createdAt: new Date().toISOString(),
@@ -352,6 +352,40 @@
         return String(log && (log.id || log.log_id || log.logId || log.ID) || '');
     }
 
+    function safeApiEvent(log) {
+        if (!log || typeof log !== 'object') return null;
+        const data = log.data && typeof log.data === 'object' ? log.data : {};
+        const safeData = {};
+        Object.keys(data).slice(0, 40).forEach(function (key) {
+            if (/key|token|secret|auth/i.test(key)) return;
+            const value = data[key];
+            if (value == null || ['string','number','boolean'].includes(typeof value)) safeData[key] = value;
+            else if (Array.isArray(value)) safeData[key] = value.slice(0, 10);
+            else if (typeof value === 'object') {
+                const nested = {};
+                Object.keys(value).slice(0, 20).forEach(function (k) {
+                    if (/key|token|secret|auth/i.test(k)) return;
+                    const v = value[k];
+                    if (v == null || ['string','number','boolean'].includes(typeof v)) nested[k] = v;
+                });
+                safeData[key] = nested;
+            }
+        });
+        return {
+            id: logId(log),
+            timestamp: log.timestamp || '',
+            title: log.title || '',
+            category: log.category || '',
+            type: log.type || '',
+            text: String(log.text || log.log || '').slice(0, 500),
+            data: safeData
+        };
+    }
+
+    function rememberApiEvents(logs) {
+        state.detection.recentApiEvents = (logs || []).slice(0, 20).map(safeApiEvent).filter(Boolean);
+    }
+
     function logText(log) {
         return [
             log && log.title,
@@ -476,6 +510,7 @@
             const from = now - 900;
             const data = await apiFetch('user/log', { from: String(from), to: String(now), limit: '100' });
             const logs = logArray(data);
+            rememberApiEvents(logs);
             let changed = false;
             logs.forEach(function (log) {
                 if (reconcileApiPurchase(log)) changed = true;
@@ -685,6 +720,7 @@
             '.fliq-list{display:flex;flex-direction:column;gap:7px}.fliq-item-top{display:flex;justify-content:space-between;gap:8px}',
             '.fliq-pill{display:inline-block;padding:2px 6px;border-radius:999px;background:#293746;font-size:10px}',
             '.fliq-empty{text-align:center;padding:24px 10px;opacity:.55}',
+            '.fliq-diag{white-space:pre-wrap;word-break:break-word;font:11px monospace;max-height:280px;overflow:auto;background:#0f151c;border-radius:6px;padding:8px;margin:8px 0 0}',
             '@media(max-width:560px){.fliq-row{grid-template-columns:1fr}.fliq-grid{grid-template-columns:1fr 1fr}.fliq-tab{padding:9px 8px;font-size:12px}}'
         ].join('');
 
@@ -814,7 +850,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.3.2 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.3.3 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -1032,6 +1068,16 @@
         }).join('') + '</div>';
     }
 
+    function renderApiDiagnostics() {
+        const events = Array.isArray(state.detection.recentApiEvents) ? state.detection.recentApiEvents : [];
+        if (!events.length) return '<div class="fliq-empty">No recent API events captured yet. Tap Test API first.</div>';
+        return '<div class="fliq-list">' + events.map(function (ev, i) {
+            return '<div class="fliq-item"><div class="fliq-item-top"><b>Event ' + (i + 1) + '</b><span class="fliq-pill">' +
+                esc(ev.id || 'no id') + '</span></div><pre class="fliq-diag">' +
+                esc(JSON.stringify(ev, null, 2)) + '</pre></div>';
+        }).join('') + '</div>';
+    }
+
     function renderSettings() {
         return '<form id="fliq-settings-form" class="fliq-card">' +
             row(
@@ -1050,8 +1096,9 @@
             '<div class="fliq-muted" data-fliq-api-status>API status: ' + esc(state.detection.apiStatus || 'Not configured') +
                 (state.detection.lastApiPollAt ? ' · Last check ' + esc(new Date(state.detection.lastApiPollAt).toLocaleTimeString()) : '') +
                 (state.detection.lastApiError ? '<br>Error: ' + esc(state.detection.lastApiError) : '') + '</div>' +
-            '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button><button class="fliq-btn" type="button" data-fliq="create-api-key">Create FactionLedgerIQ API Key</button><button class="fliq-btn" type="button" data-fliq="test-api">Test API</button></div>' +
+            '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button><button class="fliq-btn" type="button" data-fliq="create-api-key">Create FactionLedgerIQ API Key</button><button class="fliq-btn" type="button" data-fliq="test-api">Test API</button><button class="fliq-btn" type="button" data-fliq="toggle-api-diagnostics">Show API Diagnostics</button></div>' +
         '</form>' +
+        '<div id="fliq-api-diagnostics" class="fliq-section" style="display:none"><h3>Recent API Events</h3><div class="fliq-card fliq-muted" style="margin-bottom:8px">Diagnostic output excludes API keys/tokens. Use this to identify Torn log fields.</div>' + renderApiDiagnostics() + '</div>' +
         '<div class="fliq-section"><h3>Backup & Restore</h3><div class="fliq-card">' +
             '<div class="fliq-muted">Ledger data is stored locally in TornPDA/browser storage. Export backups regularly.</div>' +
             '<div class="fliq-actions">' +
@@ -1062,7 +1109,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release adds a Torn API item autocomplete picker, mobile-safe API polling, and API-confirmed purchase reconciliation while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
+            'v' + VERSION + ' performs no Torn game actions. This release adds safe recent-event API diagnostics alongside the Torn item autocomplete picker, mobile-safe polling, and purchase reconciliation while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
         '</div></div>';
     }
 
@@ -1285,6 +1332,15 @@
 
         if (action === 'test-api') {
             pollApiLogs(true);
+            return;
+        }
+
+        if (action === 'toggle-api-diagnostics') {
+            const box = document.getElementById('fliq-api-diagnostics');
+            if (!box) return;
+            const showing = box.style.display !== 'none';
+            box.style.display = showing ? 'none' : 'block';
+            btn.textContent = showing ? 'Show API Diagnostics' : 'Hide API Diagnostics';
             return;
         }
 
