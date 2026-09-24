@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.3.1
+// @version      0.3.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.3.1';
+    const VERSION = '0.3.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -47,6 +47,9 @@
     let purchaseScanQueued = false;
     let apiPollTimer = null;
     let apiPollBusy = false;
+    let itemCatalog = [];
+    let itemCatalogLoadedAt = 0;
+    let itemSearchTimer = null;
     const recentClickCaptures = [];
 
     function clone(v) { return JSON.parse(JSON.stringify(v)); }
@@ -495,7 +498,7 @@
             if (showToast) toast('API test failed');
         } finally {
             apiPollBusy = false;
-            render();
+            updateApiStatusDom();
         }
     }
 
@@ -506,6 +509,96 @@
         const seconds = Math.max(5, Number(state.settings.apiPollSeconds || 5));
         apiPollTimer = setInterval(function () { pollApiLogs(false); }, seconds * 1000);
         setTimeout(function () { pollApiLogs(false); }, 1000);
+    }
+
+    function normalizeItemCatalog(data) {
+        const source = data && (data.items || data);
+        const out = [];
+        if (Array.isArray(source)) {
+            source.forEach(function (item) {
+                if (!item) return;
+                const id = String(item.id || item.item_id || '').trim();
+                const name = String(item.name || item.item_name || '').trim();
+                if (id && name) out.push({ id: id, name: name });
+            });
+        } else if (source && typeof source === 'object') {
+            Object.keys(source).forEach(function (key) {
+                const item = source[key];
+                if (!item || typeof item !== 'object') return;
+                const id = String(item.id || item.item_id || key || '').trim();
+                const name = String(item.name || item.item_name || '').trim();
+                if (id && name) out.push({ id: id, name: name });
+            });
+        }
+        return out.sort(function (a, b) { return a.name.localeCompare(b.name); });
+    }
+
+    async function ensureItemCatalog(force) {
+        if (!force && itemCatalog.length && Date.now() - itemCatalogLoadedAt < 3600000) return itemCatalog;
+        const data = await apiFetch('torn/items', { cat: 'All' });
+        const parsed = normalizeItemCatalog(data);
+        if (!parsed.length) throw new Error('No items returned by Torn API');
+        itemCatalog = parsed;
+        itemCatalogLoadedAt = Date.now();
+        return itemCatalog;
+    }
+
+    function renderItemSuggestions(input) {
+        const wrap = input && input.closest('.fliq-item-search');
+        const list = wrap && wrap.querySelector('.fliq-suggestions');
+        if (!list) return;
+        const q = normalizeItemName(input.value);
+        if (q.length < 2) {
+            list.innerHTML = '';
+            list.classList.remove('fliq-suggestions-open');
+            return;
+        }
+        const matches = itemCatalog.filter(function (item) {
+            return normalizeItemName(item.name).includes(q);
+        }).slice(0, 12);
+        list.innerHTML = matches.length ? matches.map(function (item) {
+            return '<button type="button" class="fliq-suggestion" data-fliq="pick-item" data-item-id="' +
+                esc(item.id) + '" data-item-name="' + esc(item.name) + '"><span>' +
+                esc(item.name) + '</span><small>#' + esc(item.id) + '</small></button>';
+        }).join('') : '<div class="fliq-suggestion-empty">No matching Torn items</div>';
+        list.classList.add('fliq-suggestions-open');
+    }
+
+    async function handleItemSearchInput(input) {
+        clearTimeout(itemSearchTimer);
+        itemSearchTimer = setTimeout(async function () {
+            try {
+                if (normalizeItemName(input.value).length >= 2 && !itemCatalog.length) {
+                    await ensureItemCatalog(false);
+                }
+                if (document.body.contains(input)) renderItemSuggestions(input);
+            } catch (err) {
+                const wrap = input.closest('.fliq-item-search');
+                const list = wrap && wrap.querySelector('.fliq-suggestions');
+                if (list) {
+                    list.innerHTML = '<div class="fliq-suggestion-empty">Could not load Torn item list. Check API key permissions.</div>';
+                    list.classList.add('fliq-suggestions-open');
+                }
+            }
+        }, 180);
+    }
+
+    function itemSearchControl() {
+        return '<div class="fliq-item-search">' +
+            '<input name="itemSearch" class="fliq-item-search-input" autocomplete="off" placeholder="Type 2+ letters, e.g. emp" required>' +
+            '<input name="itemName" type="hidden"><input name="itemId" type="hidden">' +
+            '<div class="fliq-suggestions"></div>' +
+        '</div>';
+    }
+
+    function updateApiStatusDom() {
+        const panel = document.getElementById(PANEL_ID);
+        if (!panel) return;
+        const el = panel.querySelector('[data-fliq-api-status]');
+        if (!el) return;
+        el.innerHTML = 'API status: ' + esc(state.detection.apiStatus || 'Not configured') +
+            (state.detection.lastApiPollAt ? ' · Last check ' + esc(new Date(state.detection.lastApiPollAt).toLocaleTimeString()) : '') +
+            (state.detection.lastApiError ? '<br>Error: ' + esc(state.detection.lastApiError) : '');
     }
 
     function actor(tx) {
@@ -585,6 +678,8 @@
             '.fliq-field{display:flex;flex-direction:column;gap:4px}.fliq-field label{font-size:11px;opacity:.72}',
             '.fliq-field input,.fliq-field select,.fliq-field textarea{width:100%;border:1px solid #42505f;background:#0f151c;color:#fff;border-radius:6px;padding:8px}',
             '.fliq-field textarea{min-height:64px;resize:vertical}',
+            '.fliq-item-search{position:relative}.fliq-suggestions{display:none;position:absolute;z-index:2147483600;left:0;right:0;top:calc(100% + 3px);max-height:260px;overflow:auto;background:#0f151c;border:1px solid #42505f;border-radius:7px;box-shadow:0 8px 22px #0009}',
+            '.fliq-suggestions.fliq-suggestions-open{display:block}.fliq-suggestion{width:100%;display:flex;justify-content:space-between;gap:8px;text-align:left;border:0;border-bottom:1px solid #2c3946;background:#0f151c;color:#fff;padding:10px}.fliq-suggestion:last-child{border-bottom:0}.fliq-suggestion small{opacity:.55}.fliq-suggestion-empty{padding:10px;opacity:.65;font-size:12px}',
             '.fliq-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}',
             '.fliq-btn{cursor:pointer}.fliq-btn-primary{background:#315b86}.fliq-btn-danger{background:#69363b}',
             '.fliq-list{display:flex;flex-direction:column;gap:7px}.fliq-item-top{display:flex;justify-content:space-between;gap:8px}',
@@ -672,6 +767,9 @@
         document.body.appendChild(panel);
         panel.addEventListener('click', handleClick);
         panel.addEventListener('submit', handleSubmit);
+        panel.addEventListener('input', function (e) {
+            if (e.target && e.target.classList.contains('fliq-item-search-input')) handleItemSearchInput(e.target);
+        });
         render();
     }
 
@@ -716,7 +814,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.3.1 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.3.2 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -830,8 +928,8 @@
             '<div class="fliq-section"><h3>Whitelist</h3>' +
                 '<form id="fliq-whitelist-form" class="fliq-card">' +
                     row(
-                        field('Item name', '<input name="itemName" required>'),
-                        field('Torn item ID (optional)', '<input name="itemId" inputmode="numeric">')
+                        field('Search Torn items', itemSearchControl()),
+                        field('Selection', '<div class="fliq-muted">Type at least 2 letters, then tap an item.</div>')
                     ) +
                     '<button class="fliq-btn fliq-btn-primary" type="submit">Add to Whitelist</button>' +
                 '</form>' +
@@ -949,7 +1047,7 @@
                 field('API log polling', '<select name="apiPolling"><option value="true"' + (state.settings.apiPolling ? ' selected' : '') + '>On</option><option value="false"' + (!state.settings.apiPolling ? ' selected' : '') + '>Off</option></select>'),
                 field('Poll interval', '<select name="apiPollSeconds"><option value="5"' + (Number(state.settings.apiPollSeconds) === 5 ? ' selected' : '') + '>5 seconds</option><option value="10"' + (Number(state.settings.apiPollSeconds) === 10 ? ' selected' : '') + '>10 seconds</option><option value="15"' + (Number(state.settings.apiPollSeconds) === 15 ? ' selected' : '') + '>15 seconds</option></select>')
             ) +
-            '<div class="fliq-muted">API status: ' + esc(state.detection.apiStatus || 'Not configured') +
+            '<div class="fliq-muted" data-fliq-api-status>API status: ' + esc(state.detection.apiStatus || 'Not configured') +
                 (state.detection.lastApiPollAt ? ' · Last check ' + esc(new Date(state.detection.lastApiPollAt).toLocaleTimeString()) : '') +
                 (state.detection.lastApiError ? '<br>Error: ' + esc(state.detection.lastApiError) : '') + '</div>' +
             '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button><button class="fliq-btn" type="button" data-fliq="create-api-key">Create FactionLedgerIQ API Key</button><button class="fliq-btn" type="button" data-fliq="test-api">Test API</button></div>' +
@@ -964,7 +1062,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release adds local Torn API log polling and API-confirmed purchase reconciliation while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
+            'v' + VERSION + ' performs no Torn game actions. This release adds a Torn API item autocomplete picker, mobile-safe API polling, and API-confirmed purchase reconciliation while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
         '</div></div>';
     }
 
@@ -993,12 +1091,20 @@
 
         if (form.id === 'fliq-whitelist-form') {
             const itemName = formValue(fd, 'itemName');
-            if (!itemName) return;
+            const itemId = formValue(fd, 'itemId');
+            if (!itemName || !itemId) {
+                toast('Choose an item from the Torn item list');
+                return;
+            }
+            if (whitelistMatch(itemName, itemId)) {
+                toast('That item is already whitelisted');
+                return;
+            }
 
             state.whitelist.push({
                 id: uid('WL'),
                 itemName: itemName,
-                itemId: formValue(fd, 'itemId'),
+                itemId: itemId,
                 createdAt: new Date().toISOString()
             });
 
@@ -1080,6 +1186,24 @@
 
         if (action === 'close') {
             togglePanel(false);
+            return;
+        }
+
+        if (action === 'pick-item') {
+            const wrap = btn.closest('.fliq-item-search');
+            if (!wrap) return;
+            const visible = wrap.querySelector('input[name="itemSearch"]');
+            const nameInput = wrap.querySelector('input[name="itemName"]');
+            const idInput = wrap.querySelector('input[name="itemId"]');
+            if (visible) visible.value = btn.dataset.itemName || '';
+            if (nameInput) nameInput.value = btn.dataset.itemName || '';
+            if (idInput) idInput.value = btn.dataset.itemId || '';
+            const list = wrap.querySelector('.fliq-suggestions');
+            if (list) {
+                list.innerHTML = '';
+                list.classList.remove('fliq-suggestions-open');
+            }
+            if (visible) visible.blur();
             return;
         }
 
