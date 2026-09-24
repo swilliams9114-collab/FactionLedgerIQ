@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.1.0
+// @version      0.2.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.1.0';
+    const VERSION = '0.2.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -31,7 +31,8 @@
 
     const DEFAULT_STATE = {
         schemaVersion: 1,
-        settings: { playerName: '', playerId: '', factionName: '' },
+        settings: { playerName: '', playerId: '', factionName: '', autoDetectPurchases: true },
+        detection: { processedFingerprints: [], lastDetectedAt: '', lastSource: '' },
         whitelist: [],
         transactions: [],
         createdAt: new Date().toISOString(),
@@ -42,6 +43,9 @@
     let activeTab = 'dashboard';
     let dockObserver = null;
     let dockQueued = false;
+    let purchaseObserver = null;
+    let purchaseScanQueued = false;
+    const recentClickCaptures = [];
 
     function clone(v) { return JSON.parse(JSON.stringify(v)); }
 
@@ -54,6 +58,7 @@
                 ...clone(DEFAULT_STATE),
                 ...parsed,
                 settings: { ...DEFAULT_STATE.settings, ...(parsed.settings || {}) },
+                detection: { ...DEFAULT_STATE.detection, ...(parsed.detection || {}) },
                 whitelist: Array.isArray(parsed.whitelist) ? parsed.whitelist : [],
                 transactions: Array.isArray(parsed.transactions) ? parsed.transactions : []
             };
@@ -100,6 +105,212 @@
 
     function billable(actualTotal, mvTotal) {
         return Math.max(Number(actualTotal || 0), Number(mvTotal || 0));
+    }
+
+    function normalizeItemName(v) {
+        return String(v || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    }
+
+    function whitelistMatch(itemName, itemId) {
+        const wantedName = normalizeItemName(itemName);
+        const wantedId = String(itemId || '').trim();
+        return state.whitelist.find(function (w) {
+            const idMatch = wantedId && String(w.itemId || '').trim() === wantedId;
+            const nameMatch = wantedName && normalizeItemName(w.itemName) === wantedName;
+            return idMatch || nameMatch;
+        }) || null;
+    }
+
+    function rememberFingerprint(fp) {
+        if (!fp) return;
+        state.detection.processedFingerprints = Array.isArray(state.detection.processedFingerprints)
+            ? state.detection.processedFingerprints : [];
+        if (!state.detection.processedFingerprints.includes(fp)) {
+            state.detection.processedFingerprints.push(fp);
+            if (state.detection.processedFingerprints.length > 300) {
+                state.detection.processedFingerprints =
+                    state.detection.processedFingerprints.slice(-300);
+            }
+        }
+    }
+
+    function alreadyProcessed(fp) {
+        return Array.isArray(state.detection.processedFingerprints) &&
+            state.detection.processedFingerprints.includes(fp);
+    }
+
+    function detectSource() {
+        const href = location.href.toLowerCase();
+        if (href.includes('item.php') || href.includes('itemmarket') || href.includes('market')) return 'Item Market';
+        if (href.includes('bazaar')) return 'Bazaar';
+        if (href.includes('shops.php') || href.includes('bigalgunshop')) return 'City Shop';
+        if (href.includes('trade.php')) return 'Trade';
+        return 'Torn';
+    }
+
+    function parseMoney(text) {
+        const matches = String(text || '').match(/\$\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)/g);
+        if (!matches || !matches.length) return 0;
+        const last = matches[matches.length - 1];
+        return Number(last.replace(/[^0-9]/g, '')) || 0;
+    }
+
+    function parsePurchaseConfirmation(text) {
+        const clean = String(text || '').replace(/\s+/g, ' ').trim();
+        if (!clean || !/\b(?:you\s+(?:bought|purchased)|purchase(?:d)?|bought)\b/i.test(clean)) return null;
+
+        const patterns = [
+            /you\s+(?:bought|purchased)\s+(\d[\d,]*)\s*[x×]?\s*(.+?)\s+(?:for|at a cost of|costing)\s+\$\s*([\d,]+)/i,
+            /you\s+(?:bought|purchased)\s+(.+?)\s*[x×]\s*(\d[\d,]*)\s+(?:for|at a cost of|costing)\s+\$\s*([\d,]+)/i,
+            /you\s+(?:bought|purchased)\s+(?:a|an|the)?\s*(.+?)\s+(?:for|at a cost of|costing)\s+\$\s*([\d,]+)/i
+        ];
+
+        for (const re of patterns) {
+            const m = clean.match(re);
+            if (!m) continue;
+            let qty = 1, itemName = '', total = 0;
+            if (re === patterns[0]) {
+                qty = Number(m[1].replace(/,/g, '')) || 1;
+                itemName = m[2];
+                total = Number(m[3].replace(/,/g, '')) || 0;
+            } else if (re === patterns[1]) {
+                itemName = m[1];
+                qty = Number(m[2].replace(/,/g, '')) || 1;
+                total = Number(m[3].replace(/,/g, '')) || 0;
+            } else {
+                itemName = m[1];
+                total = Number(m[2].replace(/,/g, '')) || parseMoney(clean);
+            }
+            itemName = itemName.replace(/[.!]+$/, '').trim();
+            if (itemName && total > 0) return { itemName, qty, actualTotal: total, rawText: clean };
+        }
+        return null;
+    }
+
+    function capturePotentialPurchaseClick(e) {
+        const target = e.target.closest('button,a,[role="button"],input[type="button"],input[type="submit"]');
+        if (!target) return;
+        const label = String(target.innerText || target.value || target.getAttribute('aria-label') || '').trim();
+        if (!/\b(?:buy|purchase)\b/i.test(label)) return;
+
+        const container = target.closest('li,tr,[class*="item"],[class*="listing"],[class*="row"],form') || target.parentElement;
+        const text = container ? String(container.innerText || '') : '';
+        const price = parseMoney(text);
+        const candidates = container ? Array.from(container.querySelectorAll('[data-item],[data-item-id],[class*="name"],h4,h5,b,strong')) : [];
+        const nameNode = candidates.find(function (n) {
+            const t = String(n.innerText || n.getAttribute('data-item') || '').trim();
+            return t && !/^\$/.test(t) && !/\b(?:buy|purchase)\b/i.test(t);
+        });
+        const itemName = nameNode ? String(nameNode.innerText || nameNode.getAttribute('data-item') || '').trim() : '';
+        const itemId = container
+            ? String(container.getAttribute('data-item-id') || target.getAttribute('data-item-id') || '').trim()
+            : '';
+
+        recentClickCaptures.push({
+            at: Date.now(),
+            source: detectSource(),
+            itemName,
+            itemId,
+            price,
+            text: text.slice(0, 1200)
+        });
+        while (recentClickCaptures.length > 12) recentClickCaptures.shift();
+    }
+
+    function bestRecentCapture(parsed) {
+        const now = Date.now();
+        return recentClickCaptures.slice().reverse().find(function (c) {
+            if (now - c.at > 15000) return false;
+            if (!c.itemName || !parsed.itemName) return true;
+            return normalizeItemName(c.itemName).includes(normalizeItemName(parsed.itemName)) ||
+                normalizeItemName(parsed.itemName).includes(normalizeItemName(c.itemName));
+        }) || null;
+    }
+
+    function recordDetectedPurchase(parsed, node) {
+        const capture = bestRecentCapture(parsed);
+        const source = capture && capture.source ? capture.source : detectSource();
+        const itemName = parsed.itemName || (capture && capture.itemName) || '';
+        const itemId = capture && capture.itemId ? capture.itemId : '';
+        const whitelist = whitelistMatch(itemName, itemId);
+        if (!whitelist) return false;
+
+        const actualTotal = Number(parsed.actualTotal || (capture && capture.price) || 0);
+        const fp = [
+            'DOMPURCHASE',
+            source,
+            normalizeItemName(itemName),
+            Number(parsed.qty || 1),
+            actualTotal,
+            Math.floor(Date.now() / 10000)
+        ].join('|');
+
+        if (alreadyProcessed(fp)) return false;
+
+        state.transactions.push({
+            id: uid('TX'),
+            chainId: uid('CHAIN'),
+            parentId: null,
+            type: 'PURCHASE',
+            timestamp: new Date().toISOString(),
+            itemName: whitelist.itemName || itemName,
+            itemId: whitelist.itemId || itemId,
+            qty: Math.max(1, Number(parsed.qty || 1)),
+            actualTotal,
+            mvTotal: 0,
+            billableTotal: actualTotal,
+            amount: actualTotal,
+            source,
+            destination: 'Personal Inventory',
+            personName: state.settings.playerName,
+            personId: state.settings.playerId,
+            notes: 'Auto-detected purchase. MV at purchase is pending capture/reconciliation.',
+            ownership: 'PERSONAL',
+            status: 'PENDING',
+            detectionMethod: 'DOM_CONFIRMATION',
+            rawConfirmation: String(parsed.rawText || '').slice(0, 1000),
+            createdAt: new Date().toISOString()
+        });
+
+        rememberFingerprint(fp);
+        state.detection.lastDetectedAt = new Date().toISOString();
+        state.detection.lastSource = source;
+        saveState();
+        toast('Whitelisted purchase detected: ' + (whitelist.itemName || itemName));
+        if (node && node.setAttribute) node.setAttribute('data-fliq-detected', '1');
+        return true;
+    }
+
+    function scanForPurchaseConfirmations(root) {
+        if (!state.settings.autoDetectPurchases) return;
+        const scope = root && root.querySelectorAll ? root : document;
+        const nodes = [scope].concat(Array.from(scope.querySelectorAll
+            ? scope.querySelectorAll('[role="alert"],[class*="success"],[class*="confirm"],[class*="message"],[class*="notification"],[class*="toast"]')
+            : []));
+        nodes.forEach(function (node) {
+            if (!node || !node.innerText || (node.getAttribute && node.getAttribute('data-fliq-detected') === '1')) return;
+            const text = String(node.innerText || '');
+            if (text.length > 1500) return;
+            const parsed = parsePurchaseConfirmation(text);
+            if (parsed) recordDetectedPurchase(parsed, node);
+        });
+    }
+
+    function startPurchaseDetection() {
+        document.addEventListener('click', capturePotentialPurchaseClick, true);
+        scanForPurchaseConfirmations(document);
+        if (purchaseObserver) return;
+        purchaseObserver = new MutationObserver(function (mutations) {
+            if (purchaseScanQueued) return;
+            const hasAdded = mutations.some(function (m) { return m.addedNodes && m.addedNodes.length; });
+            if (!hasAdded) return;
+            purchaseScanQueued = true;
+            requestAnimationFrame(function () {
+                purchaseScanQueued = false;
+                scanForPurchaseConfirmations(document);
+            });
+        });
+        purchaseObserver.observe(document.body || document.documentElement, { childList: true, subtree: true });
     }
 
     function actor(tx) {
@@ -310,7 +521,9 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.1.0 is the accounting foundation. Automatic Torn detection comes after the base UI and storage are verified in TornPDA.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.2.0 purchase detection is active for whitelisted items. Current phase uses Torn page purchase confirmations; API reconciliation and automatic MV-at-purchase capture are next.</div>' +
+                '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
+                    (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
         '</div>';
     }
@@ -533,6 +746,9 @@
                 field('Your Torn ID', '<input name="playerId" value="' + esc(state.settings.playerId) + '" required>')
             ) +
             field('Faction name (optional)', '<input name="factionName" value="' + esc(state.settings.factionName) + '">') +
+            field('Automatic purchase detection', '<select name="autoDetectPurchases"><option value="true"' +
+                (state.settings.autoDetectPurchases ? ' selected' : '') + '>On</option><option value="false"' +
+                (!state.settings.autoDetectPurchases ? ' selected' : '') + '>Off</option></select>') +
             '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button></div>' +
         '</form>' +
         '<div class="fliq-section"><h3>Backup & Restore</h3><div class="fliq-card">' +
@@ -545,7 +761,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release provides the ledger, accounting rules, whitelist, receipts, manual event testing, backup/restore, and TornPDA docked launcher.' +
+            'v' + VERSION + ' performs no Torn game actions. This release adds automatic DOM purchase detection for whitelisted purchases while retaining the ledger, accounting rules, receipts, backup/restore, and TornPDA docked launcher.' +
         '</div></div>';
     }
 
@@ -562,6 +778,7 @@
             state.settings.playerName = formValue(fd, 'playerName');
             state.settings.playerId = formValue(fd, 'playerId');
             state.settings.factionName = formValue(fd, 'factionName');
+            state.settings.autoDetectPurchases = formValue(fd, 'autoDetectPurchases') !== 'false';
             saveState();
             toast('Settings saved');
             return;
@@ -821,6 +1038,7 @@
         ensurePanel();
         ensureDockButton();
         startDockObserver();
+        startPurchaseDetection();
         window.addEventListener('pageshow', ensureDockButton);
         window.addEventListener('popstate', function () {
             setTimeout(ensureDockButton, 100);
