@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.3.4
+// @version      0.3.5
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.3.4';
+    const VERSION = '0.3.5';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -423,92 +423,101 @@
             state.detection.processedLogIds.includes(id);
     }
 
-    function reconcileApiPurchase(log) {
+    async function reconcileApiPurchase(log) {
         const id = logId(log);
         if (!id || isLogProcessed(id)) return false;
 
-        const text = logText(log);
-        if (!/\b(?:bought|purchase|purchased|item market|bazaar|city shop|shop)\b/i.test(text)) return false;
+        const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+        const items = Array.isArray(data.items) ? data.items : [];
 
-        const data = log.data || {};
-        const itemName = String(
-            data.item_name || data.itemName || data.name ||
-            (data.item && (data.item.name || data.item.item_name)) || ''
-        ).trim();
-        const itemId = String(
-            data.item_id || data.itemId ||
-            (data.item && (data.item.id || data.item.item_id)) || ''
-        ).trim();
+        // Torn Item Market purchase logs expose item rows plus cost_total/cost_each.
+        // Require purchase-like monetary fields so unrelated item-array logs are ignored.
+        if (!items.length || (data.cost_total == null && data.cost_each == null)) return false;
 
-        const capture = recentClickCaptures.slice().reverse().find(function (c) {
-            return Date.now() - c.at < 120000 &&
-                (!itemName || !c.itemName ||
-                    normalizeItemName(c.itemName).includes(normalizeItemName(itemName)) ||
-                    normalizeItemName(itemName).includes(normalizeItemName(c.itemName)));
-        }) || null;
-
-        const wl = whitelistMatch(itemName || (capture && capture.itemName), itemId || (capture && capture.itemId));
-        if (!wl) {
-            markLogProcessed(id);
-            return false;
+        let catalogReady = itemCatalog.length > 0;
+        if (!catalogReady) {
+            try {
+                await ensureItemCatalog(false);
+                catalogReady = true;
+            } catch (err) {
+                console.warn('[FactionLedgerIQ] Could not resolve Torn item catalog', err);
+            }
         }
 
-        const qty = Math.max(1, Number(
-            data.quantity || data.qty || data.amount ||
-            (data.item && (data.item.quantity || data.item.qty)) || 1
-        ));
-        let actualTotal = Number(
-            data.total_cost || data.total || data.cost || data.price || data.money || 0
-        ) || 0;
-        if (!actualTotal && capture) actualTotal = Number(capture.price || 0);
+        let recorded = false;
+        const totalLogCost = Math.max(0, Number(data.cost_total || 0));
+        const costEach = Math.max(0, Number(data.cost_each || 0));
+        const totalQty = items.reduce(function (sum, row) {
+            return sum + Math.max(1, Number(row && (row.qty || row.quantity) || 1));
+        }, 0);
 
-        const existing = liveTransactions().find(function (tx) {
-            return tx.type === 'PURCHASE' &&
-                normalizeItemName(tx.itemName) === normalizeItemName(wl.itemName) &&
-                Math.abs(new Date(tx.timestamp).getTime() - Date.now()) < 180000 &&
-                tx.detectionMethod === 'DOM_CONFIRMATION';
-        });
+        items.forEach(function (row) {
+            if (!row || typeof row !== 'object') return;
+            const itemId = String(row.id || row.item_id || '').trim();
+            const qty = Math.max(1, Number(row.qty || row.quantity || 1));
+            const catalogItem = itemCatalog.find(function (item) { return String(item.id) === itemId; });
+            const itemName = catalogItem ? catalogItem.name : '';
+            const wl = whitelistMatch(itemName, itemId);
+            if (!wl) return;
 
-        if (existing) {
-            existing.apiLogId = id;
-            existing.detectionMethod = 'API_CONFIRMED';
-            existing.notes = 'API-confirmed purchase; DOM context reconciled.';
-            if (!existing.actualTotal && actualTotal) {
-                existing.actualTotal = actualTotal;
-                existing.amount = actualTotal;
-                existing.billableTotal = Math.max(actualTotal, Number(existing.mvTotal || 0));
+            let actualTotal = costEach ? costEach * qty : 0;
+            if (!actualTotal && totalLogCost) {
+                actualTotal = totalQty > 0 ? Math.round(totalLogCost * (qty / totalQty)) : totalLogCost;
             }
-        } else {
+
+            const duplicate = liveTransactions().find(function (tx) {
+                return tx.type === 'PURCHASE' && tx.apiLogId === id &&
+                    String(tx.itemId || '') === itemId;
+            });
+            if (duplicate) return;
+
+            const capture = recentClickCaptures.slice().reverse().find(function (c) {
+                return Date.now() - c.at < 120000 &&
+                    (!c.itemId || String(c.itemId) === itemId ||
+                        !c.itemName || !itemName ||
+                        normalizeItemName(c.itemName).includes(normalizeItemName(itemName)) ||
+                        normalizeItemName(itemName).includes(normalizeItemName(c.itemName)));
+            }) || null;
+
             state.transactions.push({
                 id: uid('TX'),
                 chainId: uid('CHAIN'),
                 parentId: null,
                 type: 'PURCHASE',
                 timestamp: log.timestamp ? new Date(Number(log.timestamp) * 1000).toISOString() : new Date().toISOString(),
-                itemName: wl.itemName || itemName,
+                itemName: wl.itemName || itemName || ('Item #' + itemId),
                 itemId: wl.itemId || itemId,
-                qty,
-                actualTotal,
+                qty: qty,
+                actualTotal: actualTotal,
                 mvTotal: 0,
                 billableTotal: actualTotal,
                 amount: actualTotal,
-                source: (capture && capture.source) || 'Torn API Log',
+                source: 'Item Market',
                 destination: 'Personal Inventory',
                 personName: state.settings.playerName,
                 personId: state.settings.playerId,
-                notes: 'API-confirmed purchase. Purchase-time MV pending reconciliation.',
+                notes: 'API-confirmed Item Market purchase. Seller ID: ' +
+                    String(data.seller == null ? 'unknown' : data.seller) +
+                    '. Purchase-time MV pending reconciliation.',
                 ownership: 'PERSONAL',
                 status: 'PENDING',
                 detectionMethod: 'API_CONFIRMED',
                 apiLogId: id,
+                sellerId: data.seller == null ? '' : String(data.seller),
+                costEach: costEach,
                 createdAt: new Date().toISOString()
             });
-        }
+            recorded = true;
+        });
 
+        // Only mark the log processed once it is understood. Whitelisted purchases are
+        // recorded; non-whitelisted purchases can be safely ignored after inspection.
         markLogProcessed(id);
-        state.detection.lastDetectedAt = new Date().toISOString();
-        state.detection.lastSource = 'Torn API';
-        return true;
+        if (recorded) {
+            state.detection.lastDetectedAt = new Date().toISOString();
+            state.detection.lastSource = 'Torn API · Item Market';
+        }
+        return recorded;
     }
 
     async function pollApiLogs(showToast) {
@@ -521,9 +530,9 @@
             const logs = logArray(data);
             rememberApiEvents(logs);
             let changed = false;
-            logs.forEach(function (log) {
-                if (reconcileApiPurchase(log)) changed = true;
-            });
+            for (const log of logs) {
+                if (await reconcileApiPurchase(log)) changed = true;
+            }
             state.detection.lastApiPollAt = new Date().toISOString();
             state.detection.lastApiError = '';
             state.detection.apiStatus = 'Connected';
@@ -859,7 +868,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.3.4 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.3.5 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -1118,7 +1127,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release fixes Torn user-log object-map parsing so API events reach diagnostics and purchase reconciliation, while retaining safe diagnostics, item autocomplete, and mobile-safe polling while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
+            'v' + VERSION + ' performs no Torn game actions. This release recognizes the observed Torn Item Market purchase log structure (items[], cost_total, cost_each, seller), resolves item IDs through the Torn item catalog, and creates Pending whitelisted purchases automatically while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
         '</div></div>';
     }
 
