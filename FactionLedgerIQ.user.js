@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.3.3
+// @version      0.3.4
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.3.3';
+    const VERSION = '0.3.4';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -342,9 +342,18 @@
 
     function logArray(data) {
         if (!data) return [];
-        if (Array.isArray(data.log)) return data.log;
-        if (Array.isArray(data.logs)) return data.logs;
-        if (Array.isArray(data)) return data;
+        const source = data.log != null ? data.log : (data.logs != null ? data.logs : data);
+        if (Array.isArray(source)) return source;
+        if (source && typeof source === 'object') {
+            return Object.keys(source).map(function (key) {
+                const value = source[key];
+                if (!value || typeof value !== 'object') return null;
+                if (value.id == null && value.log_id == null && value.logId == null) {
+                    return { ...value, id: key };
+                }
+                return value;
+            }).filter(Boolean);
+        }
         return [];
     }
 
@@ -850,7 +859,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.3.3 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.3.4 uses Torn API user logs for purchase confirmation and DOM activity for purchase context. Purchase-time MV reconciliation is still in progress.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -1109,7 +1118,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release adds safe recent-event API diagnostics alongside the Torn item autocomplete picker, mobile-safe polling, and purchase reconciliation while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
+            'v' + VERSION + ' performs no Torn game actions. This release fixes Torn user-log object-map parsing so API events reach diagnostics and purchase reconciliation, while retaining safe diagnostics, item autocomplete, and mobile-safe polling while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
         '</div></div>';
     }
 
