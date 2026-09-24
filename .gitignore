@@ -1,0 +1,9 @@
+# Local/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+
+# Optional local development
+node_modules/
+.env
