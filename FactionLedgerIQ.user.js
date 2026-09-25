@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.3.9
+// @version      0.4.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.3.9';
+    const VERSION = '0.4.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -481,10 +481,49 @@
     }
 
     async function reconcileFactionMovement(logs) {
-        const parts = (logs || []).map(factionTransferPart).filter(Boolean);
-        if (!parts.length) return false;
         try { await ensureItemCatalog(false); } catch (e) {}
+        const actorId = String(state.settings.playerId || '').trim();
+        let changed = false;
 
+        // Observed ARMORY_IN signature: faction + items[], with no sender/receiver.
+        // This is distinct from Item Market purchases because there are no cost fields/seller.
+        (logs || []).forEach(function (log) {
+            const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+            const rows = Array.isArray(data.items) ? data.items : [];
+            if (data.faction == null || !rows.length || data.sender != null || data.receiver != null) return;
+            if (data.cost_total != null || data.cost_each != null || data.seller != null) return;
+
+            rows.forEach(function (row) {
+                const itemId = String(row.id || row.item_id || '').trim();
+                const qty = Math.max(1, Number(row.qty || row.quantity || 1));
+                if (!itemId) return;
+                const key = ['IN', log.timestamp || 0, data.faction, itemId, qty, logId(log)].join('|');
+                if (liveTransactions().some(function (tx) { return tx.factionMovementKey === key; })) return;
+
+                const item = itemCatalog.find(function (x) { return String(x.id) === itemId; });
+                const mvEach = item ? Math.max(0, Number(item.marketValue || 0)) : 0;
+                const mvTotal = mvEach * qty;
+                state.transactions.push({
+                    id: uid('TX'), chainId: uid('CHAIN'), parentId: null,
+                    type: 'ARMORY_IN',
+                    timestamp: log.timestamp ? new Date(Number(log.timestamp) * 1000).toISOString() : new Date().toISOString(),
+                    itemName: item ? item.name : ('Item #' + itemId), itemId: itemId, qty: qty,
+                    actualTotal: 0, mvTotal: mvTotal, mvEach: mvEach,
+                    billableTotal: mvTotal, amount: mvTotal,
+                    source: 'Personal Inventory', destination: 'Faction Armory',
+                    personName: state.settings.playerName, personId: state.settings.playerId,
+                    notes: 'API-confirmed personal inventory deposit to faction armory. Full deposited quantity valued at movement-time MV.',
+                    ownership: 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT',
+                    status: 'DEPOSITED', detectionMethod: 'API_FACTION_ARMORY_IN',
+                    factionId: String(data.faction), factionMovementKey: key,
+                    apiLogIds: [logId(log)].filter(Boolean), createdAt: new Date().toISOString()
+                });
+                changed = true;
+            });
+        });
+
+        // Observed ARMORY_OUT signature: matching sender/receiver events for the player.
+        const parts = (logs || []).map(factionTransferPart).filter(Boolean);
         const groups = new Map();
         parts.forEach(function (part) {
             part.rows.forEach(function (row) {
@@ -493,57 +532,27 @@
                 groups.get(key).push({ part: part, row: row });
             });
         });
-
-        let changed = false;
-        const actorId = String(state.settings.playerId || '').trim();
-        groups.forEach(function (entries, key) {
-            if (liveTransactions().some(function (tx) { return tx.factionMovementKey === key; })) return;
-
+        groups.forEach(function (entries, baseKey) {
             const senderSide = entries.find(function (x) { return actorId && x.part.sender === actorId; });
             const receiverSide = entries.find(function (x) { return actorId && x.part.receiver === actorId; });
-            if (!senderSide || !receiverSide) return; // wait for both sides; avoids guessing direction from one log
-
+            if (!senderSide || !receiverSide) return;
             const row = senderSide.row;
+            const key = 'OUT|' + baseKey;
+            if (liveTransactions().some(function (tx) { return tx.factionMovementKey === key; })) return;
             const item = itemCatalog.find(function (x) { return String(x.id) === row.itemId; });
             const mvEach = item ? Math.max(0, Number(item.marketValue || 0)) : 0;
             const mvTotal = mvEach * row.qty;
-
-            // Observed paired faction-transfer logs do not themselves identify which side is
-            // the faction ledger direction. Use temporal context: a recent unmatched personal
-            // inventory purchase/deposit intent is ARMORY_IN; otherwise record as ARMORY_OUT
-            // pending purpose. This is conservative and leaves ambiguous cases pending.
-            const recentPersonal = liveTransactions().slice().reverse().find(function (tx) {
-                return tx.type === 'PURCHASE' && tx.status === 'PENDING' &&
-                    String(tx.itemId || '') === row.itemId &&
-                    Math.abs(new Date(tx.timestamp).getTime() - senderSide.part.timestamp * 1000) < 3600000;
-            });
-            const type = recentPersonal ? 'ARMORY_IN' : 'ARMORY_OUT';
             state.transactions.push({
-                id: uid('TX'),
-                chainId: uid('CHAIN'),
-                parentId: null,
-                type: type,
+                id: uid('TX'), chainId: uid('CHAIN'), parentId: null,
+                type: 'ARMORY_OUT',
                 timestamp: new Date(senderSide.part.timestamp * 1000).toISOString(),
-                itemName: item ? item.name : ('Item #' + row.itemId),
-                itemId: row.itemId,
-                qty: row.qty,
-                actualTotal: 0,
-                mvTotal: mvTotal,
-                mvEach: mvEach,
-                billableTotal: type === 'ARMORY_IN' ? mvTotal : 0,
-                amount: 0,
-                source: type === 'ARMORY_IN' ? 'Personal Inventory' : 'Faction Armory',
-                destination: type === 'ARMORY_IN' ? 'Faction Armory' : 'Personal Inventory',
-                personName: state.settings.playerName,
-                personId: state.settings.playerId,
-                notes: type === 'ARMORY_IN'
-                    ? 'API-confirmed faction item movement; personal contribution valued at movement-time MV.'
-                    : 'API-confirmed faction item movement; faction-owned asset held by player. Purpose pending.',
-                ownership: type === 'ARMORY_IN' ? 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' : 'FACTION',
-                status: type === 'ARMORY_IN' ? 'DEPOSITED' : 'PENDING',
-                detectionMethod: 'API_FACTION_PAIRED',
-                factionId: senderSide.part.factionId,
-                factionMovementKey: key,
+                itemName: item ? item.name : ('Item #' + row.itemId), itemId: row.itemId, qty: row.qty,
+                actualTotal: 0, mvTotal: mvTotal, mvEach: mvEach, billableTotal: 0, amount: 0,
+                source: 'Faction Armory', destination: 'Personal Inventory',
+                personName: state.settings.playerName, personId: state.settings.playerId,
+                notes: 'API-confirmed faction armory withdrawal. Faction-owned asset held by player; purpose pending.',
+                ownership: 'FACTION', status: 'PENDING', detectionMethod: 'API_FACTION_ARMORY_OUT',
+                factionId: senderSide.part.factionId, factionMovementKey: key,
                 apiLogIds: entries.map(function (x) { return x.part.logId; }).filter(Boolean),
                 createdAt: new Date().toISOString()
             });
@@ -1003,7 +1012,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.3.9 pairs observed faction item-transfer API events and records armory movements with item, quantity, faction, player and movement-time MV. Withdrawals remain pending for purpose selection.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.4.0 classifies the observed Torn faction log signatures directly: faction+items without sender/receiver is ARMORY_IN; paired sender/receiver events are ARMORY_OUT. Deposits reimburse the full deposited quantity at movement-time MV.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
