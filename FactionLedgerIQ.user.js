@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.4.2
+// @version      0.4.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.4.2';
+    const VERSION = '0.4.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -404,7 +404,19 @@
     }
 
     function rememberApiEvents(logs) {
-        state.detection.recentApiEvents = (logs || []).slice(0, 20).map(safeApiEvent).filter(Boolean);
+        const incoming = (logs || []).map(safeApiEvent).filter(Boolean);
+        const existing = Array.isArray(state.detection.recentApiEvents) ? state.detection.recentApiEvents : [];
+        const merged = [];
+        const seen = new Set();
+        incoming.concat(existing).forEach(function (ev) {
+            const key = String(ev && ev.id || '') || [ev && ev.timestamp, JSON.stringify(ev && ev.data || {})].join('|');
+            if (!key || seen.has(key)) return;
+            seen.add(key);
+            merged.push(ev);
+        });
+        state.detection.recentApiEvents = merged
+            .sort(function (a, b) { return Number(b.timestamp || 0) - Number(a.timestamp || 0); })
+            .slice(0, 40);
     }
 
     function logText(log) {
@@ -797,10 +809,20 @@
         if (apiPollBusy || !state.settings.apiPolling || !apiKeyValue()) return;
         apiPollBusy = true;
         try {
-            const now = Math.floor(Date.now() / 1000);
-            const from = now - 900;
-            const data = await apiFetch('user/log', { from: String(from), to: String(now), limit: '100' });
-            const logs = logArray(data);
+            // Always request Torn's latest log page. Polling with a moving from/to window
+            // can intermittently return an empty/cached historical page even while new logs
+            // are visible in Torn. Persistent log-ID dedup makes re-reading the latest page safe.
+            let data = await apiFetch('user/log', { limit: '100' });
+            let logs = logArray(data);
+
+            // Defensive recovery: if the latest-page request is unexpectedly empty, retry once
+            // with a six-hour bounded window. Do not erase previously captured diagnostics.
+            if (!logs.length) {
+                const now = Math.floor(Date.now() / 1000);
+                const from = now - (6 * 60 * 60);
+                data = await apiFetch('user/log', { from: String(from), to: String(now), limit: '100' });
+                logs = logArray(data);
+            }
             rememberApiEvents(logs);
             let changed = false;
             logs.forEach(function (log) { rememberFactionCandidate(log); });
@@ -1435,7 +1457,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release automatically reconciles matching faction-armory withdrawals into Display Case deposits, retains faction ownership with $0 reimbursement, and suppresses duplicate API armory-withdrawal records. Purchase-time MV billing, receipts, backup/restore, and the TornPDA launcher remain unchanged.' +
+            'v' + VERSION + ' performs no Torn game actions. This release makes API log capture more reliable by polling Torn\'s latest log page, retaining recent diagnostics across empty polls, and using a bounded fallback request when needed. Faction armory/display reconciliation, purchase-time MV billing, receipts, backup/restore, and the TornPDA launcher remain unchanged.' +
         '</div></div>';
     }
 
