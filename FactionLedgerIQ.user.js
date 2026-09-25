@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.4.0
+// @version      0.4.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.4.0';
+    const VERSION = '0.4.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -100,6 +100,18 @@
 
     function liveTransactions() {
         return state.transactions.filter(function (tx) { return tx.status !== 'VOID'; });
+    }
+
+    function sameMovement(tx, type, timestamp, factionId, itemId, qty) {
+        if (!tx || tx.type !== type || tx.status === 'VOID') return false;
+        const a = new Date(tx.timestamp).getTime();
+        const b = Number(timestamp || 0) * 1000;
+        if (!Number.isFinite(a) || !Number.isFinite(b) || Math.abs(a - b) > 2000) return false;
+        if (String(tx.itemId || '') !== String(itemId || '')) return false;
+        if (Number(tx.qty || 0) !== Number(qty || 0)) return false;
+        // Older versions did not always persist factionId, so missing factionId must not defeat dedup.
+        if (tx.factionId && factionId && String(tx.factionId) !== String(factionId)) return false;
+        return true;
     }
 
     function childrenOf(parentId, type) {
@@ -498,7 +510,10 @@
                 const qty = Math.max(1, Number(row.qty || row.quantity || 1));
                 if (!itemId) return;
                 const key = ['IN', log.timestamp || 0, data.faction, itemId, qty, logId(log)].join('|');
-                if (liveTransactions().some(function (tx) { return tx.factionMovementKey === key; })) return;
+                if (liveTransactions().some(function (tx) {
+                    return tx.factionMovementKey === key ||
+                        sameMovement(tx, 'ARMORY_IN', log.timestamp, data.faction, itemId, qty);
+                })) return;
 
                 const item = itemCatalog.find(function (x) { return String(x.id) === itemId; });
                 const mvEach = item ? Math.max(0, Number(item.marketValue || 0)) : 0;
@@ -538,7 +553,10 @@
             if (!senderSide || !receiverSide) return;
             const row = senderSide.row;
             const key = 'OUT|' + baseKey;
-            if (liveTransactions().some(function (tx) { return tx.factionMovementKey === key; })) return;
+            if (liveTransactions().some(function (tx) {
+                return tx.factionMovementKey === key ||
+                    sameMovement(tx, 'ARMORY_OUT', senderSide.part.timestamp, senderSide.part.factionId, row.itemId, row.qty);
+            })) return;
             const item = itemCatalog.find(function (x) { return String(x.id) === row.itemId; });
             const mvEach = item ? Math.max(0, Number(item.marketValue || 0)) : 0;
             const mvTotal = mvEach * row.qty;
@@ -827,6 +845,14 @@
                 }
             }
 
+            if (tx.type === 'ARMORY_IN' &&
+                tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT') {
+                const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
+                    return sum + Number(r.amount || r.actualTotal || 0);
+                }, 0);
+                factionOwesMe += Math.max(0, Number(tx.billableTotal || tx.mvTotal || 0) - refunded);
+            }
+
             if (tx.type === 'SALE') {
                 const deposited = childrenOf(tx.id, 'FACTION_BALANCE_IN').reduce(function (sum, r) {
                     return sum + Number(r.amount || 0);
@@ -1012,7 +1038,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.4.0 classifies the observed Torn faction log signatures directly: faction+items without sender/receiver is ARMORY_IN; paired sender/receiver events are ARMORY_OUT. Deposits reimburse the full deposited quantity at movement-time MV.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.4.1 adds semantic cross-version movement deduplication, displays ARMORY_IN movement-time MV/reimbursement, and includes personal armory contributions in the Faction owes me dashboard balance.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -1153,6 +1179,7 @@
             Number(tx.actualTotal || 0) ? 'Actual Cost/Amount: ' + money(tx.actualTotal) : null,
             Number(tx.mvTotal || 0) ? 'MV at Event: ' + money(tx.mvTotal) : null,
             tx.type === 'PURCHASE' ? 'Billable: ' + money(tx.billableTotal) : null,
+            tx.type === 'ARMORY_IN' ? 'Reimbursement Due: ' + money(tx.billableTotal || tx.mvTotal) : null,
             tx.type === 'PURCHASE'
                 ? 'Pricing Rule: ' + (Number(tx.mvTotal || 0) <= 0
                     ? 'MV unavailable - actual cost used'
@@ -1208,7 +1235,12 @@
             (tx.type === 'PURCHASE'
                 ? '<div>Actual ' + money(tx.actualTotal) + ' · MV ' + money(tx.mvTotal) +
                     ' · Billable <b>' + money(tx.billableTotal) + '</b></div>'
-                : '') +
+                : (tx.type === 'ARMORY_IN'
+                    ? '<div>MV each ' + money(tx.mvEach) + ' · Qty ' + Number(tx.qty || 0).toLocaleString() +
+                        ' · Reimbursement <b>' + money(tx.billableTotal || tx.mvTotal) + '</b></div>'
+                    : (tx.type === 'ARMORY_OUT' && Number(tx.mvTotal || 0)
+                        ? '<div>Movement MV ' + money(tx.mvTotal) + ' · Faction-owned</div>'
+                        : ''))) +
             '<div class="fliq-muted">' + esc(tx.source || '') +
                 (tx.source && tx.destination ? ' → ' : '') + esc(tx.destination || '') +
                 ' · ' + esc(tx.status) + '</div>' +
