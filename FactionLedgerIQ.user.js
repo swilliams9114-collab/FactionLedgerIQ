@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.4.1
+// @version      0.4.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.4.1';
+    const VERSION = '0.4.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -492,6 +492,119 @@
         return [part.timestamp, part.factionId, row.itemId, row.qty].join('|');
     }
 
+    function suppressDuplicateArmoryOuts() {
+        const rows = state.transactions.filter(function (tx) {
+            return tx && tx.type === 'ARMORY_OUT' && tx.status !== 'VOID' &&
+                String(tx.detectionMethod || '').indexOf('API_FACTION_ARMORY_OUT') === 0;
+        }).sort(function (a, b) {
+            return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+        });
+        let changed = false;
+        for (let i = 0; i < rows.length; i += 1) {
+            const keep = rows[i];
+            if (!keep || keep.status === 'VOID') continue;
+            for (let j = i + 1; j < rows.length; j += 1) {
+                const dup = rows[j];
+                if (!dup || dup.status === 'VOID') continue;
+                const dt = Math.abs(new Date(keep.timestamp).getTime() - new Date(dup.timestamp).getTime());
+                if (dt > 2000) break;
+                if (String(keep.itemId || '') !== String(dup.itemId || '')) continue;
+                if (Number(keep.qty || 0) !== Number(dup.qty || 0)) continue;
+                if (keep.factionId && dup.factionId && String(keep.factionId) !== String(dup.factionId)) continue;
+                if (childrenOf(dup.id).length) continue;
+                dup.status = 'VOID';
+                dup.voidReason = 'Automatically suppressed duplicate API armory-withdrawal record.';
+                dup.voidedAt = new Date().toISOString();
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    function displayCaseDepositPart(log) {
+        const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+        const rows = Array.isArray(data.items) ? data.items : [];
+        if (!rows.length) return null;
+        // Observed Display Case deposit event: items[] only. Reject faction transfers,
+        // market purchases, and other actor-addressed item movements.
+        if (data.faction != null || data.sender != null || data.receiver != null ||
+            data.seller != null || data.cost_total != null || data.cost_each != null) return null;
+        const meaningfulKeys = Object.keys(data).filter(function (k) { return data[k] != null; });
+        if (meaningfulKeys.some(function (k) { return k !== 'items'; })) return null;
+        return {
+            logId: logId(log),
+            timestamp: Number(log.timestamp || 0),
+            rows: rows.map(function (row) {
+                return {
+                    itemId: String(row && (row.id || row.item_id) || '').trim(),
+                    qty: Math.max(1, Number(row && (row.qty || row.quantity) || 1))
+                };
+            }).filter(function (row) { return row.itemId; })
+        };
+    }
+
+    function reconcileDisplayCaseDeposits(logs) {
+        let changed = false;
+        const candidates = (logs || []).map(displayCaseDepositPart).filter(Boolean)
+            .sort(function (a, b) { return a.timestamp - b.timestamp; });
+
+        candidates.forEach(function (part) {
+            if (!part.logId || liveTransactions().some(function (tx) {
+                return tx.displayApiLogId === part.logId ||
+                    (Array.isArray(tx.apiLogIds) && tx.apiLogIds.includes(part.logId));
+            })) return;
+
+            part.rows.forEach(function (row) {
+                const eventMs = part.timestamp * 1000;
+                const match = liveTransactions().filter(function (tx) {
+                    if (tx.type !== 'ARMORY_OUT' || tx.ownership !== 'FACTION') return false;
+                    if (tx.status !== 'PENDING' && tx.status !== 'HELD') return false;
+                    if (String(tx.itemId || '') !== row.itemId || Number(tx.qty || 0) !== row.qty) return false;
+                    const outMs = new Date(tx.timestamp).getTime();
+                    return Number.isFinite(outMs) && outMs <= eventMs && eventMs - outMs <= 10 * 60 * 1000;
+                }).sort(function (a, b) {
+                    return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
+                })[0];
+
+                if (!match) return;
+                match.status = 'DISPLAY';
+                match.notes = [match.notes, 'API-confirmed matching deposit into Display Case; faction ownership retained.']
+                    .filter(Boolean).join(' | ');
+                match.displayApiLogId = part.logId;
+                match.apiLogIds = Array.from(new Set([].concat(match.apiLogIds || [], [part.logId]).filter(Boolean)));
+
+                state.transactions.push({
+                    id: uid('TX'),
+                    chainId: match.chainId || match.id,
+                    parentId: match.id,
+                    type: 'DISPLAY_IN',
+                    timestamp: part.timestamp ? new Date(part.timestamp * 1000).toISOString() : new Date().toISOString(),
+                    itemName: match.itemName,
+                    itemId: match.itemId,
+                    qty: match.qty,
+                    actualTotal: 0,
+                    mvTotal: Number(match.mvTotal || 0),
+                    mvEach: Number(match.mvEach || 0),
+                    billableTotal: 0,
+                    amount: 0,
+                    source: 'Personal Inventory',
+                    destination: 'Display Case',
+                    personName: state.settings.playerName,
+                    personId: state.settings.playerId,
+                    notes: 'Automatically reconciled from faction armory withdrawal to Display Case. Faction-owned; no reimbursement created.',
+                    ownership: 'FACTION',
+                    status: 'RECORDED',
+                    detectionMethod: 'API_DISPLAY_IN_RECONCILED',
+                    displayApiLogId: part.logId,
+                    apiLogIds: [part.logId],
+                    createdAt: new Date().toISOString()
+                });
+                changed = true;
+            });
+        });
+        return changed;
+    }
+
     async function reconcileFactionMovement(logs) {
         try { await ensureItemCatalog(false); } catch (e) {}
         const actorId = String(state.settings.playerId || '').trim();
@@ -691,7 +804,9 @@
             rememberApiEvents(logs);
             let changed = false;
             logs.forEach(function (log) { rememberFactionCandidate(log); });
+            if (suppressDuplicateArmoryOuts()) changed = true;
             if (await reconcileFactionMovement(logs)) changed = true;
+            if (reconcileDisplayCaseDeposits(logs)) changed = true;
             for (const log of logs) {
                 if (await reconcileApiPurchase(log)) changed = true;
             }
@@ -1320,7 +1435,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release reads API v2 item market value from the nested value.market_price field (with legacy fallbacks), freezes it at purchase detection, and bills the greater of actual cost or purchase-time MV while retaining DOM context capture, the ledger, receipts, backup/restore, and TornPDA launcher.' +
+            'v' + VERSION + ' performs no Torn game actions. This release automatically reconciles matching faction-armory withdrawals into Display Case deposits, retains faction ownership with $0 reimbursement, and suppresses duplicate API armory-withdrawal records. Purchase-time MV billing, receipts, backup/restore, and the TornPDA launcher remain unchanged.' +
         '</div></div>';
     }
 
