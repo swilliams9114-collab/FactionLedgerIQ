@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.4.3
+// @version      0.4.4
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.4.3';
+    const VERSION = '0.4.4';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -711,8 +711,10 @@
         const data = log && log.data && typeof log.data === 'object' ? log.data : {};
         const items = Array.isArray(data.items) ? data.items : [];
 
-        // Torn Item Market purchase logs expose item rows plus cost_total/cost_each.
-        // Require purchase-like monetary fields so unrelated item-array logs are ignored.
+        // Confirmed Item Market BUY signature includes seller. Confirmed SELL signature
+        // includes buyer and fee. Never let a sale create a reimbursement purchase.
+        if (data.buyer != null || data.fee != null) return false;
+        if (data.seller == null) return false;
         if (!items.length || (data.cost_total == null && data.cost_each == null)) return false;
 
         let catalogReady = itemCatalog.length > 0;
@@ -805,6 +807,116 @@
         return recorded;
     }
 
+    function itemMarketSalePart(log) {
+        const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+        const rows = Array.isArray(data.items) ? data.items : [];
+        if (!rows.length || data.buyer == null || data.cost_total == null) return null;
+        return {
+            logId: logId(log),
+            timestamp: Number(log.timestamp || 0),
+            buyerId: String(data.buyer),
+            netTotal: Math.max(0, Number(data.cost_total || 0)),
+            fee: Math.max(0, Number(data.fee || 0)),
+            priceEach: Math.max(0, Number(data.cost_each || data.price || 0)),
+            rows: rows.map(function (row) {
+                return {
+                    itemId: String(row && (row.id || row.item_id) || '').trim(),
+                    qty: Math.max(1, Number(row && (row.qty || row.quantity) || 1))
+                };
+            }).filter(function (row) { return row.itemId; })
+        };
+    }
+
+    function voidFalsePurchasesForSale(part, row) {
+        let changed = false;
+        state.transactions.forEach(function (tx) {
+            if (!tx || tx.type !== 'PURCHASE' || tx.status === 'VOID') return;
+            if (String(tx.itemId || '') !== row.itemId || Number(tx.qty || 0) !== row.qty) return;
+            const txMs = new Date(tx.timestamp).getTime();
+            const saleMs = part.timestamp * 1000;
+            if (!Number.isFinite(txMs) || Math.abs(txMs - saleMs) > 2000) return;
+            // v0.4.3 could misclassify the sale itself as an API-confirmed purchase.
+            if (String(tx.detectionMethod || '') !== 'API_CONFIRMED') return;
+            tx.status = 'VOID';
+            tx.voidReason = 'Automatically corrected: Item Market sale was previously misclassified as a purchase.';
+            tx.voidedAt = new Date().toISOString();
+            tx.correctedByApiLogId = part.logId;
+            changed = true;
+        });
+        return changed;
+    }
+
+    function reconcileItemMarketSales(logs) {
+        let changed = false;
+        const sales = (logs || []).map(itemMarketSalePart).filter(Boolean)
+            .sort(function (a, b) { return a.timestamp - b.timestamp; });
+
+        sales.forEach(function (part) {
+            part.rows.forEach(function (row) {
+                if (voidFalsePurchasesForSale(part, row)) changed = true;
+
+                const already = liveTransactions().some(function (tx) {
+                    return tx.type === 'SALE' && tx.saleApiLogId === part.logId &&
+                        String(tx.itemId || '') === row.itemId && Number(tx.qty || 0) === row.qty;
+                });
+                if (already) return;
+
+                const saleMs = part.timestamp * 1000;
+                const match = liveTransactions().filter(function (tx) {
+                    if (tx.type !== 'ARMORY_OUT' || tx.ownership !== 'FACTION') return false;
+                    if (tx.status !== 'PENDING' && tx.status !== 'HELD') return false;
+                    if (String(tx.itemId || '') !== row.itemId || Number(tx.qty || 0) !== row.qty) return false;
+                    const outMs = new Date(tx.timestamp).getTime();
+                    return Number.isFinite(outMs) && outMs <= saleMs && saleMs - outMs <= 24 * 60 * 60 * 1000;
+                }).sort(function (a, b) {
+                    return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
+                })[0];
+
+                if (!match) return;
+
+                const grossTotal = part.netTotal + part.fee;
+                match.status = 'SOLD';
+                match.notes = [match.notes, 'API-confirmed Item Market sale; faction ownership converted to sale proceeds.']
+                    .filter(Boolean).join(' | ');
+                match.saleApiLogId = part.logId;
+                match.apiLogIds = Array.from(new Set([].concat(match.apiLogIds || [], [part.logId]).filter(Boolean)));
+
+                state.transactions.push({
+                    id: uid('TX'),
+                    chainId: match.chainId || match.id,
+                    parentId: match.id,
+                    type: 'SALE',
+                    timestamp: part.timestamp ? new Date(part.timestamp * 1000).toISOString() : new Date().toISOString(),
+                    itemName: match.itemName,
+                    itemId: match.itemId,
+                    qty: match.qty,
+                    actualTotal: part.netTotal,
+                    grossTotal: grossTotal,
+                    fee: part.fee,
+                    priceEach: part.priceEach,
+                    mvTotal: Number(match.mvTotal || 0),
+                    billableTotal: 0,
+                    amount: part.netTotal,
+                    source: 'Personal Inventory',
+                    destination: 'Item Market',
+                    personName: state.settings.playerName,
+                    personId: state.settings.playerId,
+                    buyerId: part.buyerId,
+                    notes: 'Automatically reconciled faction-owned Item Market sale. Net proceeds owed to faction: ' +
+                        money(part.netTotal) + '; market fee: ' + money(part.fee) + '.',
+                    ownership: 'FACTION_PROCEEDS',
+                    status: 'SOLD',
+                    detectionMethod: 'API_ITEM_MARKET_SALE_RECONCILED',
+                    saleApiLogId: part.logId,
+                    apiLogIds: [part.logId],
+                    createdAt: new Date().toISOString()
+                });
+                changed = true;
+            });
+        });
+        return changed;
+    }
+
     async function pollApiLogs(showToast) {
         if (apiPollBusy || !state.settings.apiPolling || !apiKeyValue()) return;
         apiPollBusy = true;
@@ -829,6 +941,7 @@
             if (suppressDuplicateArmoryOuts()) changed = true;
             if (await reconcileFactionMovement(logs)) changed = true;
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
+            if (reconcileItemMarketSales(logs)) changed = true;
             for (const log of logs) {
                 if (await reconcileApiPurchase(log)) changed = true;
             }
@@ -1375,9 +1488,12 @@
                 : (tx.type === 'ARMORY_IN'
                     ? '<div>MV each ' + money(tx.mvEach) + ' · Qty ' + Number(tx.qty || 0).toLocaleString() +
                         ' · Reimbursement <b>' + money(tx.billableTotal || tx.mvTotal) + '</b></div>'
-                    : (tx.type === 'ARMORY_OUT' && Number(tx.mvTotal || 0)
-                        ? '<div>Movement MV ' + money(tx.mvTotal) + ' · Faction-owned</div>'
-                        : ''))) +
+                    : (tx.type === 'SALE'
+                        ? '<div>Net proceeds <b>' + money(tx.amount || tx.actualTotal) + '</b>' +
+                            (Number(tx.fee || 0) ? ' · Fee ' + money(tx.fee) : '') + '</div>'
+                        : (tx.type === 'ARMORY_OUT' && Number(tx.mvTotal || 0)
+                            ? '<div>Movement MV ' + money(tx.mvTotal) + ' · Faction-owned</div>'
+                            : '')))) +
             '<div class="fliq-muted">' + esc(tx.source || '') +
                 (tx.source && tx.destination ? ' → ' : '') + esc(tx.destination || '') +
                 ' · ' + esc(tx.status) + '</div>' +
@@ -1457,7 +1573,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release makes API log capture more reliable by polling Torn\'s latest log page, retaining recent diagnostics across empty polls, and using a bounded fallback request when needed. Faction armory/display reconciliation, purchase-time MV billing, receipts, backup/restore, and the TornPDA launcher remain unchanged.' +
+            'v' + VERSION + ' performs no Torn game actions. This release distinguishes Item Market sales from purchases, automatically reconciles matching faction-owned armory withdrawals into sales using net proceeds after fees, and audit-voids sale events previously misclassified as purchases. Existing armory/display reconciliation and API diagnostics remain unchanged.' +
         '</div></div>';
     }
 
