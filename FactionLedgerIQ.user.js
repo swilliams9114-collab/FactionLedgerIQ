@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.6.0
+// @version      0.6.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.6.0';
+    const VERSION = '0.6.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -818,6 +818,114 @@
         return changed;
     }
 
+    function displayCaseWithdrawalPart(log) {
+        const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+        const rows = Array.isArray(data.items) ? data.items : [];
+        if (!rows.length) return null;
+        // Display Case removals are not assumed from the same items-only signature used
+        // for deposits. Only accept an items-only event when it can be paired uniquely
+        // with a currently displayed faction-owned chain. This avoids inventing provenance.
+        if (data.faction != null || data.sender != null || data.receiver != null ||
+            data.seller != null || data.cost_total != null || data.cost_each != null) return null;
+        const meaningfulKeys = Object.keys(data).filter(function (k) { return data[k] != null; });
+        if (meaningfulKeys.some(function (k) { return k !== 'items'; })) return null;
+        return {
+            logId: logId(log),
+            timestamp: Number(log.timestamp || 0),
+            rows: rows.map(function (row) {
+                return {
+                    itemId: String(row && (row.id || row.item_id) || '').trim(),
+                    qty: Math.max(1, Number(row && (row.qty || row.quantity) || 1))
+                };
+            }).filter(function (row) { return row.itemId; })
+        };
+    }
+
+    function reconcileDisplayCaseWithdrawals(logs) {
+        let changed = false;
+        const candidates = (logs || []).map(displayCaseWithdrawalPart).filter(Boolean)
+            .sort(function (a, b) { return a.timestamp - b.timestamp; });
+
+        candidates.forEach(function (part) {
+            if (!part.logId || liveTransactions().some(function (tx) {
+                return tx.displayOutApiLogId === part.logId ||
+                    (tx.type === 'DISPLAY_OUT' && Array.isArray(tx.apiLogIds) && tx.apiLogIds.includes(part.logId));
+            })) return;
+
+            part.rows.forEach(function (row) {
+                // A DISPLAY_IN event using this same API log means this was a deposit,
+                // not a withdrawal. Never reinterpret a previously reconciled deposit.
+                if (liveTransactions().some(function (tx) {
+                    return tx.type === 'DISPLAY_IN' &&
+                        (tx.displayApiLogId === part.logId ||
+                         (Array.isArray(tx.apiLogIds) && tx.apiLogIds.includes(part.logId)));
+                })) return;
+
+                const displayed = liveTransactions().filter(function (tx) {
+                    return tx.type === 'ARMORY_OUT' && tx.ownership === 'FACTION' &&
+                        tx.status === 'DISPLAY' &&
+                        String(tx.itemId || '') === row.itemId &&
+                        Number(tx.qty || 0) === row.qty &&
+                        childrenOf(tx.id, 'DISPLAY_IN').length &&
+                        !childrenOf(tx.id, 'DISPLAY_OUT').length;
+                });
+
+                // Exact item + quantity + exactly one open displayed faction chain.
+                // If ambiguous, leave it unresolved for diagnostics rather than guessing.
+                if (displayed.length !== 1) return;
+                const match = displayed[0];
+                const displayIn = childrenOf(match.id, 'DISPLAY_IN')
+                    .sort(function (a, b) { return new Date(b.timestamp) - new Date(a.timestamp); })[0];
+                const inMs = displayIn ? new Date(displayIn.timestamp).getTime() : 0;
+                const outMs = part.timestamp * 1000;
+                if (!Number.isFinite(inMs) || !Number.isFinite(outMs) || outMs <= inMs) return;
+
+                match.status = 'HELD';
+                match.notes = [match.notes, 'API-confirmed removal from Display Case; faction ownership retained while held in personal inventory.']
+                    .filter(Boolean).join(' | ');
+                match.displayOutApiLogId = part.logId;
+                match.apiLogIds = Array.from(new Set([].concat(match.apiLogIds || [], [part.logId]).filter(Boolean)));
+
+                state.transactions.push({
+                    id: uid('TX'),
+                    chainId: match.chainId || match.id,
+                    parentId: match.id,
+                    type: 'DISPLAY_OUT',
+                    timestamp: part.timestamp ? new Date(part.timestamp * 1000).toISOString() : new Date().toISOString(),
+                    itemName: match.itemName,
+                    itemId: match.itemId,
+                    qty: row.qty,
+                    actualTotal: 0,
+                    mvTotal: Number(match.mvTotal || 0),
+                    mvEach: Number(match.mvEach || 0),
+                    billableTotal: 0,
+                    amount: 0,
+                    source: 'Display Case',
+                    destination: 'Personal Inventory',
+                    personName: state.settings.playerName,
+                    personId: state.settings.playerId,
+                    notes: 'Automatically reconciled Display Case withdrawal. Faction-owned asset is now held in personal inventory; no reimbursement or debt created.',
+                    ownership: 'FACTION',
+                    status: 'HELD',
+                    detectionMethod: 'API_DISPLAY_OUT_RECONCILED',
+                    displayOutApiLogId: part.logId,
+                    apiLogIds: [part.logId],
+                    createdAt: new Date().toISOString()
+                });
+
+                const lot = lotForSource(match.id);
+                if (lot) {
+                    lot.location = 'PERSONAL_INVENTORY';
+                    lot.status = Number(lot.qtyRemaining || 0) > 0 ? 'OPEN' : lot.status;
+                }
+                state.detection.lastDetectedAt = new Date().toISOString();
+                state.detection.lastSource = 'Torn API · Display Case Withdrawal';
+                changed = true;
+            });
+        });
+        return changed;
+    }
+
     async function reconcileFactionMovement(logs) {
         try { await ensureItemCatalog(false); } catch (e) {}
         const actorId = String(state.settings.playerId || '').trim();
@@ -1603,6 +1711,7 @@
             if (await reconcileFactionMovement(logs)) changed = true;
             if (reconcilePurchasesToArmoryDeposits()) changed = true;
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
+            if (reconcileDisplayCaseWithdrawals(logs)) changed = true;
             if (reconcileOwnershipLots()) changed = true;
             // Bazaar recovery must also inspect the persisted diagnostic cache. Torn's latest
             // 100-log page can advance past a purchase before a newer script version gets a
@@ -2284,7 +2393,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. Armory deposits support the observed faction + items API shape, allocation prompts require exact-quantity purchase candidates, stale historical prompts are cleared without deleting audit records, and background polling no longer rebuilds the open panel.' +
+            'v' + VERSION + ' performs no Torn game actions. Display Case withdrawals now reconcile back to faction-owned personal holdings when an exact, unique displayed chain can be identified; ambiguous movements remain unresolved rather than guessed.' +
         '</div></div>';
     }
 
@@ -2646,7 +2755,7 @@
             tx.status = 'DEPOSITED';
             tx.allocationRequired = false;
             tx.allocationCandidateIds = [];
-            tx.notes = [tx.notes, 'v0.6.0 migration: stale allocation prompt cleared; historical transaction retained.']
+            tx.notes = [tx.notes, 'v0.6.1 migration: stale allocation prompt cleared; historical transaction retained.']
                 .filter(Boolean).join(' | ');
             changed = true;
         });
