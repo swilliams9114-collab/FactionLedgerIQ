@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.5.2
+// @version      0.5.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.5.2';
+    const VERSION = '0.5.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -884,6 +884,107 @@
         return changed;
     }
 
+    function tradeIdFromLog(log) {
+        const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+        if (data.parsed_trade_id != null && String(data.parsed_trade_id).trim()) return String(data.parsed_trade_id).trim();
+        const raw = String(data.trade_id || '');
+        const m = raw.match(/(?:ID=|ID%3D)(\d+)/i);
+        return m ? m[1] : '';
+    }
+
+    async function reconcileTradePurchases(logs) {
+        const groups = {};
+        (logs || []).forEach(function (log) {
+            const tradeId = tradeIdFromLog(log);
+            if (!tradeId) return;
+            const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+            if (!groups[tradeId]) groups[tradeId] = { tradeId: tradeId, logs: [], itemParts: [], moneyParts: [], userId: '', description: '' };
+            const g = groups[tradeId];
+            g.logs.push(log);
+            if (data.user != null) g.userId = String(data.user);
+            if (data.description) g.description = String(data.description);
+            if (Array.isArray(data.items) && data.items.length) g.itemParts.push(log);
+            if (data.money != null || data.total != null) g.moneyParts.push(log);
+        });
+
+        let catalogReady = itemCatalog.length > 0;
+        if (!catalogReady) {
+            try { await ensureItemCatalog(false); catalogReady = true; } catch (err) {
+                console.warn('[FactionLedgerIQ] Could not resolve Torn item catalog for trade', err);
+            }
+        }
+
+        let changed = false;
+        Object.keys(groups).forEach(function (tradeId) {
+            const g = groups[tradeId];
+            if (!g.itemParts.length || !g.moneyParts.length) return;
+            const itemLog = g.itemParts.slice().sort(function (a,b) { return Number(b.timestamp||0)-Number(a.timestamp||0); })[0];
+            const moneyLog = g.moneyParts.slice().sort(function (a,b) { return Number(b.timestamp||0)-Number(a.timestamp||0); })[0];
+            const rows = Array.isArray(itemLog.data.items) ? itemLog.data.items : [];
+            const paid = Math.max(0, Number(moneyLog.data.money != null ? moneyLog.data.money : moneyLog.data.total || 0));
+            if (!paid || !rows.length) return;
+
+            const totalQty = rows.reduce(function (n,row) { return n + Math.max(1,Number(row && (row.qty||row.quantity)||1)); },0);
+            rows.forEach(function (row) {
+                const itemId = String(row && (row.id || row.item_id) || '').trim();
+                const qty = Math.max(1, Number(row && (row.qty || row.quantity) || 1));
+                const catalogItem = itemCatalog.find(function (item) { return String(item.id) === itemId; });
+                const itemName = catalogItem ? catalogItem.name : '';
+                const wl = whitelistMatch(itemName, itemId);
+                if (!wl) return;
+                if (liveTransactions().some(function (tx) { return tx.type === 'PURCHASE' && tx.tradeId === tradeId && String(tx.itemId||'') === itemId; })) return;
+
+                const actualTotal = totalQty ? Math.round(paid * (qty / totalQty)) : paid;
+                const mvEach = catalogItem ? Math.max(0, Number(catalogItem.marketValue || 0)) : 0;
+                const mvTotal = mvEach * qty;
+                state.transactions.push({
+                    id: uid('TX'), chainId: uid('CHAIN'), parentId: null, type: 'PURCHASE',
+                    timestamp: itemLog.timestamp ? new Date(Number(itemLog.timestamp)*1000).toISOString() : new Date().toISOString(),
+                    itemName: wl.itemName || itemName || ('Item #' + itemId), itemId: wl.itemId || itemId, qty: qty,
+                    actualTotal: actualTotal, mvTotal: mvTotal, mvEach: mvEach,
+                    billableTotal: billable(actualTotal, mvTotal), amount: actualTotal,
+                    source: 'Trade', destination: 'Personal Inventory',
+                    personName: state.settings.playerName, personId: state.settings.playerId,
+                    notes: 'API-confirmed trade purchase. Trade ID: ' + tradeId + '. Counterparty ID: ' + (g.userId || 'unknown') +
+                        (g.description ? '. Description: ' + g.description : '') + '. Purchase-time MV frozen at ' + money(mvTotal) + '.',
+                    ownership: 'PERSONAL', status: 'PENDING', detectionMethod: 'API_TRADE_PURCHASE',
+                    tradeId: tradeId, counterpartyId: g.userId, apiLogIds: g.logs.map(logId).filter(Boolean),
+                    createdAt: new Date().toISOString()
+                });
+                changed = true;
+            });
+            if (changed) g.logs.forEach(function (log) { markLogProcessed(logId(log)); });
+        });
+        if (changed) { state.detection.lastDetectedAt = new Date().toISOString(); state.detection.lastSource = 'Torn API · Trade'; }
+        return changed;
+    }
+
+    function repairObservedBazaarSources(logs) {
+        let changed = false;
+        (logs || []).forEach(function (log) {
+            const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+            if (data.seller == null || data.anonymous != null || !Array.isArray(data.items) || !data.items.length) return;
+            if (data.cost_total == null && data.cost_each == null) return;
+            const id = logId(log);
+            data.items.forEach(function (row) {
+                const itemId = String(row && (row.id || row.item_id) || '').trim();
+                const qty = Math.max(1, Number(row && (row.qty || row.quantity) || 1));
+                const tx = liveTransactions().find(function (x) {
+                    return x.type === 'PURCHASE' && x.apiLogId === id && String(x.itemId||'') === itemId && Number(x.qty||0) === qty;
+                });
+                if (tx && tx.source !== 'Bazaar') {
+                    tx.source = 'Bazaar';
+                    tx.detectionMethod = 'API_BAZAAR_PURCHASE';
+                    tx.notes = 'API-confirmed Bazaar purchase. Seller ID: ' + String(data.seller) +
+                        '. Purchase-time MV frozen at ' + money(tx.mvTotal || 0) +
+                        (Number(tx.actualTotal||0) > Number(tx.mvTotal||0) && Number(tx.mvTotal||0) > 0 ? '; actual cost was above MV.' : '; billing uses the greater of actual cost or MV.');
+                    changed = true;
+                }
+            });
+        });
+        return changed;
+    }
+
     async function reconcileApiPurchase(log) {
         const id = logId(log);
         if (!id || isLogProcessed(id)) return false;
@@ -959,16 +1060,16 @@
                 mvEach: mvEach,
                 billableTotal: billedTotal,
                 amount: actualTotal,
-                source: 'Item Market',
+                source: data.anonymous == null ? 'Bazaar' : 'Item Market',
                 destination: 'Personal Inventory',
                 personName: state.settings.playerName,
                 personId: state.settings.playerId,
-                notes: 'API-confirmed Item Market purchase. Seller ID: ' +
+                notes: 'API-confirmed ' + (data.anonymous == null ? 'Bazaar' : 'Item Market') + ' purchase. Seller ID: ' +
                     String(data.seller == null ? 'unknown' : data.seller) +
                     '. Purchase-time MV frozen at ' + money(mvTotal) + (actualTotal > mvTotal && mvTotal > 0 ? '; actual cost was above MV.' : '; billing uses the greater of actual cost or MV.'),
                 ownership: 'PERSONAL',
                 status: 'PENDING',
-                detectionMethod: 'API_CONFIRMED',
+                detectionMethod: data.anonymous == null ? 'API_BAZAAR_PURCHASE' : 'API_CONFIRMED',
                 apiLogId: id,
                 sellerId: data.seller == null ? '' : String(data.seller),
                 costEach: costEach,
@@ -982,7 +1083,7 @@
         markLogProcessed(id);
         if (recorded) {
             state.detection.lastDetectedAt = new Date().toISOString();
-            state.detection.lastSource = 'Torn API · Item Market';
+            state.detection.lastSource = data.anonymous == null ? 'Torn API · Bazaar' : 'Torn API · Item Market';
         }
         return recorded;
     }
@@ -1416,6 +1517,8 @@
             if (reconcilePurchasesToArmoryDeposits()) changed = true;
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
             if (reconcileOwnershipLots()) changed = true;
+            if (repairObservedBazaarSources(logs)) changed = true;
+            if (await reconcileTradePurchases(logs)) changed = true;
             if (reconcileItemMarketSales(logs)) changed = true;
             if (reconcileFactionMoneyDeposits(logs)) changed = true;
             if (await reconcileFactionCollections(logs)) changed = true;
@@ -2054,7 +2157,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. v0.5.2 adds the ownership/lot accounting foundation without replacing the proven detectors. Personal purchases and faction-owned withdrawals create separate provenance lots with remaining quantities and frozen values. Confirmed faction sales consume faction-owned lots; Display Case chains retain faction ownership. Ambiguous legacy records remain pending.' +
+            'v' + VERSION + ' performs no Torn game actions. v0.5.3 adds observed Bazaar source classification and trade purchase aggregation. Trade lifecycle logs are grouped by Torn trade ID so item and money events create one deduplicated purchase with frozen purchase-time MV. The ownership/lot engine remains intact.' +
         '</div></div>';
     }
 
