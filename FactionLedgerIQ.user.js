@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.6.2
+// @version      0.6.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.6.2';
+    const VERSION = '0.6.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1076,6 +1076,91 @@
         return m ? m[1] : '';
     }
 
+    function reconcileTradeSales(logs) {
+        const groups = {};
+        (logs || []).forEach(function (log) {
+            const tradeId = tradeIdFromLog(log);
+            if (!tradeId) return;
+            const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+            if (!groups[tradeId]) groups[tradeId] = { tradeId: tradeId, logs: [], itemParts: [], moneyParts: [], userId: '', description: '' };
+            const g = groups[tradeId];
+            g.logs.push(log);
+            if (data.user != null) g.userId = String(data.user);
+            if (data.description) g.description = String(data.description);
+            if (Array.isArray(data.items) && data.items.length) g.itemParts.push(log);
+            if (data.money != null || data.total != null) g.moneyParts.push(log);
+        });
+
+        let changed = false;
+        Object.keys(groups).forEach(function (tradeId) {
+            const g = groups[tradeId];
+            if (!g.itemParts.length || !g.moneyParts.length) return;
+            const itemLog = g.itemParts.slice().sort(function (a,b) { return Number(b.timestamp||0)-Number(a.timestamp||0); })[0];
+            const moneyLog = g.moneyParts.slice().sort(function (a,b) { return Number(b.timestamp||0)-Number(a.timestamp||0); })[0];
+            const rows = Array.isArray(itemLog.data.items) ? itemLog.data.items : [];
+            const received = Math.max(0, Number(moneyLog.data.money != null ? moneyLog.data.money : moneyLog.data.total || 0));
+            if (!received || !rows.length) return;
+
+            const totalQty = rows.reduce(function (n,row) { return n + Math.max(1,Number(row && (row.qty||row.quantity)||1)); },0);
+            rows.forEach(function (row) {
+                const itemId = String(row && (row.id || row.item_id) || '').trim();
+                const qty = Math.max(1, Number(row && (row.qty || row.quantity) || 1));
+                if (!itemId) return;
+                const already = liveTransactions().some(function (tx) {
+                    return tx.type === 'SALE' && tx.tradeId === tradeId &&
+                        String(tx.itemId || '') === itemId && Number(tx.qty || 0) === qty;
+                });
+                if (already) return;
+
+                const saleMs = Number(itemLog.timestamp || moneyLog.timestamp || 0) * 1000;
+                const match = liveTransactions().filter(function (tx) {
+                    if (tx.type !== 'ARMORY_OUT' || tx.ownership !== 'FACTION') return false;
+                    if (tx.status !== 'PENDING' && tx.status !== 'HELD') return false;
+                    if (String(tx.itemId || '') !== itemId) return false;
+                    const lot = lotForSource(tx.id) || ensureSourceLot(tx);
+                    if (!lot || Number(lot.qtyRemaining || 0) < qty) return false;
+                    const outMs = new Date(tx.timestamp).getTime();
+                    return Number.isFinite(outMs) && outMs <= saleMs && saleMs - outMs <= 24 * 60 * 60 * 1000;
+                }).sort(function (a,b) {
+                    return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
+                })[0];
+                if (!match) return;
+
+                const amount = totalQty ? Math.round(received * (qty / totalQty)) : received;
+                const saleLot = lotForSource(match.id) || ensureSourceLot(match);
+                match.status = (saleLot && Number(saleLot.qtyRemaining || 0) > qty) ? 'HELD' : 'SOLD';
+                match.notes = [match.notes, 'API-confirmed Trade sale; faction ownership converted to sale proceeds.']
+                    .filter(Boolean).join(' | ');
+
+                const apiIds = g.logs.map(logId).filter(Boolean);
+                state.transactions.push({
+                    id: uid('TX'), chainId: match.chainId || match.id, parentId: match.id,
+                    type: 'SALE',
+                    timestamp: saleMs ? new Date(saleMs).toISOString() : new Date().toISOString(),
+                    itemName: match.itemName, itemId: match.itemId, qty: qty,
+                    actualTotal: amount, grossTotal: amount, fee: 0, billableTotal: 0, amount: amount,
+                    source: 'Personal Inventory', destination: 'Trade',
+                    personName: state.settings.playerName, personId: state.settings.playerId,
+                    buyerId: g.userId, counterpartyId: g.userId,
+                    notes: 'Automatically reconciled faction-owned Trade sale. Trade ID: ' + tradeId +
+                        '. Proceeds owed to faction: ' + money(amount) + '. Counterparty ID: ' + (g.userId || 'unknown') +
+                        (g.description ? '. Description: ' + g.description : '') + '.',
+                    ownership: 'FACTION_PROCEEDS', status: 'SOLD',
+                    detectionMethod: 'API_TRADE_SALE_RECONCILED', tradeId: tradeId,
+                    apiLogIds: apiIds, createdAt: new Date().toISOString()
+                });
+                const createdSale = state.transactions[state.transactions.length - 1];
+                allocateFactionLotSlice(match, createdSale, qty, 'FACTION_SALE');
+                changed = true;
+            });
+        });
+        if (changed) {
+            state.detection.lastDetectedAt = new Date().toISOString();
+            state.detection.lastSource = 'Torn API · Trade Sale';
+        }
+        return changed;
+    }
+
     async function reconcileTradePurchases(logs) {
         const groups = {};
         (logs || []).forEach(function (log) {
@@ -1116,6 +1201,7 @@
                 const itemName = catalogItem ? catalogItem.name : '';
                 const wl = whitelistMatch(itemName, itemId);
                 if (!wl) return;
+                if (liveTransactions().some(function (tx) { return tx.type === 'SALE' && tx.tradeId === tradeId && String(tx.itemId||'') === itemId; })) return;
                 if (liveTransactions().some(function (tx) { return tx.type === 'PURCHASE' && tx.tradeId === tradeId && String(tx.itemId||'') === itemId; })) return;
 
                 const actualTotal = totalQty ? Math.round(paid * (qty / totalQty)) : paid;
@@ -1786,6 +1872,7 @@
             });
             if (repairObservedBazaarSources(bazaarRecoveryLogs)) changed = true;
             if (await reconcileObservedBazaarPurchases(bazaarRecoveryLogs)) changed = true;
+            if (reconcileTradeSales(logs)) changed = true;
             if (await reconcileTradePurchases(logs)) changed = true;
             if (reconcileItemMarketSales(logs)) changed = true;
             if (reconcileFactionMoneyDeposits(logs)) changed = true;
@@ -2456,7 +2543,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. Faction-owned lots now support partial returns and partial Item Market sales without creating false reimbursements; held-asset value follows the remaining faction quantity. Trade and Bazaar sale shapes remain diagnostic-first until observed.' +
+            'v' + VERSION + ' performs no Torn game actions. Faction-owned lots support partial returns plus partial Item Market and Trade sales without creating false reimbursements; held-asset value follows the remaining faction quantity. Bazaar sale shape remains diagnostic-first until observed.' +
         '</div></div>';
     }
 
