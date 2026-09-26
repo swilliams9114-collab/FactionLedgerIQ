@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.5.1
+// @version      0.5.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.5.1';
+    const VERSION = '0.5.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -104,6 +104,103 @@
 
     function liveTransactions() {
         return state.transactions.filter(function (tx) { return tx.status !== 'VOID'; });
+    }
+
+    function ensureAccounting() {
+        state.accounting = state.accounting || {};
+        state.accounting.schemaVersion = 2;
+        state.accounting.lots = Array.isArray(state.accounting.lots) ? state.accounting.lots : [];
+        state.accounting.allocations = Array.isArray(state.accounting.allocations) ? state.accounting.allocations : [];
+    }
+
+    function lotForSource(sourceTxId) {
+        ensureAccounting();
+        return state.accounting.lots.find(function (lot) { return lot.sourceTxId === sourceTxId && lot.status !== 'VOID'; }) || null;
+    }
+
+    function allocatedQty(lotId) {
+        ensureAccounting();
+        return state.accounting.allocations.filter(function (a) { return a.lotId === lotId && a.status !== 'VOID'; })
+            .reduce(function (n, a) { return n + Number(a.qty || 0); }, 0);
+    }
+
+    function ensureSourceLot(tx) {
+        if (!tx || tx.status === 'VOID' || !tx.itemId) return null;
+        let ownership = '', location = '', reimbursable = false;
+        if (tx.type === 'PURCHASE') {
+            ownership = 'PERSONAL'; location = 'PERSONAL_INVENTORY'; reimbursable = true;
+        } else if (tx.type === 'ARMORY_OUT' && tx.ownership === 'FACTION') {
+            ownership = 'FACTION'; location = tx.status === 'DISPLAY' ? 'DISPLAY_CASE' : 'PERSONAL_INVENTORY';
+        } else return null;
+        let lot = lotForSource(tx.id);
+        if (!lot) {
+            lot = { id: uid('LOT'), sourceTxId: tx.id, chainId: tx.chainId || tx.id,
+                itemId: String(tx.itemId), itemName: tx.itemName || '', ownership: ownership,
+                reimbursable: reimbursable, location: location, qtyOriginal: Number(tx.qty || 0),
+                qtyRemaining: Number(tx.qty || 0), actualTotal: Number(tx.actualTotal || 0),
+                mvTotal: Number(tx.mvTotal || 0), billableTotal: Number(tx.billableTotal || 0),
+                createdAt: tx.timestamp || new Date().toISOString(), status: 'OPEN' };
+            state.accounting.lots.push(lot);
+        }
+        lot.qtyRemaining = Math.max(0, Number(lot.qtyOriginal || 0) - allocatedQty(lot.id));
+        lot.status = lot.qtyRemaining ? 'OPEN' : 'CONSUMED';
+        if (tx.type === 'ARMORY_OUT' && tx.status === 'DISPLAY') lot.location = 'DISPLAY_CASE';
+        return lot;
+    }
+
+    function openLots(itemId, ownership) {
+        ensureAccounting();
+        liveTransactions().forEach(ensureSourceLot);
+        return state.accounting.lots.filter(function (lot) {
+            lot.qtyRemaining = Math.max(0, Number(lot.qtyOriginal || 0) - allocatedQty(lot.id));
+            lot.status = lot.qtyRemaining ? 'OPEN' : 'CONSUMED';
+            return lot.status === 'OPEN' && String(lot.itemId) === String(itemId) &&
+                (!ownership || lot.ownership === ownership);
+        }).sort(function (a,b) { return new Date(a.createdAt) - new Date(b.createdAt); });
+    }
+
+    function allocateMovement(tx, ownership) {
+        ensureAccounting();
+        if (!tx || !tx.id || state.accounting.allocations.some(function (a) { return a.movementId === tx.id && a.status !== 'VOID'; })) return false;
+        let remaining = Number(tx.qty || 0), changed = false;
+        openLots(tx.itemId, ownership).forEach(function (lot) {
+            if (remaining <= 0) return;
+            const take = Math.min(remaining, Number(lot.qtyRemaining || 0));
+            if (!take) return;
+            const q = Math.max(1, Number(lot.qtyOriginal || 1));
+            state.accounting.allocations.push({ id: uid('ALLOC'), lotId: lot.id, sourceTxId: lot.sourceTxId,
+                movementId: tx.id, itemId: tx.itemId, qty: take, ownership: lot.ownership,
+                actualTotal: Math.round(Number(lot.actualTotal || 0) / q * take),
+                mvTotal: Math.round(Number(lot.mvTotal || 0) / q * take),
+                billableTotal: Math.round(Number(lot.billableTotal || 0) / q * take),
+                createdAt: new Date().toISOString(), status: 'ACTIVE' });
+            remaining -= take; changed = true;
+            lot.qtyRemaining = Math.max(0, Number(lot.qtyRemaining || 0) - take);
+            lot.status = lot.qtyRemaining ? 'OPEN' : 'CONSUMED';
+        });
+        if (changed) {
+            tx.lotAllocatedQty = Number(tx.qty || 0) - remaining;
+            tx.lotUnresolvedQty = remaining;
+        }
+        return changed;
+    }
+
+    function reconcileOwnershipLots() {
+        ensureAccounting();
+        let changed = false;
+        liveTransactions().forEach(function (tx) {
+            if ((tx.type === 'PURCHASE' || (tx.type === 'ARMORY_OUT' && tx.ownership === 'FACTION')) && !lotForSource(tx.id)) {
+                ensureSourceLot(tx); changed = true;
+            }
+        });
+        liveTransactions().forEach(function (tx) {
+            if (tx.type === 'SALE' && tx.parentId && allocateMovement(tx, 'FACTION')) changed = true;
+            if (tx.type === 'DISPLAY_IN' && tx.ownership === 'FACTION' && tx.parentId) {
+                const lot = lotForSource(tx.parentId);
+                if (lot && lot.location !== 'DISPLAY_CASE') { lot.location = 'DISPLAY_CASE'; changed = true; }
+            }
+        });
+        return changed;
     }
 
     function sameMovement(tx, type, timestamp, factionId, itemId, qty) {
@@ -1318,6 +1415,7 @@
             if (await reconcileFactionMovement(logs)) changed = true;
             if (reconcilePurchasesToArmoryDeposits()) changed = true;
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
+            if (reconcileOwnershipLots()) changed = true;
             if (reconcileItemMarketSales(logs)) changed = true;
             if (reconcileFactionMoneyDeposits(logs)) changed = true;
             if (await reconcileFactionCollections(logs)) changed = true;
@@ -1956,7 +2054,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. v0.5.1 adds audit-safe legacy cleanup: strong duplicate armory withdrawals are voided rather than deleted, DOM/API duplicate purchases are superseded, and exact purchase-to-armory matches are linked so reimbursement is counted once using the frozen purchase billable amount. Ambiguous matches remain pending.' +
+            'v' + VERSION + ' performs no Torn game actions. v0.5.2 adds the ownership/lot accounting foundation without replacing the proven detectors. Personal purchases and faction-owned withdrawals create separate provenance lots with remaining quantities and frozen values. Confirmed faction sales consume faction-owned lots; Display Case chains retain faction ownership. Ambiguous legacy records remain pending.' +
         '</div></div>';
     }
 
