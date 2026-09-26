@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.4.4
+// @version      0.4.5
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.4.4';
+    const VERSION = '0.4.5';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -32,7 +32,7 @@
     const DEFAULT_STATE = {
         schemaVersion: 1,
         settings: { playerName: '', playerId: '', factionName: '', autoDetectPurchases: true, apiKey: '', apiPolling: true, apiPollSeconds: 5 },
-        detection: { processedFingerprints: [], processedLogIds: [], recentApiEvents: [], recentFactionCandidates: [], factionMovementBuffer: [], lastDetectedAt: '', lastSource: '', lastApiPollAt: '', lastApiError: '', apiStatus: 'Not configured' },
+        detection: { processedFingerprints: [], processedLogIds: [], recentApiEvents: [], recentFactionCandidates: [], factionMovementBuffer: [], factionBalanceSnapshot: null, lastDetectedAt: '', lastSource: '', lastApiPollAt: '', lastApiError: '', apiStatus: 'Not configured' },
         whitelist: [],
         transactions: [],
         createdAt: new Date().toISOString(),
@@ -917,6 +917,123 @@
         return changed;
     }
 
+
+    function factionBalanceMemberMoney(data) {
+        const root = data && (data.balance || data);
+        const members = root && Array.isArray(root.members) ? root.members : [];
+        const playerId = String(state.settings.playerId || '').trim();
+        if (!playerId) return null;
+        const member = members.find(function (m) {
+            return String(m && (m.id || m.user_id || m.player_id) || '') === playerId;
+        });
+        if (!member) return null;
+        const value = Number(member.money);
+        return Number.isFinite(value) ? value : null;
+    }
+
+    function saleOutstanding(tx) {
+        if (!tx || tx.type !== 'SALE' || tx.status === 'VOID') return 0;
+        const deposited = childrenOf(tx.id, 'FACTION_BALANCE_IN').reduce(function (sum, r) {
+            return sum + Number(r.amount || 0);
+        }, 0);
+        const collected = childrenOf(tx.id, 'FACTION_COLLECTION').reduce(function (sum, r) {
+            return sum + Number(r.amount || 0);
+        }, 0);
+        return {
+            owed: Math.max(0, Number(tx.amount || tx.actualTotal || 0) - deposited - collected),
+            ready: Math.max(0, deposited - collected)
+        };
+    }
+
+    function recordBalanceDeposit(sale, amount, balanceNow) {
+        const child = addChild(sale, 'FACTION_BALANCE_IN', {
+            timestamp: new Date().toISOString(),
+            itemName: sale.itemName,
+            itemId: sale.itemId,
+            qty: sale.qty,
+            amount: amount,
+            actualTotal: amount,
+            source: 'Personal Wallet',
+            destination: 'Faction Balance',
+            ownership: 'FACTION_PROCEEDS',
+            status: 'READY_FOR_COLLECTION',
+            detectionMethod: 'API_FACTION_BALANCE_DELTA',
+            notes: 'Faction member balance increased by ' + money(amount) +
+                '; matched automatically to sale proceeds. Balance after deposit: ' + money(balanceNow) + '.'
+        });
+        child.balanceAfter = balanceNow;
+        return child;
+    }
+
+    function recordFactionCollection(sale, amount, balanceNow) {
+        const child = addChild(sale, 'FACTION_COLLECTION', {
+            timestamp: new Date().toISOString(),
+            itemName: sale.itemName,
+            itemId: sale.itemId,
+            qty: sale.qty,
+            amount: amount,
+            actualTotal: amount,
+            source: 'Faction Member Balance',
+            destination: 'Faction',
+            ownership: 'FACTION',
+            status: 'COLLECTED',
+            detectionMethod: 'API_FACTION_BALANCE_DELTA',
+            notes: 'Faction member balance decreased by ' + money(amount) +
+                '; matched automatically to sale proceeds previously ready for collection. Balance after collection: ' + money(balanceNow) + '.'
+        });
+        child.balanceAfter = balanceNow;
+        return child;
+    }
+
+    async function reconcileFactionBalance() {
+        let data;
+        try {
+            data = await apiFetch('faction/balance', { cat: 'current' });
+        } catch (err) {
+            // Balance permission is optional. User-log tracking continues normally when unavailable.
+            return false;
+        }
+
+        const current = factionBalanceMemberMoney(data);
+        if (current == null) return false;
+
+        const previous = state.detection.factionBalanceSnapshot;
+        state.detection.factionBalanceSnapshot = {
+            money: current,
+            at: new Date().toISOString()
+        };
+
+        if (!previous || !Number.isFinite(Number(previous.money))) return false;
+        const delta = current - Number(previous.money);
+        if (!delta) return false;
+
+        const sales = liveTransactions().filter(function (tx) { return tx.type === 'SALE'; })
+            .sort(function (a, b) { return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(); });
+
+        if (delta > 0) {
+            const exact = sales.find(function (sale) {
+                const b = saleOutstanding(sale);
+                return b && b.owed === delta;
+            });
+            if (!exact) return false;
+            recordBalanceDeposit(exact, delta, current);
+            state.detection.lastDetectedAt = new Date().toISOString();
+            state.detection.lastSource = 'Torn API · Faction Balance';
+            return true;
+        }
+
+        const decrease = Math.abs(delta);
+        const exactReady = sales.find(function (sale) {
+            const b = saleOutstanding(sale);
+            return b && b.ready === decrease;
+        });
+        if (!exactReady) return false;
+        recordFactionCollection(exactReady, decrease, current);
+        state.detection.lastDetectedAt = new Date().toISOString();
+        state.detection.lastSource = 'Torn API · Faction Balance';
+        return true;
+    }
+
     async function pollApiLogs(showToast) {
         if (apiPollBusy || !state.settings.apiPolling || !apiKeyValue()) return;
         apiPollBusy = true;
@@ -942,6 +1059,7 @@
             if (await reconcileFactionMovement(logs)) changed = true;
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
             if (reconcileItemMarketSales(logs)) changed = true;
+            if (await reconcileFactionBalance()) changed = true;
             for (const log of logs) {
                 if (await reconcileApiPurchase(log)) changed = true;
             }
@@ -1288,7 +1406,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.4.1 adds semantic cross-version movement deduplication, displays ARMORY_IN movement-time MV/reimbursement, and includes personal armory contributions in the Faction owes me dashboard balance.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.4.5 adds automatic faction-balance reconciliation for sale proceeds while retaining semantic movement deduplication and reimbursement tracking.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -1573,7 +1691,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release distinguishes Item Market sales from purchases, automatically reconciles matching faction-owned armory withdrawals into sales using net proceeds after fees, and audit-voids sale events previously misclassified as purchases. Existing armory/display reconciliation and API diagnostics remain unchanged.' +
+            'v' + VERSION + ' performs no Torn game actions. This release adds faction-balance reconciliation: an exact member-balance increase matching outstanding sale proceeds creates FACTION_BALANCE_IN and moves the amount to Ready for faction to collect; an exact later decrease matching that ready amount creates FACTION_COLLECTION and settles the chain. Balance access is optional and fails closed when the API key lacks permission.' +
         '</div></div>';
     }
 
@@ -1790,7 +1908,7 @@
         }
 
         if (action === 'create-api-key') {
-            window.location.href = 'https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=FactionLedgerIQ&user=log&torn=items';
+            window.location.href = 'https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=FactionLedgerIQ&user=log&torn=items&faction=balance';
             return;
         }
 
