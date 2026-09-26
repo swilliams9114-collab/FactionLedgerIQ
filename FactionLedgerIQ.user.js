@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.6.3
+// @version      0.6.4
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.6.3';
+    const VERSION = '0.6.4';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1434,6 +1434,7 @@
             buyerId: String(data.buyer),
             netTotal: Math.max(0, Number(data.cost_total || 0)),
             fee: Math.max(0, Number(data.fee || 0)),
+            saleSource: Object.prototype.hasOwnProperty.call(data, 'fee') ? 'Item Market' : 'Bazaar',
             priceEach: Math.max(0, Number(data.cost_each || data.price || 0)),
             rows: rows.map(function (row) {
                 return {
@@ -1494,9 +1495,10 @@
                 if (!match) return;
 
                 const grossTotal = part.netTotal + part.fee;
+                const saleSource = part.saleSource || 'Item Market';
                 const saleLot = lotForSource(match.id) || ensureSourceLot(match);
                 match.status = (saleLot && Number(saleLot.qtyRemaining || 0) > row.qty) ? 'HELD' : 'SOLD';
-                match.notes = [match.notes, 'API-confirmed Item Market sale; faction ownership converted to sale proceeds.']
+                match.notes = [match.notes, 'API-confirmed ' + saleSource + ' sale; faction ownership converted to sale proceeds.']
                     .filter(Boolean).join(' | ');
                 match.saleApiLogId = part.logId;
                 match.apiLogIds = Array.from(new Set([].concat(match.apiLogIds || [], [part.logId]).filter(Boolean)));
@@ -1518,15 +1520,15 @@
                     billableTotal: 0,
                     amount: part.netTotal,
                     source: 'Personal Inventory',
-                    destination: 'Item Market',
+                    destination: saleSource,
                     personName: state.settings.playerName,
                     personId: state.settings.playerId,
                     buyerId: part.buyerId,
-                    notes: 'Automatically reconciled faction-owned Item Market sale. Net proceeds owed to faction: ' +
-                        money(part.netTotal) + '; market fee: ' + money(part.fee) + '.',
+                    notes: 'Automatically reconciled faction-owned ' + saleSource + ' sale. Net proceeds owed to faction: ' +
+                        money(part.netTotal) + (saleSource === 'Item Market' ? '; market fee: ' + money(part.fee) : '; no market fee field reported') + '.',
                     ownership: 'FACTION_PROCEEDS',
                     status: 'SOLD',
-                    detectionMethod: 'API_ITEM_MARKET_SALE_RECONCILED',
+                    detectionMethod: saleSource === 'Bazaar' ? 'API_BAZAAR_SALE_RECONCILED' : 'API_ITEM_MARKET_SALE_RECONCILED',
                     saleApiLogId: part.logId,
                     apiLogIds: [part.logId],
                     createdAt: new Date().toISOString()
@@ -1539,6 +1541,36 @@
         return changed;
     }
 
+
+    function repairObservedBazaarSales(logs) {
+        const byId = {};
+        (logs || []).forEach(function (log) {
+            const id = logId(log);
+            if (id) byId[id] = log;
+        });
+        let changed = false;
+        liveTransactions().forEach(function (tx) {
+            if (tx.type !== 'SALE' || tx.status === 'VOID' || tx.destination !== 'Item Market') return;
+            if (String(tx.detectionMethod || '') !== 'API_ITEM_MARKET_SALE_RECONCILED') return;
+            const log = byId[String(tx.saleApiLogId || '')];
+            const data = log && log.data && typeof log.data === 'object' ? log.data : null;
+            if (!data || data.buyer == null || data.cost_total == null || !Array.isArray(data.items)) return;
+            if (Object.prototype.hasOwnProperty.call(data, 'fee')) return;
+            tx.destination = 'Bazaar';
+            tx.detectionMethod = 'API_BAZAAR_SALE_RECONCILED';
+            tx.notes = 'Automatically reconciled faction-owned Bazaar sale. Net proceeds owed to faction: ' +
+                money(Number(tx.actualTotal || tx.amount || data.cost_total || 0)) + '; no market fee field reported. | v0.6.4 corrected sale source from Item Market using authoritative API log shape.';
+            const parent = liveTransactions().find(function (p) { return p.id === tx.parentId; });
+            if (parent) {
+                parent.notes = String(parent.notes || '').replace(
+                    'API-confirmed Item Market sale; faction ownership converted to sale proceeds.',
+                    'API-confirmed Bazaar sale; faction ownership converted to sale proceeds.'
+                );
+            }
+            changed = true;
+        });
+        return changed;
+    }
 
     function personLabel(name, id) {
         const n = String(name || '').trim();
@@ -1851,6 +1883,8 @@
             }
             rememberApiEvents(logs);
             let changed = false;
+            const saleRecoveryLogs = logs.concat(Array.isArray(state.detection.recentApiEvents) ? state.detection.recentApiEvents : []);
+            if (repairObservedBazaarSales(saleRecoveryLogs)) changed = true;
             logs.forEach(function (log) { rememberFactionCandidate(log); });
             if (suppressDuplicateArmoryOuts()) changed = true;
             if (reconcileLegacyPurchaseDuplicates()) changed = true;
@@ -2543,7 +2577,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. Faction-owned lots support partial returns plus partial Item Market and Trade sales without creating false reimbursements; held-asset value follows the remaining faction quantity. Bazaar sale shape remains diagnostic-first until observed.' +
+            'v' + VERSION + ' performs no Torn game actions. Faction-owned lots support partial returns plus partial Item Market, Bazaar, and Trade sales without creating false reimbursements; held-asset value follows the remaining faction quantity. Bazaar sales are distinguished from Item Market sales using the observed authoritative API fee-field shape.' +
         '</div></div>';
     }
 
