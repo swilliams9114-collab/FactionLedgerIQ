@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.4.6
+// @version      0.5.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.4.6';
+    const VERSION = '0.5.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -32,6 +32,8 @@
     const DEFAULT_STATE = {
         schemaVersion: 1,
         settings: { playerName: '', playerId: '', factionName: '', autoDetectPurchases: true, apiKey: '', apiPolling: true, apiPollSeconds: 5 },
+        people: {},
+        accounting: { schemaVersion: 1, lots: [], allocations: [] },
         detection: { processedFingerprints: [], processedLogIds: [], recentApiEvents: [], recentFactionCandidates: [], factionMovementBuffer: [], factionBalanceSnapshot: null, lastDetectedAt: '', lastSource: '', lastApiPollAt: '', lastApiError: '', apiStatus: 'Not configured' },
         whitelist: [],
         transactions: [],
@@ -64,6 +66,8 @@
                 ...parsed,
                 settings: { ...DEFAULT_STATE.settings, ...(parsed.settings || {}) },
                 detection: { ...DEFAULT_STATE.detection, ...(parsed.detection || {}) },
+                people: { ...(parsed.people || {}) },
+                accounting: { ...clone(DEFAULT_STATE.accounting), ...(parsed.accounting || {}), lots: Array.isArray(parsed.accounting && parsed.accounting.lots) ? parsed.accounting.lots : [], allocations: Array.isArray(parsed.accounting && parsed.accounting.allocations) ? parsed.accounting.allocations : [] },
                 whitelist: Array.isArray(parsed.whitelist) ? parsed.whitelist : [],
                 transactions: Array.isArray(parsed.transactions) ? parsed.transactions : []
             };
@@ -918,6 +922,114 @@
     }
 
 
+    function personLabel(name, id) {
+        const n = String(name || '').trim();
+        const i = String(id || '').trim();
+        return n ? (n + (i ? ' [' + i + ']' : '')) : (i ? ('Player [' + i + ']') : '');
+    }
+
+    function cachedPlayerName(id) {
+        const key = String(id || '').trim();
+        return key && state.people && state.people[key] ? String(state.people[key].name || '') : '';
+    }
+
+    async function resolvePlayerName(id) {
+        const key = String(id || '').trim();
+        if (!key) return '';
+        const cached = cachedPlayerName(key);
+        if (cached) return cached;
+        try {
+            const data = await apiFetch('user/' + encodeURIComponent(key) + '/profile', {});
+            const root = data && (data.profile || data);
+            const name = String(root && (root.name || root.player_name || root.username) || '').trim();
+            if (name) {
+                state.people = state.people || {};
+                state.people[key] = { name: name, resolvedAt: new Date().toISOString() };
+                return name;
+            }
+        } catch (err) {
+            console.warn('[FactionLedgerIQ] Player-name lookup failed for ' + key, err);
+        }
+        return '';
+    }
+
+    function factionCollectionPart(log) {
+        const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+        if (data.user == null || data.faction == null ||
+            data.balance_before == null || data.balance_after == null) return null;
+        const before = Number(data.balance_before);
+        const after = Number(data.balance_after);
+        if (!Number.isFinite(before) || !Number.isFinite(after) || before <= after) return null;
+        return {
+            logId: logId(log),
+            timestamp: Number(log.timestamp || 0),
+            factionId: String(data.faction),
+            collectorId: String(data.user),
+            balanceBefore: before,
+            balanceAfter: after,
+            amount: before - after
+        };
+    }
+
+    async function reconcileFactionCollections(logs) {
+        let changed = false;
+        const parts = (logs || []).map(factionCollectionPart).filter(Boolean)
+            .sort(function (a, b) { return a.timestamp - b.timestamp; });
+
+        for (const part of parts) {
+            if (!part.logId || !(part.amount > 0)) continue;
+            const already = liveTransactions().some(function (tx) {
+                return tx.type === 'FACTION_COLLECTION' &&
+                    (tx.collectionApiLogId === part.logId ||
+                     (Array.isArray(tx.apiLogIds) && tx.apiLogIds.includes(part.logId)));
+            });
+            if (already) continue;
+
+            const candidates = liveTransactions().filter(function (sale) {
+                if (sale.type !== 'SALE') return false;
+                const b = saleOutstanding(sale);
+                if (!b || b.ready !== part.amount) return false;
+                const saleMs = new Date(sale.timestamp).getTime();
+                const eventMs = part.timestamp * 1000;
+                return Number.isFinite(saleMs) && saleMs <= eventMs &&
+                    eventMs - saleMs <= 7 * 24 * 60 * 60 * 1000;
+            });
+            if (candidates.length !== 1) continue;
+
+            const sale = candidates[0];
+            const collectorName = await resolvePlayerName(part.collectorId);
+            const child = addChild(sale, 'FACTION_COLLECTION', {
+                timestamp: part.timestamp ? new Date(part.timestamp * 1000).toISOString() : new Date().toISOString(),
+                itemName: sale.itemName,
+                itemId: sale.itemId,
+                qty: sale.qty,
+                amount: part.amount,
+                actualTotal: part.amount,
+                source: 'Faction Balance',
+                destination: 'Faction',
+                ownership: 'FACTION',
+                status: 'SETTLED',
+                personName: collectorName,
+                personId: part.collectorId,
+                collectedByName: collectorName,
+                collectedById: part.collectorId,
+                detectionMethod: 'API_FACTION_COLLECTION',
+                collectionApiLogId: part.logId,
+                apiLogIds: [part.logId],
+                factionId: part.factionId,
+                balanceBefore: part.balanceBefore,
+                balanceAfter: part.balanceAfter,
+                notes: 'API-confirmed faction collection of ' + money(part.amount) + ' by ' +
+                    personLabel(collectorName, part.collectorId) + '. Linked sale-proceeds chain is settled.'
+            });
+            child.collectionApiLogId = part.logId;
+            state.detection.lastDetectedAt = new Date().toISOString();
+            state.detection.lastSource = 'Torn API · Faction Collection';
+            changed = true;
+        }
+        return changed;
+    }
+
     function factionMoneyDepositPart(log) {
         const data = log && log.data && typeof log.data === 'object' ? log.data : {};
         const amount = Number(data.money_deposited || 0);
@@ -1127,6 +1239,7 @@
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
             if (reconcileItemMarketSales(logs)) changed = true;
             if (reconcileFactionMoneyDeposits(logs)) changed = true;
+            if (await reconcileFactionCollections(logs)) changed = true;
             if (await reconcileFactionBalance()) changed = true;
             for (const log of logs) {
                 if (await reconcileApiPurchase(log)) changed = true;
@@ -1759,7 +1872,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release uses Torn\'s observed money_deposited user-log event as the authoritative sale-proceeds deposit trigger. An exact, unambiguous deposit matching one outstanding sale creates FACTION_BALANCE_IN, clears the player obligation, and moves the proceeds to Ready for faction to collect. Faction-balance delta logic remains only as a secondary fallback.' +
+            'v' + VERSION + ' performs no Torn game actions. This release preserves the proven v0.4.6 detectors and adds the v0.5 accounting foundation, a local Torn ID → player-name cache, and automatic FACTION_COLLECTION reconciliation from observed faction balance withdrawal logs. Names are shown with IDs retained for audit accuracy. Exact, unambiguous matching is required; ambiguous money events remain unresolved.' +
         '</div></div>';
     }
 
