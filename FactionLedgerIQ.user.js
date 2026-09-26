@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.6.1
+// @version      0.6.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.6.1';
+    const VERSION = '0.6.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -926,6 +926,41 @@
         return changed;
     }
 
+    function factionHeldSourceForMovement(itemId, qty, eventTimestamp) {
+        const eventMs = Number(eventTimestamp || 0) * 1000;
+        const candidates = liveTransactions().filter(function (tx) {
+            if (tx.type !== 'ARMORY_OUT' || tx.ownership !== 'FACTION') return false;
+            if (tx.status !== 'HELD' && tx.status !== 'PENDING') return false;
+            if (String(tx.itemId || '') !== String(itemId || '')) return false;
+            const txMs = new Date(tx.timestamp).getTime();
+            if (!Number.isFinite(txMs) || !Number.isFinite(eventMs) || txMs > eventMs) return false;
+            const lot = lotForSource(tx.id) || ensureSourceLot(tx);
+            return lot && Number(lot.qtyRemaining || 0) >= Number(qty || 0);
+        }).sort(function (a,b) { return new Date(b.timestamp) - new Date(a.timestamp); });
+        return candidates.length === 1 ? candidates[0] : null;
+    }
+
+    function allocateFactionLotSlice(source, movement, qty, kind) {
+        ensureAccounting();
+        const lot = lotForSource(source.id) || ensureSourceLot(source);
+        if (!lot || Number(lot.qtyRemaining || 0) < Number(qty || 0)) return false;
+        const q = Math.max(1, Number(lot.qtyOriginal || source.qty || 1));
+        state.accounting.allocations.push({
+            id: uid('ALLOC'), kind: kind, lotId: lot.id, sourceTxId: source.id,
+            movementId: movement.id, itemId: source.itemId, qty: Number(qty || 0),
+            ownership: 'FACTION',
+            actualTotal: Math.round(Number(lot.actualTotal || 0) / q * Number(qty || 0)),
+            mvTotal: Math.round(Number(lot.mvTotal || source.mvTotal || 0) / q * Number(qty || 0)),
+            billableTotal: 0, createdAt: new Date().toISOString(), status: 'ACTIVE'
+        });
+        lot.qtyRemaining = Math.max(0, Number(lot.qtyRemaining || 0) - Number(qty || 0));
+        lot.status = lot.qtyRemaining ? 'OPEN' : 'CONSUMED';
+        source.lotAllocatedQty = Number(source.qty || 0) - lot.qtyRemaining;
+        source.lotUnresolvedQty = lot.qtyRemaining;
+        if (!lot.qtyRemaining && kind === 'FACTION_RETURN') source.status = 'RETURNED';
+        return true;
+    }
+
     async function reconcileFactionMovement(logs) {
         try { await ensureItemCatalog(false); } catch (e) {}
         const actorId = String(state.settings.playerId || '').trim();
@@ -952,6 +987,26 @@
                 const item = itemCatalog.find(function (x) { return String(x.id) === itemId; });
                 const mvEach = item ? Math.max(0, Number(item.marketValue || 0)) : 0;
                 const mvTotal = mvEach * qty;
+                const factionSource = factionHeldSourceForMovement(itemId, qty, log.timestamp);
+                if (factionSource) {
+                    const returned = {
+                        id: uid('TX'), chainId: factionSource.chainId || factionSource.id, parentId: factionSource.id,
+                        type: 'ARMORY_IN',
+                        timestamp: log.timestamp ? new Date(Number(log.timestamp) * 1000).toISOString() : new Date().toISOString(),
+                        itemName: factionSource.itemName || (item ? item.name : ('Item #' + itemId)),
+                        itemId: itemId, qty: qty, actualTotal: 0, mvTotal: mvTotal, mvEach: mvEach,
+                        billableTotal: 0, amount: 0, source: 'Personal Inventory', destination: 'Faction Armory',
+                        personName: state.settings.playerName, personId: state.settings.playerId,
+                        notes: 'API-confirmed return of faction-owned inventory to faction armory. No reimbursement created.',
+                        ownership: 'FACTION', status: 'RETURNED', detectionMethod: 'API_FACTION_ARMORY_RETURN',
+                        factionId: String(data.faction), factionMovementKey: key,
+                        apiLogIds: [logId(log)].filter(Boolean), createdAt: new Date().toISOString()
+                    };
+                    state.transactions.push(returned);
+                    allocateFactionLotSlice(factionSource, returned, qty, 'FACTION_RETURN');
+                    changed = true;
+                    return;
+                }
                 state.transactions.push({
                     id: uid('TX'), chainId: uid('CHAIN'), parentId: null,
                     type: 'ARMORY_IN',
@@ -1341,7 +1396,9 @@
                 const match = liveTransactions().filter(function (tx) {
                     if (tx.type !== 'ARMORY_OUT' || tx.ownership !== 'FACTION') return false;
                     if (tx.status !== 'PENDING' && tx.status !== 'HELD') return false;
-                    if (String(tx.itemId || '') !== row.itemId || Number(tx.qty || 0) !== row.qty) return false;
+                    if (String(tx.itemId || '') !== row.itemId) return false;
+                    const lot = lotForSource(tx.id) || ensureSourceLot(tx);
+                    if (!lot || Number(lot.qtyRemaining || 0) < row.qty) return false;
                     const outMs = new Date(tx.timestamp).getTime();
                     return Number.isFinite(outMs) && outMs <= saleMs && saleMs - outMs <= 24 * 60 * 60 * 1000;
                 }).sort(function (a, b) {
@@ -1351,7 +1408,8 @@
                 if (!match) return;
 
                 const grossTotal = part.netTotal + part.fee;
-                match.status = 'SOLD';
+                const saleLot = lotForSource(match.id) || ensureSourceLot(match);
+                match.status = (saleLot && Number(saleLot.qtyRemaining || 0) > row.qty) ? 'HELD' : 'SOLD';
                 match.notes = [match.notes, 'API-confirmed Item Market sale; faction ownership converted to sale proceeds.']
                     .filter(Boolean).join(' | ');
                 match.saleApiLogId = part.logId;
@@ -1365,7 +1423,7 @@
                     timestamp: part.timestamp ? new Date(part.timestamp * 1000).toISOString() : new Date().toISOString(),
                     itemName: match.itemName,
                     itemId: match.itemId,
-                    qty: match.qty,
+                    qty: row.qty,
                     actualTotal: part.netTotal,
                     grossTotal: grossTotal,
                     fee: part.fee,
@@ -1387,6 +1445,8 @@
                     apiLogIds: [part.logId],
                     createdAt: new Date().toISOString()
                 });
+                const createdSale = state.transactions[state.transactions.length - 1];
+                allocateFactionLotSlice(match, createdSale, row.qty, 'FACTION_SALE');
                 changed = true;
             });
         });
@@ -1922,7 +1982,10 @@
             if (tx.type === 'ARMORY_OUT' &&
                 tx.ownership === 'FACTION' &&
                 (tx.status === 'HELD' || tx.status === 'DISPLAY')) {
-                assetsHeld += Number(tx.currentValue || tx.mvTotal || 0);
+                const lot = lotForSource(tx.id) || ensureSourceLot(tx);
+                const originalQty = Math.max(1, Number(tx.qty || 1));
+                const remainingQty = lot ? Number(lot.qtyRemaining || 0) : Number(tx.qty || 0);
+                assetsHeld += Math.round(Number(tx.currentValue || tx.mvTotal || 0) / originalQty * remainingQty);
             }
         });
 
@@ -2393,7 +2456,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. Display Case withdrawals now reconcile back to faction-owned personal holdings when an exact, unique displayed chain can be identified; ambiguous movements remain unresolved rather than guessed.' +
+            'v' + VERSION + ' performs no Torn game actions. Faction-owned lots now support partial returns and partial Item Market sales without creating false reimbursements; held-asset value follows the remaining faction quantity. Trade and Bazaar sale shapes remain diagnostic-first until observed.' +
         '</div></div>';
     }
 
@@ -2755,7 +2818,7 @@
             tx.status = 'DEPOSITED';
             tx.allocationRequired = false;
             tx.allocationCandidateIds = [];
-            tx.notes = [tx.notes, 'v0.6.1 migration: stale allocation prompt cleared; historical transaction retained.']
+            tx.notes = [tx.notes, 'v0.6.2 migration: stale allocation prompt cleared; historical transaction retained.']
                 .filter(Boolean).join(' | ');
             changed = true;
         });
