@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.5.8
+// @version      0.5.9
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.5.8';
+    const VERSION = '0.5.9';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1621,8 +1621,13 @@
             state.detection.lastApiError = '';
             state.detection.apiStatus = 'Connected';
             if (changed) {
-                saveState();
-                toast('API-confirmed ledger activity detected');
+                // Persist and refresh silently during background polling. Reconciliation can
+                // legitimately update bookkeeping metadata on successive passes; that should
+                // never spam the user with repeated activity toasts.
+                state.updatedAt = new Date().toISOString();
+                localStorage.setItem(STATE_KEY, JSON.stringify(state));
+                render();
+                if (showToast) toast('API connected · ledger reconciled');
             } else {
                 localStorage.setItem(STATE_KEY, JSON.stringify(state));
                 if (showToast) toast('API connected · ' + logs.length + ' recent log(s)');
@@ -2265,7 +2270,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. Identical stackable-item deposits are no longer assigned to a purchase lot by guesswork: ambiguous armory deposits require an explicit reimbursement-lot selection.' +
+            'v' + VERSION + ' performs no Torn game actions. Background API reconciliation is silent; manual API tests still report status. Ambiguous identical-item armory deposits require an explicit reimbursement-lot selection.' +
         '</div></div>';
     }
 
