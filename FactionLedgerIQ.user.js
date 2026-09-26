@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.5.9
+// @version      0.6.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.5.9';
+    const VERSION = '0.6.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -670,56 +670,64 @@
 
     function reconcilePurchasesToArmoryDeposits() {
         let changed = false;
+        const cutoffMs = Date.now() - (30 * 60 * 1000);
         const deposits = liveTransactions().filter(function (tx) {
             return tx.type === 'ARMORY_IN' &&
                 tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
-                !tx.purchaseAllocationId;
+                !tx.purchaseAllocationId &&
+                new Date(tx.timestamp).getTime() >= cutoffMs;
         }).sort(function (a, b) { return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(); });
 
         deposits.forEach(function (dep) {
-            let remaining = Number(dep.qty || 0);
+            const remaining = Number(dep.qty || 0);
             if (!(remaining > 0)) return;
             const depMs = new Date(dep.timestamp).getTime();
             const candidates = liveTransactions().filter(function (p) {
-                if (p.type !== 'PURCHASE' || p.status === 'DEPOSITED') return false;
+                if (p.type !== 'PURCHASE' || p.status !== 'PENDING') return false;
                 if (String(p.itemId || '') !== String(dep.itemId || '')) return false;
+                if (Number(p.qty || 0) !== remaining) return false;
                 const pMs = new Date(p.timestamp).getTime();
                 return Number.isFinite(pMs) && pMs <= depMs && depMs - pMs <= 7 * 24 * 60 * 60 * 1000;
             }).sort(function (a, b) { return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(); });
 
-            const exact = candidates.filter(function (p) { return Number(p.qty || 0) === remaining; });
-            if (exact.length !== 1) {
-                // Identical stackable items are fungible in Torn. When more than one purchase
-                // could fund this deposit, do not invent provenance. Leave the deposit pending
-                // for an explicit purchase-lot selection.
-                if (candidates.length > 1 || exact.length > 1) {
+            if (candidates.length !== 1) {
+                if (candidates.length > 1) {
+                    const nextIds = candidates.map(function (p) { return p.id; });
+                    const wasSame = dep.status === 'ALLOCATION_REQUIRED' &&
+                        JSON.stringify(dep.allocationCandidateIds || []) === JSON.stringify(nextIds);
                     dep.status = 'ALLOCATION_REQUIRED';
                     dep.allocationRequired = true;
-                    dep.allocationCandidateIds = candidates.map(function (p) { return p.id; });
-                    dep.notes = [dep.notes, 'Multiple eligible personal purchase lots exist; select which purchase funded this armory deposit.']
-                        .filter(Boolean).join(' | ');
-                    changed = true;
+                    dep.allocationCandidateIds = nextIds;
+                    if (!wasSame) {
+                        dep.notes = [dep.notes, 'Multiple exact-quantity personal purchase lots exist; select which purchase funded this armory deposit.']
+                            .filter(Boolean).join(' | ');
+                        changed = true;
+                    }
                 }
                 return;
             }
-            const purchase = exact[0];
 
+            const purchase = candidates[0];
             purchase.status = 'DEPOSITED';
             purchase.depositTransactionId = dep.id;
             dep.purchaseAllocationId = purchase.id;
             dep.ownership = 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT';
+            dep.status = 'RECORDED';
+            dep.allocationRequired = false;
+            dep.allocationCandidateIds = [];
             dep.billableTotal = Number(purchase.billableTotal || dep.billableTotal || dep.mvTotal || 0);
             dep.actualTotal = Number(purchase.actualTotal || 0);
             dep.mvTotal = Number(purchase.mvTotal || dep.mvTotal || 0);
             dep.mvEach = Number(purchase.mvEach || dep.mvEach || 0);
-            dep.notes = [dep.notes, 'Matched to purchase ' + purchase.id + '; reimbursement uses frozen purchase billable amount.']
+            dep.notes = [dep.notes, 'Matched to the only exact-quantity eligible purchase ' + purchase.id + '; frozen purchase billable amount retained.']
                 .filter(Boolean).join(' | ');
             purchase.notes = [purchase.notes, 'Automatically matched to faction armory deposit ' + dep.id + '.']
                 .filter(Boolean).join(' | ');
+            ensureAccounting();
             state.accounting.allocations.push({
                 id: uid('ALLOC'), kind: 'PURCHASE_TO_ARMORY', purchaseId: purchase.id,
                 movementId: dep.id, itemId: dep.itemId, qty: remaining,
-                billableTotal: dep.billableTotal, createdAt: new Date().toISOString()
+                billableTotal: dep.billableTotal, createdAt: new Date().toISOString(), status: 'ACTIVE'
             });
             changed = true;
         });
@@ -1626,8 +1634,14 @@
                 // never spam the user with repeated activity toasts.
                 state.updatedAt = new Date().toISOString();
                 localStorage.setItem(STATE_KEY, JSON.stringify(state));
-                render();
-                if (showToast) toast('API connected · ledger reconciled');
+                // Do not rebuild an open panel during background polling. Replacing the body
+                // collapses diagnostics and interrupts scrolling/taps on TornPDA.
+                if (showToast) {
+                    render();
+                    toast('API connected · ledger reconciled');
+                } else {
+                    updateApiStatusDom();
+                }
             } else {
                 localStorage.setItem(STATE_KEY, JSON.stringify(state));
                 if (showToast) toast('API connected · ' + logs.length + ' recent log(s)');
@@ -2270,7 +2284,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. Background API reconciliation is silent; manual API tests still report status. Ambiguous identical-item armory deposits require an explicit reimbursement-lot selection.' +
+            'v' + VERSION + ' performs no Torn game actions. Armory deposits support the observed faction + items API shape, allocation prompts require exact-quantity purchase candidates, stale historical prompts are cleared without deleting audit records, and background polling no longer rebuilds the open panel.' +
         '</div></div>';
     }
 
@@ -2623,7 +2637,27 @@
         el._timer = setTimeout(function () { el.style.display = 'none'; }, 1800);
     }
 
+    function repairLegacyAllocationPrompts() {
+        let changed = false;
+        const cutoffMs = Date.now() - (30 * 60 * 1000);
+        liveTransactions().forEach(function (tx) {
+            if (tx.type !== 'ARMORY_IN' || tx.status !== 'ALLOCATION_REQUIRED') return;
+            if (new Date(tx.timestamp).getTime() >= cutoffMs) return;
+            tx.status = 'DEPOSITED';
+            tx.allocationRequired = false;
+            tx.allocationCandidateIds = [];
+            tx.notes = [tx.notes, 'v0.6.0 migration: stale allocation prompt cleared; historical transaction retained.']
+                .filter(Boolean).join(' | ');
+            changed = true;
+        });
+        if (changed) {
+            state.updatedAt = new Date().toISOString();
+            localStorage.setItem(STATE_KEY, JSON.stringify(state));
+        }
+    }
+
     function init() {
+        repairLegacyAllocationPrompts();
         injectStyles();
         ensurePanel();
         ensureDockButton();
