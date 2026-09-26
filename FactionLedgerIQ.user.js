@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.4.5
+// @version      0.4.6
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.4.5';
+    const VERSION = '0.4.6';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -918,6 +918,73 @@
     }
 
 
+    function factionMoneyDepositPart(log) {
+        const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+        const amount = Number(data.money_deposited || 0);
+        if (!(amount > 0) || data.faction == null) return null;
+        return {
+            logId: logId(log),
+            timestamp: Number(log.timestamp || 0),
+            factionId: String(data.faction),
+            amount: amount
+        };
+    }
+
+    function reconcileFactionMoneyDeposits(logs) {
+        let changed = false;
+        const deposits = (logs || []).map(factionMoneyDepositPart).filter(Boolean)
+            .sort(function (a, b) { return a.timestamp - b.timestamp; });
+
+        deposits.forEach(function (part) {
+            if (!part.logId) return;
+            const already = liveTransactions().some(function (tx) {
+                return tx.type === 'FACTION_BALANCE_IN' &&
+                    (tx.depositApiLogId === part.logId ||
+                     (Array.isArray(tx.apiLogIds) && tx.apiLogIds.includes(part.logId)));
+            });
+            if (already) return;
+
+            const candidates = liveTransactions().filter(function (sale) {
+                if (sale.type !== 'SALE') return false;
+                const b = saleOutstanding(sale);
+                if (!b || b.owed !== part.amount) return false;
+                const saleMs = new Date(sale.timestamp).getTime();
+                const depositMs = part.timestamp * 1000;
+                return Number.isFinite(saleMs) && saleMs <= depositMs &&
+                    depositMs - saleMs <= 7 * 24 * 60 * 60 * 1000;
+            }).sort(function (a, b) {
+                return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
+            });
+
+            // Exact amount + chronology is intentionally strict. If ambiguous, leave it
+            // unresolved rather than assigning faction money to the wrong sale.
+            if (candidates.length !== 1) return;
+            const sale = candidates[0];
+            const child = addChild(sale, 'FACTION_BALANCE_IN', {
+                timestamp: part.timestamp ? new Date(part.timestamp * 1000).toISOString() : new Date().toISOString(),
+                itemName: sale.itemName,
+                itemId: sale.itemId,
+                qty: sale.qty,
+                amount: part.amount,
+                actualTotal: part.amount,
+                source: 'Personal Wallet',
+                destination: 'Faction Balance',
+                ownership: 'FACTION_PROCEEDS',
+                status: 'READY_FOR_COLLECTION',
+                detectionMethod: 'API_FACTION_MONEY_DEPOSIT',
+                depositApiLogId: part.logId,
+                apiLogIds: [part.logId],
+                factionId: part.factionId,
+                notes: 'API-confirmed faction money deposit matched to outstanding sale proceeds. Player obligation settled; funds are ready for faction collection.'
+            });
+            child.depositApiLogId = part.logId;
+            state.detection.lastDetectedAt = new Date().toISOString();
+            state.detection.lastSource = 'Torn API · Faction Money Deposit';
+            changed = true;
+        });
+        return changed;
+    }
+
     function factionBalanceMemberMoney(data) {
         const root = data && (data.balance || data);
         const members = root && Array.isArray(root.members) ? root.members : [];
@@ -1059,6 +1126,7 @@
             if (await reconcileFactionMovement(logs)) changed = true;
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
             if (reconcileItemMarketSales(logs)) changed = true;
+            if (reconcileFactionMoneyDeposits(logs)) changed = true;
             if (await reconcileFactionBalance()) changed = true;
             for (const log of logs) {
                 if (await reconcileApiPurchase(log)) changed = true;
@@ -1406,7 +1474,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.4.5 adds automatic faction-balance reconciliation for sale proceeds while retaining semantic movement deduplication and reimbursement tracking.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.4.6 adds authoritative money_deposited log reconciliation for sale proceeds, while retaining faction-balance fallback, movement deduplication, and reimbursement tracking.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -1691,7 +1759,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release adds faction-balance reconciliation: an exact member-balance increase matching outstanding sale proceeds creates FACTION_BALANCE_IN and moves the amount to Ready for faction to collect; an exact later decrease matching that ready amount creates FACTION_COLLECTION and settles the chain. Balance access is optional and fails closed when the API key lacks permission.' +
+            'v' + VERSION + ' performs no Torn game actions. This release uses Torn\'s observed money_deposited user-log event as the authoritative sale-proceeds deposit trigger. An exact, unambiguous deposit matching one outstanding sale creates FACTION_BALANCE_IN, clears the player obligation, and moves the proceeds to Ready for faction to collect. Faction-balance delta logic remains only as a secondary fallback.' +
         '</div></div>';
     }
 
