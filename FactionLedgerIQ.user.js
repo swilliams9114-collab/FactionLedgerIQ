@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.7.0
+// @version      0.7.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.7.0';
+    const VERSION = '0.7.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2422,6 +2422,16 @@
             '</div>';
     }
 
+    function linkedSaleForMoneyTx(tx) {
+        if (!tx || (tx.type !== 'FACTION_BALANCE_IN' && tx.type !== 'FACTION_COLLECTION')) return null;
+        return liveTransactions().find(function (sale) { return sale.type === 'SALE' && sale.id === tx.parentId; }) || null;
+    }
+
+    function moneyTxOrigin(tx) {
+        const sale = linkedSaleForMoneyTx(tx);
+        return sale ? String(sale.destination || sale.source || 'Sale') : '';
+    }
+
     function receiptText(tx) {
         const aboveMV = Number(tx.actualTotal || 0) > Number(tx.mvTotal || 0) &&
             Number(tx.mvTotal || 0) > 0;
@@ -2436,8 +2446,9 @@
             'Quantity: ' + Number(tx.qty || 0).toLocaleString(),
             tx.source ? 'Source: ' + tx.source : null,
             tx.destination ? 'Destination: ' + tx.destination : null,
+            moneyTxOrigin(tx) ? 'Originating Sale Channel: ' + moneyTxOrigin(tx) : null,
             tx.ownership ? 'Ownership: ' + tx.ownership : null,
-            Number(tx.actualTotal || 0) ? 'Actual Cost/Amount: ' + money(tx.actualTotal) : null,
+            Number(tx.actualTotal || 0) ? (tx.type === 'FACTION_BALANCE_IN' ? 'Deposited Amount: ' : (tx.type === 'FACTION_COLLECTION' ? 'Collected Amount: ' : 'Actual Cost/Amount: ')) + money(tx.actualTotal) : null,
             Number(tx.mvTotal || 0) ? 'MV at Event: ' + money(tx.mvTotal) : null,
             tx.type === 'PURCHASE' ? 'Billable: ' + money(tx.billableTotal) : null,
             tx.type === 'ARMORY_IN' ? 'Reimbursement Due: ' + money(tx.billableTotal || tx.mvTotal) : null,
@@ -2462,6 +2473,12 @@
                     esc(tx.type) + '</span></div>' +
                 '<div class="fliq-muted">' + esc(tx.id) + ' · ' +
                     esc(new Date(tx.timestamp).toLocaleString()) + '</div>' +
+                (tx.type === 'FACTION_BALANCE_IN'
+                    ? '<div><b>' + money(tx.amount || tx.actualTotal) + '</b> deposited' +
+                        (moneyTxOrigin(tx) ? ' · ' + esc(moneyTxOrigin(tx)) : '') + '</div>'
+                    : (tx.type === 'FACTION_COLLECTION'
+                        ? '<div><b>' + money(tx.amount || tx.actualTotal) + '</b> collected' +
+                            (moneyTxOrigin(tx) ? ' · ' + esc(moneyTxOrigin(tx)) : '') + '</div>' : '')) +
                 '<div class="fliq-actions"><button class="fliq-btn" data-fliq="copy-receipt" data-id="' +
                     esc(tx.id) + '">Copy Discord Receipt</button></div>' +
             '</div>';
@@ -2518,9 +2535,15 @@
                     : (tx.type === 'SALE'
                         ? '<div>Net proceeds <b>' + money(tx.amount || tx.actualTotal) + '</b>' +
                             (Number(tx.fee || 0) ? ' · Fee ' + money(tx.fee) : '') + '</div>'
-                        : (tx.type === 'ARMORY_OUT' && Number(tx.mvTotal || 0)
-                            ? '<div>Movement MV ' + money(tx.mvTotal) + ' · Faction-owned</div>'
-                            : '')))) +
+                        : (tx.type === 'FACTION_BALANCE_IN'
+                            ? '<div>Deposited <b>' + money(tx.amount || tx.actualTotal) + '</b>' +
+                                (moneyTxOrigin(tx) ? ' · From ' + esc(moneyTxOrigin(tx)) + ' sale' : '') + '</div>'
+                            : (tx.type === 'FACTION_COLLECTION'
+                                ? '<div>Collected <b>' + money(tx.amount || tx.actualTotal) + '</b>' +
+                                    (moneyTxOrigin(tx) ? ' · From ' + esc(moneyTxOrigin(tx)) + ' sale' : '') + '</div>'
+                                : (tx.type === 'ARMORY_OUT' && Number(tx.mvTotal || 0)
+                                    ? '<div>Movement MV ' + money(tx.mvTotal) + ' · Faction-owned</div>'
+                                    : '')))))) +
             '<div class="fliq-muted">' + esc(tx.source || '') +
                 (tx.source && tx.destination ? ' → ' : '') + esc(tx.destination || '') +
                 ' · ' + esc(tx.status) + '</div>' +
