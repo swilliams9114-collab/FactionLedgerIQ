@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.8.1
+// @version      0.8.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.8.1';
+    const VERSION = '0.8.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2202,6 +2202,90 @@
         return { factionOwesMe, iOweFaction, readyToCollect, assetsHeld, pending };
     }
 
+    function factionOwesMeBreakdown() {
+        const rows = [];
+
+        liveTransactions().forEach(function (tx) {
+            if (tx.type === 'PURCHASE') {
+                const deposited = tx.status === 'DEPOSITED' ||
+                    childrenOf(tx.id, 'ARMORY_IN').length ||
+                    childrenOf(tx.id, 'DISPLAY_IN').length;
+                if (!deposited) return;
+
+                const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
+                    return sum + Number(r.amount || r.actualTotal || 0);
+                }, 0);
+                const original = Number(tx.billableTotal || 0);
+                const outstanding = Math.max(0, original - refunded);
+                if (outstanding > 0) {
+                    rows.push({
+                        id: tx.id,
+                        type: tx.type,
+                        itemName: tx.itemName || 'Item',
+                        qty: Number(tx.qty || 0),
+                        timestamp: tx.timestamp,
+                        source: tx.source || '',
+                        destination: tx.destination || '',
+                        original: original,
+                        refunded: refunded,
+                        outstanding: outstanding
+                    });
+                }
+                return;
+            }
+
+            if (tx.type === 'ARMORY_IN' &&
+                (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' ||
+                 tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT') &&
+                !tx.purchaseAllocationId) {
+                const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
+                    return sum + Number(r.amount || r.actualTotal || 0);
+                }, 0);
+                const original = Number(tx.billableTotal || tx.mvTotal || 0);
+                const outstanding = Math.max(0, original - refunded);
+                if (outstanding > 0) {
+                    rows.push({
+                        id: tx.id,
+                        type: tx.type,
+                        itemName: tx.itemName || 'Item',
+                        qty: Number(tx.qty || 0),
+                        timestamp: tx.timestamp,
+                        source: tx.source || '',
+                        destination: tx.destination || '',
+                        original: original,
+                        refunded: refunded,
+                        outstanding: outstanding
+                    });
+                }
+            }
+        });
+
+        rows.sort(function (a, b) {
+            return Number(b.outstanding || 0) - Number(a.outstanding || 0) ||
+                new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime();
+        });
+        return rows;
+    }
+
+    function renderFactionOwesBreakdown() {
+        const rows = factionOwesMeBreakdown();
+        const total = rows.reduce(function (sum, row) { return sum + Number(row.outstanding || 0); }, 0);
+
+        return '<div class="fliq-card" style="grid-column:1/-1">' +
+            '<div class="fliq-item-top"><div><span class="fliq-muted">Faction owes me breakdown</span><b class="fliq-good">' + money(total) + '</b></div>' +
+            '<button class="fliq-btn" type="button" data-fliq="toggle-faction-owes-breakdown">Hide</button></div>' +
+            (rows.length ? '<div class="fliq-list" style="margin-top:10px">' + rows.map(function (row) {
+                return '<div class="fliq-item">' +
+                    '<div class="fliq-item-top"><b>' + esc(row.itemName) + ' × ' + Number(row.qty || 0).toLocaleString() + '</b><span class="fliq-pill">' + esc(row.type) + '</span></div>' +
+                    '<div><b class="fliq-good">' + money(row.outstanding) + ' outstanding</b></div>' +
+                    '<div class="fliq-muted">' + esc(new Date(row.timestamp).toLocaleString()) +
+                        (row.source || row.destination ? ' · ' + esc(row.source || '') + (row.destination ? ' → ' + esc(row.destination) : '') : '') + '</div>' +
+                    '<div class="fliq-muted">Original ' + money(row.original) + ' · Reimbursed ' + money(row.refunded) + '</div>' +
+                '</div>';
+            }).join('') + '</div>' : '<div class="fliq-empty">No outstanding reimbursements.</div>') +
+        '</div>';
+    }
+
     function injectStyles() {
         if (document.getElementById(STYLE_ID)) return;
 
@@ -2221,6 +2305,7 @@
             '.fliq-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}',
             '.fliq-card,.fliq-item{background:#18222d;border:1px solid #34404c;border-radius:9px;padding:10px}',
             '.fliq-card b{display:block;font-size:19px;margin-top:5px}',
+            '.fliq-stat-button{width:100%;color:inherit;text-align:left;font:inherit;cursor:pointer}.fliq-stat-button:active{transform:translateY(1px)}',
             '.fliq-muted{opacity:.66;font-size:12px}.fliq-good{color:#7ddc9b}.fliq-warn{color:#ffcf70}.fliq-bad{color:#ff8d8d}',
             '.fliq-section{margin:12px 0}.fliq-section h3{margin:0 0 8px;font-size:14px}',
             '.fliq-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:7px 0}',
@@ -2353,11 +2438,12 @@
         const b = balances();
 
         return '<div class="fliq-grid">' +
-            card('Faction owes me', money(b.factionOwesMe), 'fliq-good') +
+            card('Faction owes me', money(b.factionOwesMe), 'fliq-good', 'toggle-faction-owes-breakdown') +
             card('I owe faction', money(b.iOweFaction), 'fliq-bad') +
             card('Ready for faction to collect', money(b.readyToCollect), 'fliq-warn') +
             card('Faction assets held', money(b.assetsHeld), '') +
         '</div>' +
+        (state.ui && state.ui.showFactionOwesBreakdown ? '<div class="fliq-section">' + renderFactionOwesBreakdown() + '</div>' : '') +
         '<div class="fliq-section"><h3>Quick Record</h3>' + eventForm() + '</div>' +
         '<div class="fliq-section"><h3>Ledger Status</h3>' +
             '<div class="fliq-card">' +
@@ -2371,7 +2457,12 @@
         '</div>';
     }
 
-    function card(label, value, cls) {
+    function card(label, value, cls, action) {
+        if (action) {
+            return '<button type="button" class="fliq-card fliq-stat-button" data-fliq="' + esc(action) + '">' +
+                '<span class="fliq-muted">' + esc(label) + '</span><b class="' + cls + '">' + esc(value) + '</b>' +
+                '<span class="fliq-muted">Tap for breakdown</span></button>';
+        }
         return '<div class="fliq-card"><span class="fliq-muted">' + esc(label) +
             '</span><b class="' + cls + '">' + esc(value) + '</b></div>';
     }
@@ -2916,6 +3007,15 @@
             togglePanel(false);
             return;
         }
+
+        if (action === 'toggle-faction-owes-breakdown') {
+            state.ui = state.ui || {};
+            state.ui.showFactionOwesBreakdown = !state.ui.showFactionOwesBreakdown;
+            saveState();
+            render();
+            return;
+        }
+
 
         if (action === 'pick-item') {
             const wrap = btn.closest('.fliq-item-search');
