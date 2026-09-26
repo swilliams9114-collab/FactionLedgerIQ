@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.7.3
+// @version      0.7.4
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.7.3';
+    const VERSION = '0.7.4';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2434,7 +2434,7 @@
             const reimbursementCandidates = isCredit ? (m.candidateReimbursementIds || []).map(function (id) {
                 return liveTransactions().find(function (tx) { return tx.id === id; });
             }).filter(Boolean) : [];
-            const candidateTotal = candidates.reduce(function (sum,sale) {
+            let candidateTotal = candidates.reduce(function (sum,sale) {
                 const bal = saleOutstanding(sale);
                 return sum + Number(isOut ? (bal && bal.ready || 0) : (bal && bal.owed || 0));
             },0);
@@ -2452,11 +2452,11 @@
                     ? 'This could be faction collection, a war payment, reimbursement, special transfer, or another withdrawal.'
                     : (isCredit ? 'This could be reimbursement, war pay, a special transfer, or another faction payment.'
                     : 'This could be personal cash, war money, another payment, or faction sale proceeds.')) + '</div>' +
-                (candidates.length ? '<div class="fliq-muted" style="margin-top:6px">' +
+                ((isCredit ? reimbursementCandidates.length : candidates.length) ? '<div class="fliq-muted" style="margin-top:6px">' +
                     (isOut ? 'Ready sale-proceeds candidates: ' : (isCredit ? 'Reimbursement candidates: ' : 'Outstanding sale candidates: ')) +
-                    candidates.length + ' · combined ' + money(candidateTotal) + '</div>' : '') +
+                    (isCredit ? reimbursementCandidates.length : candidates.length) + ' · combined ' + money(candidateTotal) + '</div>' : '') +
                 '<div class="fliq-actions">' +
-                    (candidateTotal === Number(m.amount||0) && candidates.length
+                    (candidateTotal === Number(m.amount||0) && (isCredit ? reimbursementCandidates.length : candidates.length)
                         ? '<button class="fliq-btn fliq-btn-primary" data-fliq="' +
                             (isOut ? 'balance-faction-collection' : (isCredit ? 'balance-reimbursement' : 'balance-sale-proceeds')) +
                             '" data-id="' + esc(m.id) + '">' +
