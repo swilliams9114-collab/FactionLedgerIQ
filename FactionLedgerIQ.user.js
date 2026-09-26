@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.7.1
+// @version      0.7.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.7.1';
+    const VERSION = '0.7.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1621,61 +1621,77 @@
         };
     }
 
+    function saleCandidatesForCollection(part) {
+        const eventMs = part.timestamp * 1000;
+        return liveTransactions().filter(function (sale) {
+            if (sale.type !== 'SALE') return false;
+            const bal = saleOutstanding(sale);
+            if (!bal || !(bal.ready > 0)) return false;
+            const saleMs = new Date(sale.timestamp).getTime();
+            return Number.isFinite(saleMs) && saleMs <= eventMs &&
+                eventMs - saleMs <= 7 * 24 * 60 * 60 * 1000;
+        }).sort(function (x,y) { return new Date(x.timestamp) - new Date(y.timestamp); });
+    }
+
+    async function rememberUnclassifiedCollection(part) {
+        if (!part.logId || balanceMovementForLog(part.logId)) return false;
+        const candidates = saleCandidatesForCollection(part);
+        const collectorName = await resolvePlayerName(part.collectorId);
+        state.detection.balanceMovements.push({
+            id: uid('BAL'), logId: part.logId, timestamp: part.timestamp,
+            factionId: part.factionId, direction: 'OUT', amount: part.amount,
+            status: 'UNCLASSIFIED', classification: '',
+            collectorId: part.collectorId, collectorName: collectorName,
+            balanceBefore: part.balanceBefore, balanceAfter: part.balanceAfter,
+            candidateSaleIds: candidates.map(function (sale) { return sale.id; }),
+            createdAt: new Date().toISOString()
+        });
+        return true;
+    }
+
+    function applyCollectionToSales(movement) {
+        let remaining = Number(movement.amount || 0);
+        const sales = (movement.candidateSaleIds || []).map(function (id) {
+            return liveTransactions().find(function (tx) { return tx.id === id && tx.type === 'SALE'; });
+        }).filter(Boolean).sort(function (x,y) { return new Date(x.timestamp) - new Date(y.timestamp); });
+        const totalReady = sales.reduce(function (sum, sale) {
+            const bal = saleOutstanding(sale); return sum + Number(bal && bal.ready || 0);
+        }, 0);
+        if (!sales.length || totalReady !== remaining) return false;
+        sales.forEach(function (sale) {
+            const bal = saleOutstanding(sale);
+            const amount = Number(bal && bal.ready || 0);
+            if (!(amount > 0)) return;
+            addChild(sale, 'FACTION_COLLECTION', {
+                timestamp: movement.timestamp ? new Date(movement.timestamp * 1000).toISOString() : new Date().toISOString(),
+                itemName: sale.itemName, itemId: sale.itemId, qty: sale.qty,
+                amount: amount, actualTotal: amount,
+                source: 'Faction Balance', destination: 'Faction',
+                ownership: 'FACTION', status: 'SETTLED',
+                personName: movement.collectorName || '', personId: movement.collectorId || '',
+                collectedByName: movement.collectorName || '', collectedById: movement.collectorId || '',
+                detectionMethod: 'USER_CLASSIFIED_FACTION_COLLECTION',
+                collectionApiLogId: movement.logId, apiLogIds: [movement.logId],
+                factionId: movement.factionId, balanceBefore: movement.balanceBefore,
+                balanceAfter: movement.balanceAfter,
+                notes: 'User classified mixed faction-balance withdrawal as collection of faction sale proceeds. Applied ' +
+                    money(amount) + ' to sale ' + sale.id + '.'
+            });
+            remaining -= amount;
+        });
+        movement.status = 'CLASSIFIED';
+        movement.classification = 'FACTION_COLLECTION';
+        movement.classifiedAt = new Date().toISOString();
+        return remaining === 0;
+    }
+
     async function reconcileFactionCollections(logs) {
         let changed = false;
         const parts = (logs || []).map(factionCollectionPart).filter(Boolean)
             .sort(function (a, b) { return a.timestamp - b.timestamp; });
-
         for (const part of parts) {
             if (!part.logId || !(part.amount > 0)) continue;
-            const already = liveTransactions().some(function (tx) {
-                return tx.type === 'FACTION_COLLECTION' &&
-                    (tx.collectionApiLogId === part.logId ||
-                     (Array.isArray(tx.apiLogIds) && tx.apiLogIds.includes(part.logId)));
-            });
-            if (already) continue;
-
-            const candidates = liveTransactions().filter(function (sale) {
-                if (sale.type !== 'SALE') return false;
-                const b = saleOutstanding(sale);
-                if (!b || b.ready !== part.amount) return false;
-                const saleMs = new Date(sale.timestamp).getTime();
-                const eventMs = part.timestamp * 1000;
-                return Number.isFinite(saleMs) && saleMs <= eventMs &&
-                    eventMs - saleMs <= 7 * 24 * 60 * 60 * 1000;
-            });
-            if (candidates.length !== 1) continue;
-
-            const sale = candidates[0];
-            const collectorName = await resolvePlayerName(part.collectorId);
-            const child = addChild(sale, 'FACTION_COLLECTION', {
-                timestamp: part.timestamp ? new Date(part.timestamp * 1000).toISOString() : new Date().toISOString(),
-                itemName: sale.itemName,
-                itemId: sale.itemId,
-                qty: sale.qty,
-                amount: part.amount,
-                actualTotal: part.amount,
-                source: 'Faction Balance',
-                destination: 'Faction',
-                ownership: 'FACTION',
-                status: 'SETTLED',
-                personName: collectorName,
-                personId: part.collectorId,
-                collectedByName: collectorName,
-                collectedById: part.collectorId,
-                detectionMethod: 'API_FACTION_COLLECTION',
-                collectionApiLogId: part.logId,
-                apiLogIds: [part.logId],
-                factionId: part.factionId,
-                balanceBefore: part.balanceBefore,
-                balanceAfter: part.balanceAfter,
-                notes: 'API-confirmed faction collection of ' + money(part.amount) + ' by ' +
-                    personLabel(collectorName, part.collectorId) + '. Linked sale-proceeds chain is settled.'
-            });
-            child.collectionApiLogId = part.logId;
-            state.detection.lastDetectedAt = new Date().toISOString();
-            state.detection.lastSource = 'Torn API · Faction Collection';
-            changed = true;
+            if (await rememberUnclassifiedCollection(part)) changed = true;
         }
         return changed;
     }
@@ -2340,20 +2356,33 @@
             const candidates = (m.candidateSaleIds || []).map(function (id) {
                 return liveTransactions().find(function (tx) { return tx.id === id && tx.type === 'SALE'; });
             }).filter(Boolean);
+            const isOut = m.direction === 'OUT';
             const candidateTotal = candidates.reduce(function (sum,sale) {
-                const b = saleOutstanding(sale); return sum + Number(b && b.owed || 0);
+                const bal = saleOutstanding(sale);
+                return sum + Number(isOut ? (bal && bal.ready || 0) : (bal && bal.owed || 0));
             },0);
-            return '<div class="fliq-item"><div class="fliq-item-top"><b>Faction balance deposit ' + money(m.amount) +
+            return '<div class="fliq-item"><div class="fliq-item-top"><b>Faction balance ' +
+                (isOut ? 'withdrawal ' : 'deposit ') + money(m.amount) +
                 '</b><span class="fliq-pill">UNCLASSIFIED</span></div>' +
                 '<div>' + esc(new Date(Number(m.timestamp||0)*1000).toLocaleString()) + '</div>' +
-                '<div class="fliq-muted">This could be personal cash, war money, another payment, or faction sale proceeds.</div>' +
-                (candidates.length ? '<div class="fliq-muted" style="margin-top:6px">Outstanding sale candidates: ' +
+                (isOut && m.collectorName ? '<div class="fliq-muted">Withdrawn by ' +
+                    esc(personLabel(m.collectorName, m.collectorId)) + '</div>' : '') +
+                '<div class="fliq-muted">' + (isOut
+                    ? 'This could be faction collection, a war payment, reimbursement, special transfer, or another withdrawal.'
+                    : 'This could be personal cash, war money, another payment, or faction sale proceeds.') + '</div>' +
+                (candidates.length ? '<div class="fliq-muted" style="margin-top:6px">' +
+                    (isOut ? 'Ready sale-proceeds candidates: ' : 'Outstanding sale candidates: ') +
                     candidates.length + ' · combined ' + money(candidateTotal) + '</div>' : '') +
                 '<div class="fliq-actions">' +
                     (candidateTotal === Number(m.amount||0) && candidates.length
-                        ? '<button class="fliq-btn fliq-btn-primary" data-fliq="balance-sale-proceeds" data-id="' + esc(m.id) + '">Apply to Sale Proceeds</button>' : '') +
-                    '<button class="fliq-btn" data-fliq="balance-personal" data-id="' + esc(m.id) + '">Personal Deposit</button>' +
-                    '<button class="fliq-btn" data-fliq="balance-other" data-id="' + esc(m.id) + '">Other / Ignore</button>' +
+                        ? '<button class="fliq-btn fliq-btn-primary" data-fliq="' +
+                            (isOut ? 'balance-faction-collection' : 'balance-sale-proceeds') +
+                            '" data-id="' + esc(m.id) + '">' +
+                            (isOut ? 'Apply as Faction Collection' : 'Apply to Sale Proceeds') + '</button>' : '') +
+                    (isOut
+                        ? '<button class="fliq-btn" data-fliq="balance-withdrawal-other" data-id="' + esc(m.id) + '">Other / Ignore</button>'
+                        : '<button class="fliq-btn" data-fliq="balance-personal" data-id="' + esc(m.id) + '">Personal Deposit</button>' +
+                          '<button class="fliq-btn" data-fliq="balance-other" data-id="' + esc(m.id) + '">Other / Ignore</button>') +
                 '</div></div>';
         }).join('');
         if (!list.length && !movements.length) return '<div class="fliq-empty">No pending actions.</div>';
@@ -2771,6 +2800,28 @@
         if (action === 'remove-whitelist') {
             state.whitelist = state.whitelist.filter(function (x) { return x.id !== id; });
             saveState();
+            return;
+        }
+
+        if (action === 'balance-faction-collection' || action === 'balance-withdrawal-other') {
+            const movement = (state.detection.balanceMovements || []).find(function (m) { return m.id === id; });
+            if (!movement || movement.status !== 'UNCLASSIFIED' || movement.direction !== 'OUT') return;
+            if (action === 'balance-faction-collection') {
+                if (!applyCollectionToSales(movement)) {
+                    toast('Withdrawal does not exactly match the ready sale-proceeds total');
+                    return;
+                }
+                state.detection.lastDetectedAt = new Date().toISOString();
+                state.detection.lastSource = 'Faction balance · User classified faction collection';
+                saveState();
+                toast('Withdrawal applied as faction collection');
+                return;
+            }
+            movement.status = 'CLASSIFIED';
+            movement.classification = 'OTHER';
+            movement.classifiedAt = new Date().toISOString();
+            saveState();
+            toast('Withdrawal marked other / ignored');
             return;
         }
 
