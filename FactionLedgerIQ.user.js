@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.5.3
+// @version      0.5.4
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.5.3';
+    const VERSION = '0.5.4';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -959,6 +959,72 @@
         return changed;
     }
 
+    async function reconcileObservedBazaarPurchases(logs) {
+        let catalogReady = itemCatalog.length > 0;
+        if (!catalogReady) {
+            try { await ensureItemCatalog(false); catalogReady = true; } catch (err) {
+                console.warn('[FactionLedgerIQ] Could not resolve Torn item catalog for Bazaar', err);
+            }
+        }
+        let changed = false;
+        for (const log of (logs || [])) {
+            const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+            if (data.seller == null || data.anonymous != null || !Array.isArray(data.items) || !data.items.length) continue;
+            if (data.cost_total == null && data.cost_each == null) continue;
+            const id = logId(log);
+            const totalLogCost = Math.max(0, Number(data.cost_total || 0));
+            const costEach = Math.max(0, Number(data.cost_each || 0));
+            const totalQty = data.items.reduce(function (n,row) { return n + Math.max(1,Number(row && (row.qty||row.quantity)||1)); },0);
+
+            for (const row of data.items) {
+                const itemId = String(row && (row.id || row.item_id) || '').trim();
+                const qty = Math.max(1, Number(row && (row.qty || row.quantity) || 1));
+                const catalogItem = itemCatalog.find(function (item) { return String(item.id) === itemId; });
+                const itemName = catalogItem ? catalogItem.name : '';
+                const wl = whitelistMatch(itemName, itemId);
+                if (!wl) continue;
+
+                let tx = liveTransactions().find(function (x) {
+                    return x.type === 'PURCHASE' && x.apiLogId === id && String(x.itemId||'') === itemId && Number(x.qty||0) === qty;
+                });
+                if (tx) {
+                    if (tx.source !== 'Bazaar' || tx.detectionMethod !== 'API_BAZAAR_PURCHASE') {
+                        tx.source = 'Bazaar'; tx.detectionMethod = 'API_BAZAAR_PURCHASE';
+                        tx.notes = 'API-confirmed Bazaar purchase. Seller ID: ' + String(data.seller) +
+                            '. Purchase-time MV frozen at ' + money(tx.mvTotal || 0) +
+                            (Number(tx.actualTotal||0) > Number(tx.mvTotal||0) && Number(tx.mvTotal||0) > 0 ? '; actual cost was above MV.' : '; billing uses the greater of actual cost or MV.');
+                        changed = true;
+                    }
+                    continue;
+                }
+
+                const actualTotal = costEach ? costEach * qty :
+                    (totalQty > 0 ? Math.round(totalLogCost * (qty / totalQty)) : totalLogCost);
+                const mvEach = catalogItem ? Math.max(0, Number(catalogItem.marketValue || 0)) : 0;
+                const mvTotal = mvEach * qty;
+                state.transactions.push({
+                    id: uid('TX'), chainId: uid('CHAIN'), parentId: null, type: 'PURCHASE',
+                    timestamp: log.timestamp ? new Date(Number(log.timestamp)*1000).toISOString() : new Date().toISOString(),
+                    itemName: wl.itemName || itemName || ('Item #' + itemId), itemId: wl.itemId || itemId, qty: qty,
+                    actualTotal: actualTotal, mvTotal: mvTotal, mvEach: mvEach,
+                    billableTotal: billable(actualTotal, mvTotal), amount: actualTotal,
+                    source: 'Bazaar', destination: 'Personal Inventory',
+                    personName: state.settings.playerName, personId: state.settings.playerId,
+                    notes: 'API-confirmed Bazaar purchase. Seller ID: ' + String(data.seller) +
+                        '. Purchase-time MV frozen at ' + money(mvTotal) +
+                        (actualTotal > mvTotal && mvTotal > 0 ? '; actual cost was above MV.' : '; billing uses the greater of actual cost or MV.'),
+                    ownership: 'PERSONAL', status: 'PENDING', detectionMethod: 'API_BAZAAR_PURCHASE',
+                    apiLogId: id, sellerId: String(data.seller), costEach: costEach,
+                    createdAt: new Date().toISOString()
+                });
+                changed = true;
+            }
+            markLogProcessed(id);
+        }
+        if (changed) { state.detection.lastDetectedAt = new Date().toISOString(); state.detection.lastSource = 'Torn API · Bazaar'; }
+        return changed;
+    }
+
     function repairObservedBazaarSources(logs) {
         let changed = false;
         (logs || []).forEach(function (log) {
@@ -1518,6 +1584,7 @@
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
             if (reconcileOwnershipLots()) changed = true;
             if (repairObservedBazaarSources(logs)) changed = true;
+            if (await reconcileObservedBazaarPurchases(logs)) changed = true;
             if (await reconcileTradePurchases(logs)) changed = true;
             if (reconcileItemMarketSales(logs)) changed = true;
             if (reconcileFactionMoneyDeposits(logs)) changed = true;
@@ -2157,7 +2224,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. v0.5.3 adds observed Bazaar source classification and trade purchase aggregation. Trade lifecycle logs are grouped by Torn trade ID so item and money events create one deduplicated purchase with frozen purchase-time MV. The ownership/lot engine remains intact.' +
+            'v' + VERSION + ' performs no Torn game actions. v0.5.4 fixes Bazaar recovery when an observed Bazaar log was already marked processed before source-aware handling. The Bazaar reconciler now independently creates or repairs the whitelisted purchase from the authoritative seller/items/cost log, while preserving deduplication and frozen purchase-time MV.' +
         '</div></div>';
     }
 
