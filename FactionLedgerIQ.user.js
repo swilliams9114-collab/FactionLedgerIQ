@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.8.0
+// @version      0.8.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.8.0';
+    const VERSION = '0.8.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2748,9 +2748,10 @@
             return '<div class="fliq-card"><div class="fliq-muted">No safe legacy/test cleanup candidates. Only unresolved records older than 24 hours with no child transactions or active allocations are shown here.</div></div>';
         }
         return '<div class="fliq-card"><div class="fliq-muted">These unresolved records are older than 24 hours and have no linked child transactions or active allocations. Archiving marks them VOID with an audit reason; nothing is deleted.</div>' +
+            '<div class="fliq-actions" style="margin-top:8px"><button class="fliq-btn" type="button" data-fliq="cleanup-select-all">Select All Safe (' + candidates.length + ')</button><button class="fliq-btn fliq-btn-danger" type="button" data-fliq="cleanup-archive-selected">Archive Selected</button></div>' +
             '<div class="fliq-list" style="margin-top:8px">' + candidates.map(function (tx) {
-                return '<div class="fliq-item"><div class="fliq-item-top"><b>' + esc(tx.itemName) + ' × ' +
-                    Number(tx.qty || 0).toLocaleString() + '</b><span class="fliq-pill">' + esc(tx.type) + '</span></div>' +
+                return '<div class="fliq-item"><div class="fliq-item-top"><label style="display:flex;gap:8px;align-items:center;min-width:0"><input type="checkbox" data-fliq-cleanup-select value="' + esc(tx.id) + '"><b>' + esc(tx.itemName) + ' × ' +
+                    Number(tx.qty || 0).toLocaleString() + '</b></label><span class="fliq-pill">' + esc(tx.type) + '</span></div>' +
                     '<div>' + esc(new Date(tx.timestamp).toLocaleString()) + '</div>' +
                     (tx.type === 'PURCHASE' ? '<div class="fliq-muted">Billable ' + money(tx.billableTotal) + ' · ' + esc(tx.source || '') + '</div>' : '') +
                     '<div class="fliq-actions"><button class="fliq-btn fliq-btn-danger" data-fliq="archive-test" data-id="' + esc(tx.id) + '">Archive Test Record</button></div></div>';
@@ -2931,6 +2932,47 @@
                 list.classList.remove('fliq-suggestions-open');
             }
             if (visible) visible.blur();
+            return;
+        }
+
+        if (action === 'cleanup-select-all') {
+            const boxes = Array.from(document.querySelectorAll('[data-fliq-cleanup-select]'));
+            const shouldSelect = boxes.some(function (box) { return !box.checked; });
+            boxes.forEach(function (box) { box.checked = shouldSelect; });
+            const button = document.querySelector('[data-fliq="cleanup-select-all"]');
+            if (button) button.textContent = shouldSelect ? 'Clear Selection' : 'Select All Safe (' + boxes.length + ')';
+            return;
+        }
+
+        if (action === 'cleanup-archive-selected') {
+            const selectedIds = Array.from(document.querySelectorAll('[data-fliq-cleanup-select]:checked')).map(function (box) { return box.value; });
+            if (!selectedIds.length) {
+                toast('Select at least one safe test record');
+                return;
+            }
+            const currentSafe = cleanupCandidates();
+            const selected = currentSafe.filter(function (candidate) { return selectedIds.includes(candidate.id); });
+            if (selected.length !== selectedIds.length) {
+                toast('Selection changed; review the safe cleanup list again');
+                return;
+            }
+            const totalBillable = selected.filter(function (candidate) { return candidate.type === 'PURCHASE'; }).reduce(function (sum, candidate) { return sum + Number(candidate.billableTotal || 0); }, 0);
+            const ok = confirm('Archive ' + selected.length + ' selected legacy/test record' + (selected.length === 1 ? '' : 's') + '?\n\n' +
+                (totalBillable > 0 ? 'Selected purchase billable total: ' + money(totalBillable) + '\n\n' : '') +
+                'Nothing will be deleted. Every selected transaction will be marked VOID and retained in History with an audit reason.');
+            if (!ok) return;
+            let archived = 0;
+            selected.forEach(function (candidate) {
+                if (archiveTestTransaction(candidate)) archived += 1;
+            });
+            if (!archived) {
+                toast('No records were archived');
+                return;
+            }
+            state.detection.lastDetectedAt = new Date().toISOString();
+            state.detection.lastSource = 'Legacy/test cleanup · User archived ' + archived + ' records';
+            saveState();
+            toast(archived + ' test record' + (archived === 1 ? '' : 's') + ' archived; audit retained');
             return;
         }
 
