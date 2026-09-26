@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.5.5
+// @version      0.5.6
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.5.5';
+    const VERSION = '0.5.6';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2235,7 +2235,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. v0.5.5 fixes legacy Bazaar recovery across API-page rollover. Bazaar reconciliation now checks both the current Torn log page and FactionLedgerIQ's persisted recent API-event cache, so an authoritative Bazaar event already visible in Diagnostics can be recovered even after it falls outside Torn's latest 100 logs.' +
+            "v" + VERSION + " performs no Torn game actions. v0.5.6 fixes legacy Bazaar recovery across API-page rollover. Bazaar reconciliation checks both the current Torn log page and FactionLedgerIQ's persisted recent API-event cache, so an authoritative Bazaar event already visible in Diagnostics can be recovered even after it falls outside Torn's latest 100 logs." +
         '</div></div>';
     }
 
