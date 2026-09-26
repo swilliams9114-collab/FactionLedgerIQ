@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.6.4
+// @version      0.7.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.6.4';
+    const VERSION = '0.7.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -34,7 +34,7 @@
         settings: { playerName: '', playerId: '', factionName: '', autoDetectPurchases: true, apiKey: '', apiPolling: true, apiPollSeconds: 5 },
         people: {},
         accounting: { schemaVersion: 1, lots: [], allocations: [] },
-        detection: { processedFingerprints: [], processedLogIds: [], recentApiEvents: [], recentFactionCandidates: [], factionMovementBuffer: [], factionBalanceSnapshot: null, lastDetectedAt: '', lastSource: '', lastApiPollAt: '', lastApiError: '', apiStatus: 'Not configured' },
+        detection: { processedFingerprints: [], processedLogIds: [], recentApiEvents: [], recentFactionCandidates: [], factionMovementBuffer: [], factionBalanceSnapshot: null, balanceMovements: [], lastDetectedAt: '', lastSource: '', lastApiPollAt: '', lastApiError: '', apiStatus: 'Not configured' },
         whitelist: [],
         transactions: [],
         createdAt: new Date().toISOString(),
@@ -1692,58 +1692,76 @@
         };
     }
 
+    function balanceMovementForLog(logIdValue) {
+        state.detection.balanceMovements = Array.isArray(state.detection.balanceMovements) ? state.detection.balanceMovements : [];
+        return state.detection.balanceMovements.find(function (m) { return m.logId === logIdValue; }) || null;
+    }
+
+    function saleCandidatesForDeposit(part) {
+        const depositMs = part.timestamp * 1000;
+        return liveTransactions().filter(function (sale) {
+            if (sale.type !== 'SALE') return false;
+            const b = saleOutstanding(sale);
+            if (!b || !(b.owed > 0)) return false;
+            const saleMs = new Date(sale.timestamp).getTime();
+            return Number.isFinite(saleMs) && saleMs <= depositMs &&
+                depositMs - saleMs <= 7 * 24 * 60 * 60 * 1000;
+        }).sort(function (a,b) { return new Date(a.timestamp) - new Date(b.timestamp); });
+    }
+
+    function rememberUnclassifiedDeposit(part) {
+        if (!part.logId || balanceMovementForLog(part.logId)) return false;
+        const candidates = saleCandidatesForDeposit(part);
+        state.detection.balanceMovements.push({
+            id: uid('BAL'), logId: part.logId, timestamp: part.timestamp,
+            factionId: part.factionId, direction: 'IN', amount: part.amount,
+            status: 'UNCLASSIFIED', classification: '',
+            candidateSaleIds: candidates.map(function (s) { return s.id; }),
+            createdAt: new Date().toISOString()
+        });
+        return true;
+    }
+
+    function applyDepositToSales(movement) {
+        let remaining = Number(movement.amount || 0);
+        const sales = (movement.candidateSaleIds || []).map(function (id) {
+            return liveTransactions().find(function (tx) { return tx.id === id && tx.type === 'SALE'; });
+        }).filter(Boolean).sort(function (a,b) { return new Date(a.timestamp) - new Date(b.timestamp); });
+        const totalOwed = sales.reduce(function (sum, sale) {
+            const b = saleOutstanding(sale); return sum + Number(b && b.owed || 0);
+        }, 0);
+        if (!sales.length || totalOwed !== remaining) return false;
+        sales.forEach(function (sale) {
+            const b = saleOutstanding(sale);
+            const amount = Number(b && b.owed || 0);
+            if (!(amount > 0)) return;
+            addChild(sale, 'FACTION_BALANCE_IN', {
+                timestamp: movement.timestamp ? new Date(movement.timestamp * 1000).toISOString() : new Date().toISOString(),
+                itemName: sale.itemName, itemId: sale.itemId, qty: sale.qty,
+                amount: amount, actualTotal: amount,
+                source: 'Personal Wallet', destination: 'Faction Balance',
+                ownership: 'FACTION_PROCEEDS', status: 'READY_FOR_COLLECTION',
+                detectionMethod: 'USER_CLASSIFIED_FACTION_MONEY_DEPOSIT',
+                depositApiLogId: movement.logId, apiLogIds: [movement.logId],
+                factionId: movement.factionId,
+                notes: 'User classified mixed faction-balance deposit as faction sale proceeds. Applied ' +
+                    money(amount) + ' to sale ' + sale.id + '.'
+            });
+            remaining -= amount;
+        });
+        movement.status = 'CLASSIFIED';
+        movement.classification = 'SALE_PROCEEDS';
+        movement.classifiedAt = new Date().toISOString();
+        return remaining === 0;
+    }
+
     function reconcileFactionMoneyDeposits(logs) {
         let changed = false;
-        const deposits = (logs || []).map(factionMoneyDepositPart).filter(Boolean)
-            .sort(function (a, b) { return a.timestamp - b.timestamp; });
-
-        deposits.forEach(function (part) {
-            if (!part.logId) return;
-            const already = liveTransactions().some(function (tx) {
-                return tx.type === 'FACTION_BALANCE_IN' &&
-                    (tx.depositApiLogId === part.logId ||
-                     (Array.isArray(tx.apiLogIds) && tx.apiLogIds.includes(part.logId)));
+        (logs || []).map(factionMoneyDepositPart).filter(Boolean)
+            .sort(function (a,b) { return a.timestamp - b.timestamp; })
+            .forEach(function (part) {
+                if (rememberUnclassifiedDeposit(part)) changed = true;
             });
-            if (already) return;
-
-            const candidates = liveTransactions().filter(function (sale) {
-                if (sale.type !== 'SALE') return false;
-                const b = saleOutstanding(sale);
-                if (!b || b.owed !== part.amount) return false;
-                const saleMs = new Date(sale.timestamp).getTime();
-                const depositMs = part.timestamp * 1000;
-                return Number.isFinite(saleMs) && saleMs <= depositMs &&
-                    depositMs - saleMs <= 7 * 24 * 60 * 60 * 1000;
-            }).sort(function (a, b) {
-                return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
-            });
-
-            // Exact amount + chronology is intentionally strict. If ambiguous, leave it
-            // unresolved rather than assigning faction money to the wrong sale.
-            if (candidates.length !== 1) return;
-            const sale = candidates[0];
-            const child = addChild(sale, 'FACTION_BALANCE_IN', {
-                timestamp: part.timestamp ? new Date(part.timestamp * 1000).toISOString() : new Date().toISOString(),
-                itemName: sale.itemName,
-                itemId: sale.itemId,
-                qty: sale.qty,
-                amount: part.amount,
-                actualTotal: part.amount,
-                source: 'Personal Wallet',
-                destination: 'Faction Balance',
-                ownership: 'FACTION_PROCEEDS',
-                status: 'READY_FOR_COLLECTION',
-                detectionMethod: 'API_FACTION_MONEY_DEPOSIT',
-                depositApiLogId: part.logId,
-                apiLogIds: [part.logId],
-                factionId: part.factionId,
-                notes: 'API-confirmed faction money deposit matched to outstanding sale proceeds. Player obligation settled; funds are ready for faction collection.'
-            });
-            child.depositApiLogId = part.logId;
-            state.detection.lastDetectedAt = new Date().toISOString();
-            state.detection.lastSource = 'Torn API · Faction Money Deposit';
-            changed = true;
-        });
         return changed;
     }
 
@@ -1839,28 +1857,10 @@
         const sales = liveTransactions().filter(function (tx) { return tx.type === 'SALE'; })
             .sort(function (a, b) { return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(); });
 
-        if (delta > 0) {
-            const exact = sales.find(function (sale) {
-                const b = saleOutstanding(sale);
-                return b && b.owed === delta;
-            });
-            if (!exact) return false;
-            recordBalanceDeposit(exact, delta, current);
-            state.detection.lastDetectedAt = new Date().toISOString();
-            state.detection.lastSource = 'Torn API · Faction Balance';
-            return true;
-        }
-
-        const decrease = Math.abs(delta);
-        const exactReady = sales.find(function (sale) {
-            const b = saleOutstanding(sale);
-            return b && b.ready === decrease;
-        });
-        if (!exactReady) return false;
-        recordFactionCollection(exactReady, decrease, current);
-        state.detection.lastDetectedAt = new Date().toISOString();
-        state.detection.lastSource = 'Torn API · Faction Balance';
-        return true;
+        // A faction member balance is a mixed account. Balance deltas alone cannot prove
+        // that money belongs to an armory sale, reimbursement, war payout, or personal funds.
+        // Authoritative log movements are captured for explicit classification instead.
+        return false;
     }
 
     async function pollApiLogs(showToast) {
@@ -2275,7 +2275,7 @@
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
                 '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.4.6 adds authoritative money_deposited log reconciliation for sale proceeds, while retaining faction-balance fallback, movement deduplication, and reimbursement tracking.</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">v0.7.0 treats your faction balance as a mixed account. Deposits are captured as unclassified until you explicitly identify sale proceeds, personal cash, or other money.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -2333,8 +2333,31 @@
 
     function renderPending() {
         const list = pendingTransactions();
-        if (!list.length) return '<div class="fliq-empty">No pending actions.</div>';
-        return '<div class="fliq-list">' + list.map(function (tx) {
+        const movements = (Array.isArray(state.detection.balanceMovements) ? state.detection.balanceMovements : [])
+            .filter(function (m) { return m.status === 'UNCLASSIFIED'; })
+            .sort(function (a,b) { return Number(b.timestamp||0) - Number(a.timestamp||0); });
+        const movementHtml = movements.map(function (m) {
+            const candidates = (m.candidateSaleIds || []).map(function (id) {
+                return liveTransactions().find(function (tx) { return tx.id === id && tx.type === 'SALE'; });
+            }).filter(Boolean);
+            const candidateTotal = candidates.reduce(function (sum,sale) {
+                const b = saleOutstanding(sale); return sum + Number(b && b.owed || 0);
+            },0);
+            return '<div class="fliq-item"><div class="fliq-item-top"><b>Faction balance deposit ' + money(m.amount) +
+                '</b><span class="fliq-pill">UNCLASSIFIED</span></div>' +
+                '<div>' + esc(new Date(Number(m.timestamp||0)*1000).toLocaleString()) + '</div>' +
+                '<div class="fliq-muted">This could be personal cash, war money, another payment, or faction sale proceeds.</div>' +
+                (candidates.length ? '<div class="fliq-muted" style="margin-top:6px">Outstanding sale candidates: ' +
+                    candidates.length + ' · combined ' + money(candidateTotal) + '</div>' : '') +
+                '<div class="fliq-actions">' +
+                    (candidateTotal === Number(m.amount||0) && candidates.length
+                        ? '<button class="fliq-btn fliq-btn-primary" data-fliq="balance-sale-proceeds" data-id="' + esc(m.id) + '">Apply to Sale Proceeds</button>' : '') +
+                    '<button class="fliq-btn" data-fliq="balance-personal" data-id="' + esc(m.id) + '">Personal Deposit</button>' +
+                    '<button class="fliq-btn" data-fliq="balance-other" data-id="' + esc(m.id) + '">Other / Ignore</button>' +
+                '</div></div>';
+        }).join('');
+        if (!list.length && !movements.length) return '<div class="fliq-empty">No pending actions.</div>';
+        return '<div class="fliq-list">' + movementHtml + list.map(function (tx) {
             return transactionCard(tx, true);
         }).join('') + '</div>';
     }
@@ -2725,6 +2748,28 @@
         if (action === 'remove-whitelist') {
             state.whitelist = state.whitelist.filter(function (x) { return x.id !== id; });
             saveState();
+            return;
+        }
+
+        if (action === 'balance-sale-proceeds' || action === 'balance-personal' || action === 'balance-other') {
+            const movement = (state.detection.balanceMovements || []).find(function (m) { return m.id === id; });
+            if (!movement || movement.status !== 'UNCLASSIFIED') return;
+            if (action === 'balance-sale-proceeds') {
+                if (!applyDepositToSales(movement)) {
+                    toast('Deposit does not exactly match the selected outstanding sale total');
+                    return;
+                }
+                state.detection.lastDetectedAt = new Date().toISOString();
+                state.detection.lastSource = 'Faction balance · User classified sale proceeds';
+                saveState();
+                toast('Deposit applied to sale proceeds');
+                return;
+            }
+            movement.status = 'CLASSIFIED';
+            movement.classification = action === 'balance-personal' ? 'PERSONAL' : 'OTHER';
+            movement.classifiedAt = new Date().toISOString();
+            saveState();
+            toast(action === 'balance-personal' ? 'Marked as personal deposit' : 'Marked other / ignored');
             return;
         }
 
