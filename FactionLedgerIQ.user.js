@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.7.2
+// @version      0.7.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.7.2';
+    const VERSION = '0.7.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1696,6 +1696,78 @@
         return changed;
     }
 
+    function factionBalanceCreditPart(log) {
+        const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+        if (data.user == null || data.faction == null || data.balance_before == null || data.balance_after == null) return null;
+        const before = Number(data.balance_before), after = Number(data.balance_after);
+        if (!Number.isFinite(before) || !Number.isFinite(after) || after <= before) return null;
+        return { logId: logId(log), timestamp: Number(log.timestamp || 0), factionId: String(data.faction),
+            senderId: String(data.user), balanceBefore: before, balanceAfter: after, amount: after - before };
+    }
+
+    function reimbursementOutstanding(tx) {
+        if (!tx || tx.status === 'VOID') return 0;
+        let total = 0;
+        if (tx.type === 'PURCHASE') {
+            const deposited = tx.status === 'DEPOSITED' || childrenOf(tx.id, 'ARMORY_IN').length || childrenOf(tx.id, 'DISPLAY_IN').length;
+            if (!deposited) return 0;
+            total = Number(tx.billableTotal || 0);
+        } else if (tx.type === 'ARMORY_IN' &&
+            (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' || tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT') &&
+            !tx.purchaseAllocationId) total = Number(tx.billableTotal || tx.mvTotal || 0);
+        else return 0;
+        const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum,r) { return sum + Number(r.amount || r.actualTotal || 0); },0);
+        return Math.max(0,total-refunded);
+    }
+
+    function reimbursementCandidatesForCredit(part) {
+        const eventMs = part.timestamp * 1000;
+        return liveTransactions().filter(function (tx) {
+            const outstanding = reimbursementOutstanding(tx);
+            if (!(outstanding > 0)) return false;
+            const txMs = new Date(tx.timestamp).getTime();
+            return Number.isFinite(txMs) && txMs <= eventMs && eventMs - txMs <= 30*24*60*60*1000;
+        }).sort(function(a,b){ return new Date(a.timestamp)-new Date(b.timestamp); });
+    }
+
+    async function rememberUnclassifiedCredit(part) {
+        if (!part.logId || balanceMovementForLog(part.logId)) return false;
+        const candidates = reimbursementCandidatesForCredit(part);
+        state.detection.balanceMovements.push({ id:uid('BAL'), logId:part.logId, timestamp:part.timestamp, factionId:part.factionId,
+            direction:'CREDIT', amount:part.amount, status:'UNCLASSIFIED', classification:'',
+            senderId:part.senderId, senderName:await resolvePlayerName(part.senderId), balanceBefore:part.balanceBefore,
+            balanceAfter:part.balanceAfter, candidateReimbursementIds:candidates.map(function(tx){return tx.id;}), createdAt:new Date().toISOString() });
+        return true;
+    }
+
+    function applyCreditAsReimbursement(movement) {
+        let remaining=Number(movement.amount||0);
+        const candidates=(movement.candidateReimbursementIds||[]).map(function(id){return liveTransactions().find(function(tx){return tx.id===id;});}).filter(Boolean);
+        const exact=candidates.find(function(tx){return reimbursementOutstanding(tx)===remaining;});
+        const targets=exact?[exact]:candidates;
+        const total=targets.reduce(function(sum,tx){return sum+reimbursementOutstanding(tx);},0);
+        if(!targets.length||total!==remaining)return false;
+        targets.forEach(function(tx){
+            const amount=reimbursementOutstanding(tx); if(!(amount>0))return;
+            addChild(tx,'REFUND',{timestamp:movement.timestamp?new Date(movement.timestamp*1000).toISOString():new Date().toISOString(),
+                itemName:tx.itemName,itemId:tx.itemId,qty:tx.qty,amount:amount,actualTotal:amount,source:'Faction Balance',
+                destination:'Personal Faction Balance',ownership:'REIMBURSEMENT',status:'PAID',
+                personName:movement.senderName||'',personId:movement.senderId||'',paidByName:movement.senderName||'',paidById:movement.senderId||'',
+                detectionMethod:'USER_CLASSIFIED_FACTION_REIMBURSEMENT',reimbursementApiLogId:movement.logId,apiLogIds:[movement.logId],
+                factionId:movement.factionId,notes:'User classified mixed faction-balance credit as reimbursement. Applied '+money(amount)+' to '+tx.id+'.'});
+            remaining-=amount;
+        });
+        movement.status='CLASSIFIED'; movement.classification='REIMBURSEMENT'; movement.classifiedAt=new Date().toISOString();
+        return remaining===0;
+    }
+
+    async function reconcileFactionBalanceCredits(logs) {
+        let changed=false;
+        const parts=(logs||[]).map(factionBalanceCreditPart).filter(Boolean).sort(function(a,b){return a.timestamp-b.timestamp;});
+        for(const part of parts){if(await rememberUnclassifiedCredit(part))changed=true;}
+        return changed;
+    }
+
     function factionMoneyDepositPart(log) {
         const data = log && log.data && typeof log.data === 'object' ? log.data : {};
         const amount = Number(data.money_deposited || 0);
@@ -1926,6 +1998,7 @@
             if (await reconcileTradePurchases(logs)) changed = true;
             if (reconcileItemMarketSales(logs)) changed = true;
             if (reconcileFactionMoneyDeposits(logs)) changed = true;
+            if (await reconcileFactionBalanceCredits(logs)) changed = true;
             if (await reconcileFactionCollections(logs)) changed = true;
             if (await reconcileFactionBalance()) changed = true;
             for (const log of logs) {
@@ -2357,32 +2430,43 @@
                 return liveTransactions().find(function (tx) { return tx.id === id && tx.type === 'SALE'; });
             }).filter(Boolean);
             const isOut = m.direction === 'OUT';
+            const isCredit = m.direction === 'CREDIT';
+            const reimbursementCandidates = isCredit ? (m.candidateReimbursementIds || []).map(function (id) {
+                return liveTransactions().find(function (tx) { return tx.id === id; });
+            }).filter(Boolean) : [];
             const candidateTotal = candidates.reduce(function (sum,sale) {
                 const bal = saleOutstanding(sale);
                 return sum + Number(isOut ? (bal && bal.ready || 0) : (bal && bal.owed || 0));
             },0);
+            const exactReimbursement = reimbursementCandidates.find(function (tx) { return reimbursementOutstanding(tx) === Number(m.amount || 0); });
+            if (isCredit) candidateTotal = exactReimbursement ? Number(m.amount || 0) :
+                reimbursementCandidates.reduce(function (sum,tx) { return sum + reimbursementOutstanding(tx); },0);
             return '<div class="fliq-item"><div class="fliq-item-top"><b>Faction balance ' +
-                (isOut ? 'withdrawal ' : 'deposit ') + money(m.amount) +
+                (isOut ? 'withdrawal ' : (isCredit ? 'credit ' : 'deposit ')) + money(m.amount) +
                 '</b><span class="fliq-pill">UNCLASSIFIED</span></div>' +
                 '<div>' + esc(new Date(Number(m.timestamp||0)*1000).toLocaleString()) + '</div>' +
                 (isOut && m.collectorName ? '<div class="fliq-muted">Withdrawn by ' +
                     esc(personLabel(m.collectorName, m.collectorId)) + '</div>' : '') +
+                (isCredit && m.senderName ? '<div class="fliq-muted">Added by ' + esc(personLabel(m.senderName, m.senderId)) + '</div>' : '') +
                 '<div class="fliq-muted">' + (isOut
                     ? 'This could be faction collection, a war payment, reimbursement, special transfer, or another withdrawal.'
-                    : 'This could be personal cash, war money, another payment, or faction sale proceeds.') + '</div>' +
+                    : (isCredit ? 'This could be reimbursement, war pay, a special transfer, or another faction payment.'
+                    : 'This could be personal cash, war money, another payment, or faction sale proceeds.')) + '</div>' +
                 (candidates.length ? '<div class="fliq-muted" style="margin-top:6px">' +
-                    (isOut ? 'Ready sale-proceeds candidates: ' : 'Outstanding sale candidates: ') +
+                    (isOut ? 'Ready sale-proceeds candidates: ' : (isCredit ? 'Reimbursement candidates: ' : 'Outstanding sale candidates: ')) +
                     candidates.length + ' · combined ' + money(candidateTotal) + '</div>' : '') +
                 '<div class="fliq-actions">' +
                     (candidateTotal === Number(m.amount||0) && candidates.length
                         ? '<button class="fliq-btn fliq-btn-primary" data-fliq="' +
-                            (isOut ? 'balance-faction-collection' : 'balance-sale-proceeds') +
+                            (isOut ? 'balance-faction-collection' : (isCredit ? 'balance-reimbursement' : 'balance-sale-proceeds')) +
                             '" data-id="' + esc(m.id) + '">' +
-                            (isOut ? 'Apply as Faction Collection' : 'Apply to Sale Proceeds') + '</button>' : '') +
+                            (isOut ? 'Apply as Faction Collection' : (isCredit ? 'Apply as Reimbursement' : 'Apply to Sale Proceeds')) + '</button>' : '') +
                     (isOut
                         ? '<button class="fliq-btn" data-fliq="balance-withdrawal-other" data-id="' + esc(m.id) + '">Other / Ignore</button>'
-                        : '<button class="fliq-btn" data-fliq="balance-personal" data-id="' + esc(m.id) + '">Personal Deposit</button>' +
-                          '<button class="fliq-btn" data-fliq="balance-other" data-id="' + esc(m.id) + '">Other / Ignore</button>') +
+                        : (isCredit
+                            ? '<button class="fliq-btn" data-fliq="balance-credit-other" data-id="' + esc(m.id) + '">Other / Ignore</button>'
+                            : '<button class="fliq-btn" data-fliq="balance-personal" data-id="' + esc(m.id) + '">Personal Deposit</button>' +
+                              '<button class="fliq-btn" data-fliq="balance-other" data-id="' + esc(m.id) + '">Other / Ignore</button>')) +
                 '</div></div>';
         }).join('');
         if (!list.length && !movements.length) return '<div class="fliq-empty">No pending actions.</div>';
@@ -2801,6 +2885,18 @@
             state.whitelist = state.whitelist.filter(function (x) { return x.id !== id; });
             saveState();
             return;
+        }
+
+        if (action === 'balance-reimbursement' || action === 'balance-credit-other') {
+            const movement=(state.detection.balanceMovements||[]).find(function(m){return m.id===id;});
+            if(!movement||movement.status!=='UNCLASSIFIED'||movement.direction!=='CREDIT')return;
+            if(action==='balance-reimbursement'){
+                if(!applyCreditAsReimbursement(movement)){toast('Credit does not exactly match an eligible reimbursement chain');return;}
+                state.detection.lastDetectedAt=new Date().toISOString(); state.detection.lastSource='Faction balance · User classified reimbursement';
+                saveState(); toast('Credit applied as reimbursement'); return;
+            }
+            movement.status='CLASSIFIED'; movement.classification='OTHER'; movement.classifiedAt=new Date().toISOString();
+            saveState(); toast('Credit marked other / ignored'); return;
         }
 
         if (action === 'balance-faction-collection' || action === 'balance-withdrawal-other') {
