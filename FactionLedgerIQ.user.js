@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.5.0
+// @version      0.5.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.5.0';
+    const VERSION = '0.5.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -510,8 +510,7 @@
 
     function suppressDuplicateArmoryOuts() {
         const rows = state.transactions.filter(function (tx) {
-            return tx && tx.type === 'ARMORY_OUT' && tx.status !== 'VOID' &&
-                String(tx.detectionMethod || '').indexOf('API_FACTION_ARMORY_OUT') === 0;
+            return tx && tx.type === 'ARMORY_OUT' && tx.status !== 'VOID';
         }).sort(function (a, b) {
             return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
         });
@@ -534,6 +533,86 @@
                 changed = true;
             }
         }
+        return changed;
+    }
+
+    function reconcileLegacyPurchaseDuplicates() {
+        let changed = false;
+        const purchases = state.transactions.filter(function (tx) {
+            return tx && tx.type === 'PURCHASE' && tx.status !== 'VOID';
+        }).sort(function (a, b) { return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(); });
+
+        for (let i = 0; i < purchases.length; i += 1) {
+            const a = purchases[i];
+            if (!a || a.status === 'VOID') continue;
+            for (let j = i + 1; j < purchases.length; j += 1) {
+                const b = purchases[j];
+                if (!b || b.status === 'VOID') continue;
+                const dt = Math.abs(new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+                if (dt > 15000) break;
+                if (String(a.itemId || '') !== String(b.itemId || '')) continue;
+                if (Number(a.qty || 0) !== Number(b.qty || 0)) continue;
+                if (Number(a.actualTotal || 0) !== Number(b.actualTotal || 0)) continue;
+                const apiA = String(a.detectionMethod || '').indexOf('API') === 0;
+                const apiB = String(b.detectionMethod || '').indexOf('API') === 0;
+                const domA = a.detectionMethod === 'DOM_CONFIRMATION';
+                const domB = b.detectionMethod === 'DOM_CONFIRMATION';
+                if (!((apiA && domB) || (apiB && domA))) continue;
+                const keep = apiA ? a : b;
+                const dup = apiA ? b : a;
+                if (childrenOf(dup.id).length) continue;
+                dup.status = 'VOID';
+                dup.voidReason = 'Legacy cleanup: duplicate DOM purchase superseded by API-confirmed purchase.';
+                dup.voidedAt = new Date().toISOString();
+                dup.supersededBy = keep.id;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    function reconcilePurchasesToArmoryDeposits() {
+        let changed = false;
+        const deposits = liveTransactions().filter(function (tx) {
+            return tx.type === 'ARMORY_IN' &&
+                tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
+                !tx.purchaseAllocationId;
+        }).sort(function (a, b) { return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(); });
+
+        deposits.forEach(function (dep) {
+            let remaining = Number(dep.qty || 0);
+            if (!(remaining > 0)) return;
+            const depMs = new Date(dep.timestamp).getTime();
+            const candidates = liveTransactions().filter(function (p) {
+                if (p.type !== 'PURCHASE' || p.status === 'DEPOSITED') return false;
+                if (String(p.itemId || '') !== String(dep.itemId || '')) return false;
+                const pMs = new Date(p.timestamp).getTime();
+                return Number.isFinite(pMs) && pMs <= depMs && depMs - pMs <= 7 * 24 * 60 * 60 * 1000;
+            }).sort(function (a, b) { return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(); });
+
+            const exact = candidates.filter(function (p) { return Number(p.qty || 0) === remaining; });
+            if (exact.length !== 1) return;
+            const purchase = exact[0];
+
+            purchase.status = 'DEPOSITED';
+            purchase.depositTransactionId = dep.id;
+            dep.purchaseAllocationId = purchase.id;
+            dep.ownership = 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT';
+            dep.billableTotal = Number(purchase.billableTotal || dep.billableTotal || dep.mvTotal || 0);
+            dep.actualTotal = Number(purchase.actualTotal || 0);
+            dep.mvTotal = Number(purchase.mvTotal || dep.mvTotal || 0);
+            dep.mvEach = Number(purchase.mvEach || dep.mvEach || 0);
+            dep.notes = [dep.notes, 'Matched to purchase ' + purchase.id + '; reimbursement uses frozen purchase billable amount.']
+                .filter(Boolean).join(' | ');
+            purchase.notes = [purchase.notes, 'Automatically matched to faction armory deposit ' + dep.id + '.']
+                .filter(Boolean).join(' | ');
+            state.accounting.allocations.push({
+                id: uid('ALLOC'), kind: 'PURCHASE_TO_ARMORY', purchaseId: purchase.id,
+                movementId: dep.id, itemId: dep.itemId, qty: remaining,
+                billableTotal: dep.billableTotal, createdAt: new Date().toISOString()
+            });
+            changed = true;
+        });
         return changed;
     }
 
@@ -1235,7 +1314,9 @@
             let changed = false;
             logs.forEach(function (log) { rememberFactionCandidate(log); });
             if (suppressDuplicateArmoryOuts()) changed = true;
+            if (reconcileLegacyPurchaseDuplicates()) changed = true;
             if (await reconcileFactionMovement(logs)) changed = true;
+            if (reconcilePurchasesToArmoryDeposits()) changed = true;
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
             if (reconcileItemMarketSales(logs)) changed = true;
             if (reconcileFactionMoneyDeposits(logs)) changed = true;
@@ -1395,11 +1476,14 @@
             }
 
             if (tx.type === 'ARMORY_IN' &&
-                tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT') {
+                (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' ||
+                 tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT')) {
                 const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
                     return sum + Number(r.amount || r.actualTotal || 0);
                 }, 0);
-                factionOwesMe += Math.max(0, Number(tx.billableTotal || tx.mvTotal || 0) - refunded);
+                if (!tx.purchaseAllocationId) {
+                    factionOwesMe += Math.max(0, Number(tx.billableTotal || tx.mvTotal || 0) - refunded);
+                }
             }
 
             if (tx.type === 'SALE') {
@@ -1872,7 +1956,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. This release preserves the proven v0.4.6 detectors and adds the v0.5 accounting foundation, a local Torn ID → player-name cache, and automatic FACTION_COLLECTION reconciliation from observed faction balance withdrawal logs. Names are shown with IDs retained for audit accuracy. Exact, unambiguous matching is required; ambiguous money events remain unresolved.' +
+            'v' + VERSION + ' performs no Torn game actions. v0.5.1 adds audit-safe legacy cleanup: strong duplicate armory withdrawals are voided rather than deleted, DOM/API duplicate purchases are superseded, and exact purchase-to-armory matches are linked so reimbursement is counted once using the frozen purchase billable amount. Ambiguous matches remain pending.' +
         '</div></div>';
     }
 
