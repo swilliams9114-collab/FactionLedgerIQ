@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.5.4
+// @version      0.5.5
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.5.4';
+    const VERSION = '0.5.5';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1583,8 +1583,19 @@
             if (reconcilePurchasesToArmoryDeposits()) changed = true;
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
             if (reconcileOwnershipLots()) changed = true;
-            if (repairObservedBazaarSources(logs)) changed = true;
-            if (await reconcileObservedBazaarPurchases(logs)) changed = true;
+            // Bazaar recovery must also inspect the persisted diagnostic cache. Torn's latest
+            // 100-log page can advance past a purchase before a newer script version gets a
+            // chance to reconcile it; recentApiEvents retains the authoritative sanitized log.
+            const bazaarRecoveryLogs = [];
+            const bazaarSeen = new Set();
+            logs.concat(Array.isArray(state.detection.recentApiEvents) ? state.detection.recentApiEvents : []).forEach(function (ev) {
+                const key = logId(ev) || [ev && ev.timestamp, JSON.stringify(ev && ev.data || {})].join('|');
+                if (!key || bazaarSeen.has(key)) return;
+                bazaarSeen.add(key);
+                bazaarRecoveryLogs.push(ev);
+            });
+            if (repairObservedBazaarSources(bazaarRecoveryLogs)) changed = true;
+            if (await reconcileObservedBazaarPurchases(bazaarRecoveryLogs)) changed = true;
             if (await reconcileTradePurchases(logs)) changed = true;
             if (reconcileItemMarketSales(logs)) changed = true;
             if (reconcileFactionMoneyDeposits(logs)) changed = true;
@@ -2224,7 +2235,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. v0.5.4 fixes Bazaar recovery when an observed Bazaar log was already marked processed before source-aware handling. The Bazaar reconciler now independently creates or repairs the whitelisted purchase from the authoritative seller/items/cost log, while preserving deduplication and frozen purchase-time MV.' +
+            'v' + VERSION + ' performs no Torn game actions. v0.5.5 fixes legacy Bazaar recovery across API-page rollover. Bazaar reconciliation now checks both the current Torn log page and FactionLedgerIQ's persisted recent API-event cache, so an authoritative Bazaar event already visible in Diagnostics can be recovered even after it falls outside Torn's latest 100 logs.' +
         '</div></div>';
     }
 
