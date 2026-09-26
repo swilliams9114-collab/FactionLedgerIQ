@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.5.7
+// @version      0.5.8
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.5.7';
+    const VERSION = '0.5.8';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -688,7 +688,20 @@
             }).sort(function (a, b) { return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(); });
 
             const exact = candidates.filter(function (p) { return Number(p.qty || 0) === remaining; });
-            if (exact.length !== 1) return;
+            if (exact.length !== 1) {
+                // Identical stackable items are fungible in Torn. When more than one purchase
+                // could fund this deposit, do not invent provenance. Leave the deposit pending
+                // for an explicit purchase-lot selection.
+                if (candidates.length > 1 || exact.length > 1) {
+                    dep.status = 'ALLOCATION_REQUIRED';
+                    dep.allocationRequired = true;
+                    dep.allocationCandidateIds = candidates.map(function (p) { return p.id; });
+                    dep.notes = [dep.notes, 'Multiple eligible personal purchase lots exist; select which purchase funded this armory deposit.']
+                        .filter(Boolean).join(' | ');
+                    changed = true;
+                }
+                return;
+            }
             const purchase = exact[0];
 
             purchase.status = 'DEPOSITED';
@@ -2001,7 +2014,8 @@
 
     function pendingTransactions() {
         return liveTransactions().filter(function (tx) {
-            return (tx.type === 'PURCHASE' || tx.type === 'ARMORY_OUT') && tx.status === 'PENDING';
+            return ((tx.type === 'PURCHASE' || tx.type === 'ARMORY_OUT') && tx.status === 'PENDING') ||
+                (tx.type === 'ARMORY_IN' && tx.status === 'ALLOCATION_REQUIRED');
         });
     }
 
@@ -2130,6 +2144,22 @@
                 '</div>';
         }
 
+        if (pendingActions && tx.type === 'ARMORY_IN' && tx.status === 'ALLOCATION_REQUIRED') {
+            const ids = Array.isArray(tx.allocationCandidateIds) ? tx.allocationCandidateIds : [];
+            const candidates = ids.map(function (id) { return liveTransactions().find(function (p) { return p.id === id; }); })
+                .filter(function (p) { return p && p.type === 'PURCHASE' && p.status === 'PENDING'; });
+            actions =
+                '<div class="fliq-muted" style="margin-top:8px">Ownership allocation required. Torn does not identify which identical stackable items were deposited. Choose the purchase lot to reimburse:</div>' +
+                '<div class="fliq-actions">' +
+                candidates.map(function (p) {
+                    return '<button class="fliq-btn" data-fliq="allocate-armory-purchase" data-id="' + esc(tx.id) +
+                        '" data-purchase-id="' + esc(p.id) + '">' + esc(p.source || 'Purchase') + ' · ' +
+                        Number(p.qty || 0).toLocaleString() + ' × ' + esc(p.itemName) + ' · ' +
+                        money(p.billableTotal) + '</button>';
+                }).join('') +
+                '</div>';
+        }
+
         if (pendingActions && tx.type === 'ARMORY_OUT') {
             actions =
                 '<div class="fliq-actions">' +
@@ -2235,7 +2265,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. Bazaar recovery checks current API logs and the saved diagnostics cache so recent Bazaar purchases can still be reconciled after API log rollover.' +
+            'v' + VERSION + ' performs no Torn game actions. Identical stackable-item deposits are no longer assigned to a purchase lot by guesswork: ambiguous armory deposits require an explicit reimbursement-lot selection.' +
         '</div></div>';
     }
 
@@ -2399,6 +2429,38 @@
             tx.voidedAt = new Date().toISOString();
             saveState();
             toast('Transaction voided; audit retained');
+            return;
+        }
+
+        if (action === 'allocate-armory-purchase' && tx && tx.type === 'ARMORY_IN') {
+            const purchaseId = btn.dataset.purchaseId;
+            const purchase = liveTransactions().find(function (p) {
+                return p.id === purchaseId && p.type === 'PURCHASE' && p.status === 'PENDING' &&
+                    String(p.itemId || '') === String(tx.itemId || '') && Number(p.qty || 0) === Number(tx.qty || 0);
+            });
+            if (!purchase) { toast('That purchase lot is no longer available'); return; }
+            purchase.status = 'DEPOSITED';
+            purchase.depositTransactionId = tx.id;
+            tx.purchaseAllocationId = purchase.id;
+            tx.ownership = 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT';
+            tx.status = 'RECORDED';
+            tx.allocationRequired = false;
+            tx.billableTotal = Number(purchase.billableTotal || tx.billableTotal || tx.mvTotal || 0);
+            tx.actualTotal = Number(purchase.actualTotal || 0);
+            tx.mvTotal = Number(purchase.mvTotal || tx.mvTotal || 0);
+            tx.mvEach = Number(purchase.mvEach || tx.mvEach || 0);
+            tx.notes = [tx.notes, 'User selected purchase ' + purchase.id + ' as the reimbursement lot; frozen purchase pricing retained.']
+                .filter(Boolean).join(' | ');
+            purchase.notes = [purchase.notes, 'Allocated by user to faction armory deposit ' + tx.id + '.']
+                .filter(Boolean).join(' | ');
+            ensureAccounting();
+            state.accounting.allocations.push({
+                id: uid('ALLOC'), kind: 'PURCHASE_TO_ARMORY', purchaseId: purchase.id,
+                movementId: tx.id, itemId: tx.itemId, qty: Number(tx.qty || 0),
+                billableTotal: tx.billableTotal, createdAt: new Date().toISOString(), status: 'ACTIVE'
+            });
+            saveState();
+            toast('Purchase lot allocated to armory deposit');
             return;
         }
 
