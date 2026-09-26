@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.7.4
+// @version      0.8.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.7.4';
+    const VERSION = '0.8.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2705,6 +2705,58 @@
         }).join('') + '</div>';
     }
 
+    function cleanupCandidates() {
+        ensureAccounting();
+        return liveTransactions().filter(function (tx) {
+            if (!tx || (tx.type !== 'PURCHASE' && tx.type !== 'ARMORY_IN' && tx.type !== 'ARMORY_OUT')) return false;
+            if (tx.status !== 'PENDING' && tx.status !== 'ALLOCATION_REQUIRED') return false;
+            if (childrenOf(tx.id).length) return false;
+            const hasActiveAllocation = state.accounting.allocations.some(function (a) {
+                return a.status !== 'VOID' && (a.sourceTxId === tx.id || a.movementId === tx.id);
+            });
+            if (hasActiveAllocation) return false;
+            const age = Date.now() - new Date(tx.timestamp).getTime();
+            return Number.isFinite(age) && age >= 24 * 60 * 60 * 1000;
+        }).sort(function (a,b) { return new Date(a.timestamp) - new Date(b.timestamp); });
+    }
+
+    function archiveTestTransaction(tx) {
+        if (!tx || tx.status === 'VOID') return false;
+        if (childrenOf(tx.id).length) return false;
+        ensureAccounting();
+        const activeAllocations = state.accounting.allocations.filter(function (a) {
+            return a.status !== 'VOID' && (a.sourceTxId === tx.id || a.movementId === tx.id);
+        });
+        if (activeAllocations.length) return false;
+        tx.status = 'VOID';
+        tx.voidReason = 'Archived as legacy/test data by user';
+        tx.voidedAt = new Date().toISOString();
+        tx.archivedAsTest = true;
+        state.accounting.lots.forEach(function (lot) {
+            if (lot.sourceTxId === tx.id && lot.status !== 'VOID') {
+                lot.status = 'VOID';
+                lot.voidReason = 'Source transaction archived as legacy/test data';
+                lot.voidedAt = tx.voidedAt;
+            }
+        });
+        return true;
+    }
+
+    function renderCleanupTools() {
+        const candidates = cleanupCandidates();
+        if (!candidates.length) {
+            return '<div class="fliq-card"><div class="fliq-muted">No safe legacy/test cleanup candidates. Only unresolved records older than 24 hours with no child transactions or active allocations are shown here.</div></div>';
+        }
+        return '<div class="fliq-card"><div class="fliq-muted">These unresolved records are older than 24 hours and have no linked child transactions or active allocations. Archiving marks them VOID with an audit reason; nothing is deleted.</div>' +
+            '<div class="fliq-list" style="margin-top:8px">' + candidates.map(function (tx) {
+                return '<div class="fliq-item"><div class="fliq-item-top"><b>' + esc(tx.itemName) + ' × ' +
+                    Number(tx.qty || 0).toLocaleString() + '</b><span class="fliq-pill">' + esc(tx.type) + '</span></div>' +
+                    '<div>' + esc(new Date(tx.timestamp).toLocaleString()) + '</div>' +
+                    (tx.type === 'PURCHASE' ? '<div class="fliq-muted">Billable ' + money(tx.billableTotal) + ' · ' + esc(tx.source || '') + '</div>' : '') +
+                    '<div class="fliq-actions"><button class="fliq-btn fliq-btn-danger" data-fliq="archive-test" data-id="' + esc(tx.id) + '">Archive Test Record</button></div></div>';
+            }).join('') + '</div></div>';
+    }
+
     function renderSettings() {
         return '<form id="fliq-settings-form" class="fliq-card">' +
             row(
@@ -2726,6 +2778,7 @@
             '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button><button class="fliq-btn" type="button" data-fliq="create-api-key">Create FactionLedgerIQ API Key</button><button class="fliq-btn" type="button" data-fliq="test-api">Test API</button><button class="fliq-btn" type="button" data-fliq="toggle-api-diagnostics">Show API Diagnostics</button></div>' +
         '</form>' +
         '<div id="fliq-api-diagnostics" class="fliq-section" style="display:none"><h3>Recent API Events</h3><div class="fliq-card fliq-muted" style="margin-bottom:8px">Diagnostic output excludes API keys/tokens. ' + esc(renderCatalogDiagnostic()) + '</div>' + renderApiDiagnostics() + '<h3 style="margin-top:12px">Faction Movement Candidates</h3>' + renderFactionDiagnostics() + '</div>' +
+        '<div class="fliq-section"><h3>Legacy/Test Cleanup</h3>' + renderCleanupTools() + '</div>' +
         '<div class="fliq-section"><h3>Backup & Restore</h3><div class="fliq-card">' +
             '<div class="fliq-muted">Ledger data is stored locally in TornPDA/browser storage. Export backups regularly.</div>' +
             '<div class="fliq-actions">' +
@@ -2736,7 +2789,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. Faction-owned lots support partial returns plus partial Item Market, Bazaar, and Trade sales without creating false reimbursements; held-asset value follows the remaining faction quantity. Bazaar sales are distinguished from Item Market sales using the observed authoritative API fee-field shape.' +
+            'v' + VERSION + ' performs no Torn game actions. Legacy/test cleanup is audit-safe: eligible unresolved records can be archived as VOID without deletion, and linked/allocated records are blocked from cleanup. Faction-owned lots support partial returns plus partial Item Market, Bazaar, and Trade sales without creating false reimbursements.' +
         '</div></div>';
     }
 
@@ -2878,6 +2931,22 @@
                 list.classList.remove('fliq-suggestions-open');
             }
             if (visible) visible.blur();
+            return;
+        }
+
+        if (action === 'archive-test' && tx) {
+            const ok = confirm('Archive this record as legacy/test data?\n\n' +
+                (tx.itemName || 'Item') + ' × ' + Number(tx.qty || 0).toLocaleString() +
+                '\n\nNothing will be deleted. The transaction will be marked VOID and retained in History with an audit reason.');
+            if (!ok) return;
+            if (!cleanupCandidates().some(function (x) { return x.id === tx.id; }) || !archiveTestTransaction(tx)) {
+                toast('Record is no longer safe to archive');
+                return;
+            }
+            state.detection.lastDetectedAt = new Date().toISOString();
+            state.detection.lastSource = 'Legacy/test cleanup · User archived record';
+            saveState();
+            toast('Test record archived; audit retained');
             return;
         }
 
