@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.8.2
+// @version      0.9.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.8.2';
+    const VERSION = '0.9.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -712,6 +712,7 @@
             purchase.depositTransactionId = dep.id;
             dep.purchaseAllocationId = purchase.id;
             dep.ownership = 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT';
+            dep.provenanceStatus = 'TRACKED_PERSONAL_PURCHASE';
             dep.status = 'RECORDED';
             dep.allocationRequired = false;
             dep.allocationCandidateIds = [];
@@ -1018,6 +1019,7 @@
                     personName: state.settings.playerName, personId: state.settings.playerId,
                     notes: 'API-confirmed personal inventory deposit to faction armory. Full deposited quantity valued at movement-time MV.',
                     ownership: 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT',
+                    provenanceStatus: 'PERSONAL_BASELINE_CONFIRMED',
                     status: 'DEPOSITED', detectionMethod: 'API_FACTION_ARMORY_IN',
                     factionId: String(data.faction), factionMovementKey: key,
                     apiLogIds: [logId(log)].filter(Boolean), createdAt: new Date().toISOString()
@@ -1705,15 +1707,28 @@
             senderId: String(data.user), balanceBefore: before, balanceAfter: after, amount: after - before };
     }
 
+
+    function purchaseHasConfirmedFactionDeposit(tx) {
+        if (!tx || tx.type !== 'PURCHASE' || tx.status === 'VOID') return false;
+        if (childrenOf(tx.id, 'ARMORY_IN').length || childrenOf(tx.id, 'DISPLAY_IN').length) return true;
+        if (!tx.depositTransactionId) return false;
+        const movement = liveTransactions().find(function (m) {
+            return m.id === tx.depositTransactionId &&
+                (m.type === 'ARMORY_IN' || m.type === 'DISPLAY_IN');
+        });
+        return !!movement;
+    }
+
     function reimbursementOutstanding(tx) {
         if (!tx || tx.status === 'VOID') return 0;
         let total = 0;
         if (tx.type === 'PURCHASE') {
-            const deposited = tx.status === 'DEPOSITED' || childrenOf(tx.id, 'ARMORY_IN').length || childrenOf(tx.id, 'DISPLAY_IN').length;
+            const deposited = purchaseHasConfirmedFactionDeposit(tx);
             if (!deposited) return 0;
             total = Number(tx.billableTotal || 0);
         } else if (tx.type === 'ARMORY_IN' &&
-            (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' || tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT') &&
+            (tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
+             (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' && tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED')) &&
             !tx.purchaseAllocationId) total = Number(tx.billableTotal || tx.mvTotal || 0);
         else return 0;
         const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum,r) { return sum + Number(r.amount || r.actualTotal || 0); },0);
@@ -2151,9 +2166,7 @@
 
         liveTransactions().forEach(function (tx) {
             if (tx.type === 'PURCHASE') {
-                const deposited = tx.status === 'DEPOSITED' ||
-                    childrenOf(tx.id, 'ARMORY_IN').length ||
-                    childrenOf(tx.id, 'DISPLAY_IN').length;
+                const deposited = purchaseHasConfirmedFactionDeposit(tx);
                 const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
                     return sum + Number(r.amount || r.actualTotal || 0);
                 }, 0);
@@ -2166,8 +2179,9 @@
             }
 
             if (tx.type === 'ARMORY_IN' &&
-                (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' ||
-                 tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT')) {
+                (tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
+                 (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
+                  tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED'))) {
                 const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
                     return sum + Number(r.amount || r.actualTotal || 0);
                 }, 0);
@@ -2207,9 +2221,7 @@
 
         liveTransactions().forEach(function (tx) {
             if (tx.type === 'PURCHASE') {
-                const deposited = tx.status === 'DEPOSITED' ||
-                    childrenOf(tx.id, 'ARMORY_IN').length ||
-                    childrenOf(tx.id, 'DISPLAY_IN').length;
+                const deposited = purchaseHasConfirmedFactionDeposit(tx);
                 if (!deposited) return;
 
                 const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
@@ -2235,8 +2247,9 @@
             }
 
             if (tx.type === 'ARMORY_IN' &&
-                (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' ||
-                 tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT') &&
+                (tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
+                 (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
+                  tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED')) &&
                 !tx.purchaseAllocationId) {
                 const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
                     return sum + Number(r.amount || r.actualTotal || 0);
@@ -2507,7 +2520,7 @@
     function pendingTransactions() {
         return liveTransactions().filter(function (tx) {
             return ((tx.type === 'PURCHASE' || tx.type === 'ARMORY_OUT') && tx.status === 'PENDING') ||
-                (tx.type === 'ARMORY_IN' && tx.status === 'ALLOCATION_REQUIRED');
+                (tx.type === 'ARMORY_IN' && (tx.status === 'ALLOCATION_REQUIRED' || tx.status === 'OWNERSHIP_REVIEW'));
         });
     }
 
@@ -2713,6 +2726,16 @@
                         Number(p.qty || 0).toLocaleString() + ' × ' + esc(p.itemName) + ' · ' +
                         money(p.billableTotal) + '</button>';
                 }).join('') +
+                '</div>';
+        }
+
+
+        if (pendingActions && tx.type === 'ARMORY_IN' && tx.status === 'OWNERSHIP_REVIEW') {
+            actions =
+                '<div class="fliq-muted" style="margin-top:8px">Legacy ownership review: this deposit predates reliable provenance tracking. Was this your personal stock, or faction-owned stock being returned?</div>' +
+                '<div class="fliq-actions">' +
+                    '<button class="fliq-btn fliq-btn-primary" data-fliq="legacy-armory-personal" data-id="' + esc(tx.id) + '">Personal · Reimburse at Deposit MV</button>' +
+                    '<button class="fliq-btn" data-fliq="legacy-armory-faction" data-id="' + esc(tx.id) + '">Faction Owned · No Reimbursement</button>' +
                 '</div>';
         }
 
@@ -3170,6 +3193,32 @@
             return;
         }
 
+
+        if ((action === 'legacy-armory-personal' || action === 'legacy-armory-faction') && tx && tx.type === 'ARMORY_IN' && tx.status === 'OWNERSHIP_REVIEW') {
+            tx.reviewedAt = new Date().toISOString();
+            tx.reviewedFromStatus = 'OWNERSHIP_REVIEW';
+            if (action === 'legacy-armory-personal') {
+                tx.ownership = 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT';
+                tx.provenanceStatus = 'PERSONAL_BASELINE_CONFIRMED';
+                tx.status = 'DEPOSITED';
+                tx.billableTotal = Number(tx.mvTotal || tx.billableTotal || 0);
+                tx.amount = tx.billableTotal;
+                tx.notes = [tx.notes, 'v0.9.0 ownership review: confirmed as pre-existing personal inventory; reimbursement frozen at deposit-time MV.'].filter(Boolean).join(' | ');
+                saveState();
+                toast('Personal stock confirmed · reimbursement at deposit MV');
+            } else {
+                tx.ownership = 'FACTION';
+                tx.provenanceStatus = 'FACTION_CONFIRMED';
+                tx.status = 'RETURNED';
+                tx.billableTotal = 0;
+                tx.amount = 0;
+                tx.notes = [tx.notes, 'v0.9.0 ownership review: confirmed as faction-owned inventory; no reimbursement.'].filter(Boolean).join(' | ');
+                saveState();
+                toast('Faction ownership confirmed · no reimbursement');
+            }
+            return;
+        }
+
         if (action === 'allocate-armory-purchase' && tx && tx.type === 'ARMORY_IN') {
             const purchaseId = btn.dataset.purchaseId;
             const purchase = liveTransactions().find(function (p) {
@@ -3181,6 +3230,7 @@
             purchase.depositTransactionId = tx.id;
             tx.purchaseAllocationId = purchase.id;
             tx.ownership = 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT';
+            tx.provenanceStatus = 'TRACKED_PERSONAL_PURCHASE';
             tx.status = 'RECORDED';
             tx.allocationRequired = false;
             tx.billableTotal = Number(purchase.billableTotal || tx.billableTotal || tx.mvTotal || 0);
@@ -3356,6 +3406,31 @@
         el._timer = setTimeout(function () { el.style.display = 'none'; }, 1800);
     }
 
+
+    function migrateLegacyOwnershipForV090() {
+        state.accounting = state.accounting || {};
+        if (state.accounting.provenanceMigrationV090) return;
+        let changed = false;
+        liveTransactions().forEach(function (tx) {
+            if (tx.type !== 'ARMORY_IN') return;
+            if (tx.ownership !== 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT') return;
+            if (tx.purchaseAllocationId) return;
+            if (childrenOf(tx.id, 'REFUND').length) return;
+            tx.provenanceStatus = 'REVIEW_REQUIRED';
+            tx.previousStatusBeforeOwnershipReview = tx.status;
+            tx.status = 'OWNERSHIP_REVIEW';
+            tx.notes = [tx.notes, 'v0.9.0 migration: legacy armory deposit removed from reimbursement liability until one-time ownership review. Historical record retained.'].filter(Boolean).join(' | ');
+            changed = true;
+        });
+        state.accounting.provenanceMigrationV090 = {
+            at: new Date().toISOString(),
+            rule: 'Movement does not establish ownership; legacy unlinked armory deposits require one-time provenance review.'
+        };
+        if (changed) state.detection.lastSource = 'v0.9.0 provenance migration · legacy ownership review';
+        state.updatedAt = new Date().toISOString();
+        localStorage.setItem(STATE_KEY, JSON.stringify(state));
+    }
+
     function repairLegacyAllocationPrompts() {
         let changed = false;
         const cutoffMs = Date.now() - (30 * 60 * 1000);
@@ -3376,6 +3451,7 @@
     }
 
     function init() {
+        migrateLegacyOwnershipForV090();
         repairLegacyAllocationPrompts();
         injectStyles();
         ensurePanel();
