@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.9.1
+// @version      0.9.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.9.1';
+    const VERSION = '0.9.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2462,8 +2462,8 @@
             '<div class="fliq-card">' +
                 '<div>' + liveTransactions().length + ' active transaction(s)</div>' +
                 '<div>' + state.whitelist.length + ' whitelisted item(s)</div>' +
-                '<div>' + b.pending + ' pending purchase(s)</div>' +
-                '<div class="fliq-muted" style="margin-top:6px">v0.7.0 treats your faction balance as a mixed account. Deposits are captured as unclassified until you explicitly identify sale proceeds, personal cash, or other money.</div>' +
+                '<div>' + b.pending + ' unresolved item action(s)</div>' +
+                '<div class="fliq-muted" style="margin-top:6px">Normal item movement is automatic. Pending is reserved for genuinely ambiguous ownership or mixed faction-balance money.</div>' +
                 '<div class="fliq-muted" style="margin-top:4px">Detector: ' + (state.settings.autoDetectPurchases ? 'ON' : 'OFF') +
                     (state.detection.lastDetectedAt ? ' · Last: ' + esc(new Date(state.detection.lastDetectedAt).toLocaleString()) + ' · ' + esc(state.detection.lastSource || '') : ' · No purchases detected yet') + '</div>' +
             '</div>' +
@@ -2519,8 +2519,9 @@
 
     function pendingTransactions() {
         return liveTransactions().filter(function (tx) {
-            return ((tx.type === 'PURCHASE' || tx.type === 'ARMORY_OUT') && tx.status === 'PENDING') ||
-                (tx.type === 'ARMORY_IN' && (tx.status === 'ALLOCATION_REQUIRED' || tx.status === 'OWNERSHIP_REVIEW'));
+            if (tx.type === 'PURCHASE' && tx.status === 'PENDING') return false;
+            if (tx.type === 'ARMORY_OUT' && tx.status === 'PENDING') return false;
+            return tx.type === 'ARMORY_IN' && tx.status === 'ALLOCATION_REQUIRED';
         });
     }
 
@@ -2706,11 +2707,7 @@
         let actions = '';
 
         if (pendingActions && tx.type === 'PURCHASE') {
-            actions =
-                '<div class="fliq-actions">' +
-                    '<button class="fliq-btn" data-fliq="purchase-armory" data-id="' + esc(tx.id) + '">Deposited to Armory</button>' +
-                    '<button class="fliq-btn" data-fliq="purchase-display" data-id="' + esc(tx.id) + '">Deposited to Display</button>' +
-                '</div>';
+            actions = '';
         }
 
         if (pendingActions && tx.type === 'ARMORY_IN' && tx.status === 'ALLOCATION_REQUIRED') {
@@ -2740,12 +2737,7 @@
         }
 
         if (pendingActions && tx.type === 'ARMORY_OUT') {
-            actions =
-                '<div class="fliq-actions">' +
-                    '<button class="fliq-btn" data-fliq="armory-display" data-id="' + esc(tx.id) + '">Hold in Display</button>' +
-                    '<button class="fliq-btn" data-fliq="armory-sell" data-id="' + esc(tx.id) + '">Sell for Faction</button>' +
-                    '<button class="fliq-btn" data-fliq="armory-other" data-id="' + esc(tx.id) + '">Other</button>' +
-                '</div>';
+            actions = '';
         }
 
         return '<div class="fliq-item">' +
@@ -3513,6 +3505,31 @@
         localStorage.setItem(STATE_KEY, JSON.stringify(state));
     }
 
+
+    function simplifyLegacyReviewV092() {
+        state.accounting = state.accounting || {};
+        if (state.accounting.simpleWorkflowV092) return;
+        let hiddenReviews = 0;
+        liveTransactions().forEach(function (tx) {
+            if (tx.type === 'ARMORY_IN' && tx.status === 'OWNERSHIP_REVIEW') {
+                tx.status = 'LEGACY_UNRESOLVED';
+                tx.provenanceStatus = 'LEGACY_UNRESOLVED';
+                tx.billableTotal = 0;
+                tx.amount = 0;
+                tx.notes = [tx.notes, 'v0.9.2 simplified workflow: historical unresolved ownership retained in audit history but removed from day-to-day Pending and reimbursement totals.'].filter(Boolean).join(' | ');
+                hiddenReviews += 1;
+            }
+        });
+        state.accounting.simpleWorkflowV092 = {
+            at: new Date().toISOString(),
+            hiddenLegacyReviews: hiddenReviews,
+            rule: 'Normal item activity is automatic; legacy ambiguity stays in audit history instead of interrupting daily workflow.'
+        };
+        if (hiddenReviews) state.detection.lastSource = 'v0.9.2 simplified workflow · ' + hiddenReviews + ' legacy review(s) moved to audit history';
+        state.updatedAt = new Date().toISOString();
+        localStorage.setItem(STATE_KEY, JSON.stringify(state));
+    }
+
     function repairLegacyAllocationPrompts() {
         let changed = false;
         const cutoffMs = Date.now() - (30 * 60 * 1000);
@@ -3535,6 +3552,7 @@
     function init() {
         migrateLegacyOwnershipForV090();
         recoverConfirmedLegacyProvenanceV091();
+        simplifyLegacyReviewV092();
         repairLegacyAllocationPrompts();
         injectStyles();
         ensurePanel();
