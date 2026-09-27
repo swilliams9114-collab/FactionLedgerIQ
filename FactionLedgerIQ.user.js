@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.9.2
+// @version      0.9.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.9.2';
+    const VERSION = '0.9.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1719,6 +1719,31 @@
         return !!movement;
     }
 
+    function confirmedDepositForPurchase(tx) {
+        if (!tx || tx.type !== 'PURCHASE' || tx.status === 'VOID') return null;
+        const children = childrenOf(tx.id).filter(function (m) {
+            return m.type === 'ARMORY_IN' || m.type === 'DISPLAY_IN';
+        }).sort(function (a,b) { return new Date(a.timestamp) - new Date(b.timestamp); });
+        if (children.length) return children[0];
+        if (!tx.depositTransactionId) return null;
+        return liveTransactions().find(function (m) {
+            return m.id === tx.depositTransactionId &&
+                (m.type === 'ARMORY_IN' || m.type === 'DISPLAY_IN');
+        }) || null;
+    }
+
+    function reimbursementProofHtml(tx) {
+        if (!tx || tx.type !== 'PURCHASE') return '';
+        const movement = confirmedDepositForPurchase(tx);
+        if (!movement) return '<div class="fliq-proof"><b>Why faction owes me</b><div class="fliq-muted">No confirmed faction deposit link found.</div></div>';
+        const label = movement.type === 'DISPLAY_IN' ? 'Display Case deposit' : 'Armory deposit';
+        return '<div class="fliq-proof"><b>Why faction owes me</b>' +
+            '<div>' + esc(label) + ': ' + Number(movement.qty || 0).toLocaleString() + ' × ' + esc(movement.itemName || tx.itemName) + '</div>' +
+            '<div class="fliq-muted">' + esc(new Date(movement.timestamp).toLocaleString()) + ' · ' +
+                esc(movement.source || 'Personal Inventory') + (movement.destination ? ' → ' + esc(movement.destination) : '') + '</div>' +
+            '<div class="fliq-muted">Linked movement: ' + esc(movement.id) + '</div></div>';
+    }
+
     function reimbursementOutstanding(tx) {
         if (!tx || tx.status === 'VOID') return 0;
         let total = 0;
@@ -2294,6 +2319,7 @@
                     '<div class="fliq-muted">' + esc(new Date(row.timestamp).toLocaleString()) +
                         (row.source || row.destination ? ' · ' + esc(row.source || '') + (row.destination ? ' → ' + esc(row.destination) : '') : '') + '</div>' +
                     '<div class="fliq-muted">Original ' + money(row.original) + ' · Reimbursed ' + money(row.refunded) + '</div>' +
+                    (row.type === 'PURCHASE' ? reimbursementProofHtml(liveTransactions().find(function (tx) { return tx.id === row.id; })) : '') +
                 '</div>';
             }).join('') + '</div>' : '<div class="fliq-empty">No outstanding reimbursements.</div>') +
         '</div>';
@@ -2320,6 +2346,7 @@
             '.fliq-card b{display:block;font-size:19px;margin-top:5px}',
             '.fliq-stat-button{width:100%;color:inherit;text-align:left;font:inherit;cursor:pointer}.fliq-stat-button:active{transform:translateY(1px)}',
             '.fliq-muted{opacity:.66;font-size:12px}.fliq-good{color:#7ddc9b}.fliq-warn{color:#ffcf70}.fliq-bad{color:#ff8d8d}',
+            '.fliq-proof{margin-top:8px;padding-top:8px;border-top:1px solid #34404c}.fliq-proof b{font-size:12px;margin:0 0 3px}',
             '.fliq-section{margin:12px 0}.fliq-section h3{margin:0 0 8px;font-size:14px}',
             '.fliq-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:7px 0}',
             '.fliq-field{display:flex;flex-direction:column;gap:4px}.fliq-field label{font-size:11px;opacity:.72}',
