@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.9.0
+// @version      0.9.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.9.0';
+    const VERSION = '0.9.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3431,6 +3431,88 @@
         localStorage.setItem(STATE_KEY, JSON.stringify(state));
     }
 
+
+    function recoverConfirmedLegacyProvenanceV091() {
+        state.accounting = state.accounting || {};
+        if (state.accounting.provenanceRecoveryV091) return;
+        let recoveredFaction = 0;
+        let recoveredPurchase = 0;
+
+        const txs = liveTransactions();
+
+        // Recover faction-owned returns from chains the ledger already proved:
+        // ARMORY_OUT(FACTION) -> DISPLAY_IN(FACTION) -> DISPLAY_OUT(FACTION) -> ARMORY_IN.
+        // This uses persisted chain/item/quantity evidence only; it never guesses from location.
+        txs.filter(function (tx) {
+            return tx.type === 'ARMORY_IN' && tx.status === 'OWNERSHIP_REVIEW' &&
+                tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT';
+        }).forEach(function (dep) {
+            const depMs = new Date(dep.timestamp).getTime();
+            const candidates = txs.filter(function (src) {
+                if (src.type !== 'ARMORY_OUT' || src.ownership !== 'FACTION') return false;
+                if (String(src.itemId || '') !== String(dep.itemId || '')) return false;
+                if (Number(src.qty || 0) !== Number(dep.qty || 0)) return false;
+                const srcMs = new Date(src.timestamp).getTime();
+                if (!Number.isFinite(srcMs) || !Number.isFinite(depMs) || srcMs > depMs) return false;
+                const displayIns = childrenOf(src.id, 'DISPLAY_IN').filter(function (m) {
+                    return m.ownership === 'FACTION' && new Date(m.timestamp).getTime() <= depMs;
+                });
+                const displayOuts = childrenOf(src.id, 'DISPLAY_OUT').filter(function (m) {
+                    return m.ownership === 'FACTION' && new Date(m.timestamp).getTime() <= depMs;
+                });
+                return displayIns.length && displayOuts.length;
+            }).sort(function (a,b) { return new Date(b.timestamp) - new Date(a.timestamp); });
+
+            if (candidates.length !== 1) return;
+            const src = candidates[0];
+            dep.parentId = dep.parentId || src.id;
+            dep.chainId = src.chainId || src.id;
+            dep.ownership = 'FACTION';
+            dep.provenanceStatus = 'FACTION_CHAIN_RECOVERED';
+            dep.status = 'RETURNED';
+            dep.billableTotal = 0;
+            dep.amount = 0;
+            dep.notes = [dep.notes, 'v0.9.1 provenance recovery: existing faction Armory/Display chain proves this was faction-owned stock returned to Armory; no reimbursement.'].filter(Boolean).join(' | ');
+            recoveredFaction += 1;
+        });
+
+        // Recover exact purchase-funded deposits where an older version already persisted
+        // the purchase/deposit relationship. No FIFO or amount-only inference is allowed.
+        txs.filter(function (p) {
+            return p.type === 'PURCHASE' && p.status === 'DEPOSITED' && p.depositTransactionId;
+        }).forEach(function (p) {
+            const dep = txs.find(function (m) {
+                return m.id === p.depositTransactionId && m.type === 'ARMORY_IN' &&
+                    String(m.itemId || '') === String(p.itemId || '') &&
+                    Number(m.qty || 0) === Number(p.qty || 0);
+            });
+            if (!dep || dep.status === 'VOID') return;
+            dep.purchaseAllocationId = p.id;
+            dep.parentId = p.id;
+            dep.chainId = p.chainId || p.id;
+            dep.ownership = 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT';
+            dep.provenanceStatus = 'TRACKED_PERSONAL_PURCHASE';
+            dep.status = 'RECORDED';
+            dep.billableTotal = Number(p.billableTotal || dep.billableTotal || dep.mvTotal || 0);
+            dep.actualTotal = Number(p.actualTotal || 0);
+            dep.notes = [dep.notes, 'v0.9.1 provenance recovery: restored previously persisted purchase-to-armory relationship; frozen purchase billing retained.'].filter(Boolean).join(' | ');
+            recoveredPurchase += 1;
+        });
+
+        state.accounting.provenanceRecoveryV091 = {
+            at: new Date().toISOString(),
+            recoveredFactionReturns: recoveredFaction,
+            recoveredPurchaseDeposits: recoveredPurchase,
+            rule: 'Recover only provenance already proved by persisted transaction relationships; never infer by FIFO or amount alone.'
+        };
+        if (recoveredFaction || recoveredPurchase) {
+            state.detection.lastSource = 'v0.9.1 provenance recovery · ' +
+                recoveredFaction + ' faction return(s), ' + recoveredPurchase + ' purchase deposit(s)';
+        }
+        state.updatedAt = new Date().toISOString();
+        localStorage.setItem(STATE_KEY, JSON.stringify(state));
+    }
+
     function repairLegacyAllocationPrompts() {
         let changed = false;
         const cutoffMs = Date.now() - (30 * 60 * 1000);
@@ -3452,6 +3534,7 @@
 
     function init() {
         migrateLegacyOwnershipForV090();
+        recoverConfirmedLegacyProvenanceV091();
         repairLegacyAllocationPrompts();
         injectStyles();
         ensurePanel();
