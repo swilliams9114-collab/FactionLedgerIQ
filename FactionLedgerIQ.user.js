@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.9.3
+// @version      0.10.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.9.3';
+    const VERSION = '0.10.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2677,57 +2677,217 @@
         return sale ? String(sale.destination || sale.source || 'Sale') : '';
     }
 
-    function receiptText(tx) {
-        const aboveMV = Number(tx.actualTotal || 0) > Number(tx.mvTotal || 0) &&
-            Number(tx.mvTotal || 0) > 0;
+    function receiptRefunds(tx) {
+        return childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
+            return sum + Number(r.amount || r.actualTotal || 0);
+        }, 0);
+    }
 
-        return [
-            'FACTIONLEDGERIQ RECEIPT',
-            'Transaction: ' + tx.id,
-            'Date: ' + new Date(tx.timestamp).toLocaleString(),
-            'Person: ' + actor(tx),
-            'Event: ' + tx.type,
-            'Item: ' + tx.itemName + (tx.itemId ? ' [Item ' + tx.itemId + ']' : ''),
-            'Quantity: ' + Number(tx.qty || 0).toLocaleString(),
-            tx.source ? 'Source: ' + tx.source : null,
-            tx.destination ? 'Destination: ' + tx.destination : null,
-            moneyTxOrigin(tx) ? 'Originating Sale Channel: ' + moneyTxOrigin(tx) : null,
-            tx.ownership ? 'Ownership: ' + tx.ownership : null,
-            Number(tx.actualTotal || 0) ? (tx.type === 'FACTION_BALANCE_IN' ? 'Deposited Amount: ' : (tx.type === 'FACTION_COLLECTION' ? 'Collected Amount: ' : 'Actual Cost/Amount: ')) + money(tx.actualTotal) : null,
-            Number(tx.mvTotal || 0) ? 'MV at Event: ' + money(tx.mvTotal) : null,
-            tx.type === 'PURCHASE' ? 'Billable: ' + money(tx.billableTotal) : null,
-            tx.type === 'ARMORY_IN' ? 'Reimbursement Due: ' + money(tx.billableTotal || tx.mvTotal) : null,
-            tx.type === 'PURCHASE'
-                ? 'Pricing Rule: ' + (Number(tx.mvTotal || 0) <= 0
-                    ? 'MV unavailable - actual cost used'
-                    : (aboveMV ? 'Actual cost used - purchase was above MV' : 'MV used when purchase cost was at or below MV'))
-                : null,
-            'Status: ' + tx.status,
-            tx.notes ? 'Notes: ' + tx.notes : null
-        ].filter(Boolean).join('\n');
+    function receiptBundleKind(tx) {
+        if (!tx) return 'ACTIVITY';
+        if (tx.type === 'PURCHASE' || (tx.type === 'ARMORY_IN' &&
+            (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' ||
+             tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT'))) return 'REIMBURSEMENT';
+        if (tx.type === 'ARMORY_OUT') {
+            return childrenOf(tx.id, 'SALE').length ? 'SALE' : 'ASSET';
+        }
+        if (tx.type === 'SALE') return 'SALE';
+        if (tx.type === 'DISPLAY_IN' || tx.type === 'DISPLAY_OUT') return 'ASSET';
+        return 'ACTIVITY';
+    }
+
+    function receiptRoot(tx) {
+        if (!tx) return null;
+        let cur = tx, guard = 0;
+        while (cur.parentId && guard++ < 12) {
+            const parent = liveTransactions().find(function (x) { return x.id === cur.parentId; });
+            if (!parent) break;
+            cur = parent;
+        }
+        return cur;
+    }
+
+    function reimbursementDueForRoot(root) {
+        if (!root) return 0;
+        if (root.type === 'PURCHASE') return purchaseHasConfirmedFactionDeposit(root) ? Number(root.billableTotal || 0) : 0;
+        if (root.type === 'ARMORY_IN' && !root.purchaseAllocationId &&
+            root.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
+            root.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED') {
+            return Number(root.billableTotal || root.mvTotal || 0);
+        }
+        return 0;
+    }
+
+    function chainMembers(root) {
+        if (!root) return [];
+        const out = [], seen = new Set(), queue = [root.id];
+        while (queue.length) {
+            const id = queue.shift();
+            liveTransactions().forEach(function (tx) {
+                if (seen.has(tx.id)) return;
+                if (tx.id === id || tx.parentId === id) {
+                    seen.add(tx.id); out.push(tx);
+                    if (tx.id !== id) queue.push(tx.id);
+                }
+            });
+        }
+        return out.sort(function (a,b) { return new Date(a.timestamp) - new Date(b.timestamp); });
+    }
+
+    function makeReceiptBundle(roots, kind, id) {
+        const members = [], seen = new Set();
+        roots.forEach(function (root) {
+            chainMembers(root).forEach(function (tx) {
+                if (!seen.has(tx.id)) { seen.add(tx.id); members.push(tx); }
+            });
+        });
+        members.sort(function (a,b) { return new Date(a.timestamp) - new Date(b.timestamp); });
+        const items = {};
+        roots.forEach(function (root) {
+            const key = String(root.itemId || root.itemName || root.id);
+            if (!items[key]) items[key] = { itemName: root.itemName || 'Item', itemId: root.itemId || '', qty: 0, due: 0, paid: 0 };
+            items[key].qty += Number(root.qty || 0);
+            if (kind === 'REIMBURSEMENT') {
+                const due = reimbursementDueForRoot(root);
+                const paid = receiptRefunds(root);
+                items[key].due += due;
+                items[key].paid += Math.min(due, paid);
+            }
+        });
+        const rows = Object.keys(items).map(function (k) { return items[k]; });
+        let due = rows.reduce(function (n,x) { return n + x.due; },0);
+        let paid = rows.reduce(function (n,x) { return n + x.paid; },0);
+        let proceeds = 0, returned = 0, collected = 0;
+        members.forEach(function (tx) {
+            if (tx.type === 'SALE') proceeds += Number(tx.amount || tx.actualTotal || 0);
+            if (tx.type === 'FACTION_BALANCE_IN') returned += Number(tx.amount || tx.actualTotal || 0);
+            if (tx.type === 'FACTION_COLLECTION') collected += Number(tx.amount || tx.actualTotal || 0);
+        });
+        let status = 'RECORDED';
+        if (kind === 'REIMBURSEMENT') status = due > 0 ? (paid >= due ? 'SETTLED' : (paid > 0 ? 'PARTIALLY PAID' : 'AWAITING PAYMENT')) : 'RECORDED';
+        if (kind === 'SALE') status = proceeds > 0 ? (collected >= proceeds ? 'SETTLED' : (returned >= proceeds ? 'READY FOR COLLECTION' : 'AWAITING PROCEEDS')) : 'IN PROGRESS';
+        if (kind === 'ASSET') status = 'FACTION ASSET';
+        return {
+            id: id || ('RCPT-' + roots[0].id), kind: kind, roots: roots, members: members, items: rows,
+            timestamp: members.length ? members[0].timestamp : roots[0].timestamp,
+            lastTimestamp: members.length ? members[members.length-1].timestamp : roots[0].timestamp,
+            due: due, paid: paid, outstanding: Math.max(0,due-paid),
+            proceeds: proceeds, returned: returned, collected: collected, status: status
+        };
+    }
+
+    function buildReceiptBundles() {
+        const txs = liveTransactions().slice().sort(function (a,b) { return new Date(a.timestamp)-new Date(b.timestamp); });
+        const roots = txs.filter(function (tx) { return !tx.parentId; });
+        const bundles = [], consumed = new Set();
+
+        // Exact/near-simultaneous personal Armory deposits are displayed as one restock batch.
+        // This is presentation-only: the underlying transactions and accounting remain separate.
+        const deposits = roots.filter(function (tx) {
+            return tx.type === 'ARMORY_IN' && !tx.purchaseAllocationId &&
+                tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
+                tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED';
+        });
+        deposits.forEach(function (tx) {
+            if (consumed.has(tx.id)) return;
+            const t0 = new Date(tx.timestamp).getTime();
+            const group = deposits.filter(function (other) {
+                if (consumed.has(other.id)) return false;
+                const dt = Math.abs(new Date(other.timestamp).getTime() - t0);
+                return dt <= 60000 && String(other.personId || '') === String(tx.personId || '') &&
+                    String(other.destination || '') === String(tx.destination || '');
+            });
+            group.forEach(function (x) { consumed.add(x.id); });
+            bundles.push(makeReceiptBundle(group, 'REIMBURSEMENT', 'BATCH-' + tx.id));
+        });
+
+        roots.forEach(function (root) {
+            if (consumed.has(root.id)) return;
+            consumed.add(root.id);
+            bundles.push(makeReceiptBundle([root], receiptBundleKind(root), 'RCPT-' + root.id));
+        });
+        return bundles.sort(function (a,b) { return new Date(b.lastTimestamp)-new Date(a.lastTimestamp); });
+    }
+
+    function bundleForTransaction(tx) {
+        if (!tx) return null;
+        return buildReceiptBundles().find(function (b) {
+            return b.members.some(function (m) { return m.id === tx.id; });
+        }) || null;
+    }
+
+    function receiptTitle(bundle) {
+        if (bundle.kind === 'REIMBURSEMENT') return 'PURCHASE & REIMBURSEMENT';
+        if (bundle.kind === 'SALE') return 'FACTION SALE';
+        if (bundle.kind === 'ASSET') return 'FACTION ASSET TRANSFER';
+        return 'FACTION ACTIVITY';
+    }
+
+    function bundledReceiptText(bundle) {
+        if (!bundle) return '';
+        const roots = bundle.roots || [];
+        const who = roots[0] ? actor(roots[0]) : actor({});
+        const lines = [
+            'FACTIONLEDGERIQ · ' + receiptTitle(bundle),
+            'Receipt: ' + bundle.id,
+            'Status: ' + bundle.status,
+            'Person: ' + who,
+            'Date: ' + new Date(bundle.timestamp).toLocaleString()
+        ];
+        lines.push('');
+        bundle.items.forEach(function (item) {
+            let line = Number(item.qty || 0).toLocaleString() + 'x ' + item.itemName;
+            if (bundle.kind === 'REIMBURSEMENT' && item.due) line += ' — ' + money(item.due);
+            lines.push(line);
+        });
+        if (bundle.kind === 'REIMBURSEMENT') {
+            lines.push('', 'Amount due: ' + money(bundle.due), 'Reimbursed: ' + money(bundle.paid), 'Balance: ' + money(bundle.outstanding));
+        }
+        if (bundle.kind === 'SALE') {
+            lines.push('', 'Sale proceeds: ' + money(bundle.proceeds), 'Deposited to faction: ' + money(bundle.returned), 'Collected by faction: ' + money(bundle.collected));
+        }
+        lines.push('', 'Timeline:');
+        bundle.members.forEach(function (tx) {
+            let detail = new Date(tx.timestamp).toLocaleString() + ' · ' + tx.type;
+            if (tx.source || tx.destination) detail += ' · ' + (tx.source || '') + (tx.source && tx.destination ? ' → ' : '') + (tx.destination || '');
+            if (tx.type === 'REFUND' || tx.type === 'FACTION_BALANCE_IN' || tx.type === 'FACTION_COLLECTION' || tx.type === 'SALE') {
+                detail += ' · ' + money(tx.amount || tx.actualTotal || 0);
+            }
+            lines.push(detail);
+        });
+        return lines.join('\n');
+    }
+
+    function receiptText(tx) {
+        const bundle = bundleForTransaction(tx);
+        if (bundle) return bundledReceiptText(bundle);
+        return 'FACTIONLEDGERIQ RECEIPT\nTransaction: ' + tx.id;
     }
 
     function renderReceipts() {
-        const txs = state.transactions.slice().reverse();
-        if (!txs.length) return '<div class="fliq-empty">No receipts yet.</div>';
-
-        return '<div class="fliq-list">' + txs.map(function (tx) {
-            return '<div class="fliq-item">' +
-                '<div class="fliq-item-top"><b>' + esc(tx.itemName) + ' × ' +
-                    Number(tx.qty || 0).toLocaleString() + '</b><span class="fliq-pill">' +
-                    esc(tx.type) + '</span></div>' +
-                '<div class="fliq-muted">' + esc(tx.id) + ' · ' +
-                    esc(new Date(tx.timestamp).toLocaleString()) + '</div>' +
-                (tx.type === 'FACTION_BALANCE_IN'
-                    ? '<div><b>' + money(tx.amount || tx.actualTotal) + '</b> deposited' +
-                        (moneyTxOrigin(tx) ? ' · ' + esc(moneyTxOrigin(tx)) : '') + '</div>'
-                    : (tx.type === 'FACTION_COLLECTION'
-                        ? '<div><b>' + money(tx.amount || tx.actualTotal) + '</b> collected' +
-                            (moneyTxOrigin(tx) ? ' · ' + esc(moneyTxOrigin(tx)) : '') + '</div>' : '')) +
-                '<div class="fliq-actions"><button class="fliq-btn" data-fliq="copy-receipt" data-id="' +
-                    esc(tx.id) + '">Copy Discord Receipt</button></div>' +
-            '</div>';
-        }).join('') + '</div>';
+        const bundles = buildReceiptBundles();
+        if (!bundles.length) return '<div class="fliq-empty">No receipts yet.</div>';
+        const openCount = bundles.filter(function (b) { return b.status !== 'SETTLED' && b.kind !== 'ASSET'; }).length;
+        return '<div class="fliq-card" style="margin-bottom:10px"><b>Bundled Receipts</b>' +
+            '<div class="fliq-muted">One real-world transaction story per receipt. History keeps every individual ledger event.</div>' +
+            '<div class="fliq-muted" style="margin-top:5px">' + openCount + ' open · ' + bundles.length + ' total</div></div>' +
+            '<div class="fliq-list">' + bundles.map(function (b) {
+                const first = b.roots[0];
+                const itemSummary = b.items.length === 1
+                    ? Number(b.items[0].qty||0).toLocaleString() + '× ' + esc(b.items[0].itemName)
+                    : b.items.length + ' item types · ' + b.items.reduce(function(n,x){return n+Number(x.qty||0);},0).toLocaleString() + ' items';
+                let moneyLine = '';
+                if (b.kind === 'REIMBURSEMENT') moneyLine = '<div><b>' + money(b.outstanding) + '</b> outstanding · ' + money(b.paid) + ' reimbursed</div>';
+                if (b.kind === 'SALE') moneyLine = '<div><b>' + money(b.proceeds) + '</b> proceeds · ' + money(b.collected) + ' collected</div>';
+                return '<div class="fliq-item">' +
+                    '<div class="fliq-item-top"><b>' + esc(receiptTitle(b)) + '</b><span class="fliq-pill">' + esc(b.status) + '</span></div>' +
+                    '<div>' + itemSummary + '</div>' + moneyLine +
+                    '<div class="fliq-muted">' + esc(new Date(b.timestamp).toLocaleString()) +
+                        (b.lastTimestamp !== b.timestamp ? ' → ' + esc(new Date(b.lastTimestamp).toLocaleString()) : '') + '</div>' +
+                    '<div class="fliq-muted">' + b.members.length + ' linked ledger event' + (b.members.length===1?'':'s') + '</div>' +
+                    '<div class="fliq-actions"><button class="fliq-btn" data-fliq="copy-receipt" data-id="' + esc(first.id) + '">Copy Discord Receipt</button></div>' +
+                '</div>';
+            }).join('') + '</div>';
     }
 
     function transactionCard(tx, pendingActions) {
