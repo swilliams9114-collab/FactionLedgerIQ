@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.12.3
+// @version      0.12.4
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.12.3';
+    const VERSION = '0.12.4';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2363,8 +2363,10 @@
     }
 
     function openingInventoryForm() {
+        state.ui = state.ui || {};
+        const lastType = state.ui.openingInventoryType === 'PERSONAL_STOCK' ? 'PERSONAL_STOCK' : 'FACTION_DISPLAY';
         return '<form id="fliq-opening-form" class="fliq-card">' +
-            row(field('Opening inventory type','<select name="openingType"><option value="FACTION_DISPLAY">Faction-owned · already in Display Case</option><option value="PERSONAL_STOCK">Personal stock · planned faction sale</option></select>'),
+            row(field('Opening inventory type','<select name="openingType"><option value="FACTION_DISPLAY"' + (lastType==='FACTION_DISPLAY'?' selected':'') + '>Faction-owned · already in Display Case</option><option value="PERSONAL_STOCK"' + (lastType==='PERSONAL_STOCK'?' selected':'') + '>Personal stock · planned faction sale</option></select>'),
                 field('Search Torn items', itemSearchControl())) +
             row(field('Quantity','<input name="qty" type="number" min="1" value="1" required>'),
                 field('Known total cost basis (personal stock only)','<input name="costBasis" type="number" min="0" step="1" placeholder="Leave blank if unknown">')) +
@@ -3482,6 +3484,8 @@
 
         if (form.id === 'fliq-opening-form') {
             const openingType = formValue(fd, 'openingType');
+            state.ui = state.ui || {};
+            state.ui.openingInventoryType = openingType;
             const itemName = formValue(fd, 'itemName');
             const itemId = formValue(fd, 'itemId');
             const qty = Math.max(1, Number(fd.get('qty') || 1));
