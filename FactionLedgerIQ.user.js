@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.13.1
+// @version      0.14.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.13.1';
+    const VERSION = '0.14.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -133,6 +133,8 @@
             ownership = 'PERSONAL'; location = 'PERSONAL_INVENTORY'; reimbursable = true;
         } else if (tx.type === 'ARMORY_OUT' && tx.ownership === 'FACTION') {
             ownership = 'FACTION'; location = tx.status === 'DISPLAY' ? 'DISPLAY_CASE' : 'PERSONAL_INVENTORY';
+        } else if (tx.type === 'FACTION_HELD_IN' && tx.ownership === 'FACTION') {
+            ownership = 'FACTION'; location = 'PERSONAL_INVENTORY'; reimbursable = false;
         } else return null;
         let lot = lotForSource(tx.id);
         if (!lot) {
@@ -191,7 +193,8 @@
         ensureAccounting();
         let changed = false;
         liveTransactions().forEach(function (tx) {
-            if ((tx.type === 'PURCHASE' || (tx.type === 'ARMORY_OUT' && tx.ownership === 'FACTION')) && !lotForSource(tx.id)) {
+            if ((tx.type === 'PURCHASE' || (tx.type === 'ARMORY_OUT' && tx.ownership === 'FACTION') ||
+                (tx.type === 'FACTION_HELD_IN' && tx.ownership === 'FACTION')) && !lotForSource(tx.id)) {
                 ensureSourceLot(tx); changed = true;
             }
         });
@@ -743,6 +746,10 @@
 
     function recoverHistoricalMixedDepositsV0111() {
         state.migrations = state.migrations || {};
+        if (!state.migrations.incomingTransferClassificationV0140) {
+            state.migrations.incomingTransferClassificationV0140={at:new Date().toISOString(),
+                rule:'All incoming player item transfers are detected regardless of whitelist and require one-time Faction-Owned, Personal Purchase, or Personal Gift classification.'};
+        }
         if (!state.migrations.factionHeldRaffleV0130) {
             state.migrations.factionHeldRaffleV0130={at:new Date().toISOString(),
                 rule:'Faction-held/raffle stock is separate from personal stock and creates no reimbursement or personal P/L. Personal inventory uses remaining lot quantity.'};
@@ -1001,7 +1008,7 @@
     function factionHeldSourceForMovement(itemId, qty, eventTimestamp) {
         const eventMs = Number(eventTimestamp || 0) * 1000;
         const candidates = liveTransactions().filter(function (tx) {
-            if (tx.type !== 'ARMORY_OUT' || tx.ownership !== 'FACTION') return false;
+            if ((tx.type !== 'ARMORY_OUT' && tx.type !== 'FACTION_HELD_IN') || tx.ownership !== 'FACTION') return false;
             if (tx.status !== 'HELD' && tx.status !== 'PENDING') return false;
             if (String(tx.itemId || '') !== String(itemId || '')) return false;
             const txMs = new Date(tx.timestamp).getTime();
@@ -2162,6 +2169,43 @@
         return false;
     }
 
+    function incomingPlayerTransferParts(log) {
+        const data=log&&log.data&&typeof log.data==='object'?log.data:{};
+        if(data.sender==null || data.receiver!=null || data.faction!=null) return [];
+        if(data.cost_total!=null || data.cost_each!=null || data.seller!=null || data.buyer!=null) return [];
+        const rows=Array.isArray(data.items)?data.items:(data.item&&typeof data.item==='object'?[data.item]:[]);
+        if(!rows.length)return [];
+        return rows.map(function(row){
+            const itemId=String(row&&(row.id||row.item_id)||'').trim();
+            const qty=Math.max(1,Number(row&&(row.qty||row.quantity)||1));
+            return itemId?{logId:logId(log),timestamp:Number(log.timestamp||0),senderId:String(data.sender),
+                itemId:itemId,qty:qty,message:String(data.message||'')} : null;
+        }).filter(Boolean);
+    }
+
+    async function reconcileIncomingPlayerTransfers(logs) {
+        try{await ensureItemCatalog(false);}catch(e){}
+        let changed=false;
+        for(const log of (logs||[])){
+            for(const part of incomingPlayerTransferParts(log)){
+                const dup=liveTransactions().some(function(tx){return tx.type==='INCOMING_TRANSFER'&&tx.apiLogId===part.logId&&String(tx.itemId)===part.itemId;});
+                if(dup)continue;
+                const item=itemCatalog.find(function(x){return String(x.id)===part.itemId;});
+                const mvEach=item?Math.max(0,Number(item.marketValue||0)):0;
+                state.transactions.push({id:uid('TX'),chainId:uid('CHAIN'),parentId:null,type:'INCOMING_TRANSFER',
+                    timestamp:part.timestamp?new Date(part.timestamp*1000).toISOString():new Date().toISOString(),
+                    itemName:item?item.name:('Item #'+part.itemId),itemId:part.itemId,qty:part.qty,
+                    actualTotal:0,mvEach:mvEach,mvTotal:mvEach*part.qty,billableTotal:0,amount:0,
+                    source:'Player Transfer',destination:'Personal Inventory',personName:await resolvePlayerName(part.senderId),
+                    personId:part.senderId,ownership:'UNCLASSIFIED',status:'CLASSIFICATION_REQUIRED',
+                    transferMessage:part.message,apiLogId:part.logId,detectionMethod:'API_INCOMING_PLAYER_TRANSFER',
+                    notes:'Incoming player item transfer requires one-time ownership classification.',createdAt:new Date().toISOString()});
+                changed=true;
+            }
+        }
+        return changed;
+    }
+
     async function pollApiLogs(showToast) {
         if (apiPollBusy || !state.settings.apiPolling || !apiKeyValue()) return;
         apiPollBusy = true;
@@ -2182,6 +2226,7 @@
             }
             rememberApiEvents(logs);
             let changed = false;
+            if (await reconcileIncomingPlayerTransfers(logs)) changed = true;
             const saleRecoveryLogs = logs.concat(Array.isArray(state.detection.recentApiEvents) ? state.detection.recentApiEvents : []);
             if (repairObservedBazaarSales(saleRecoveryLogs)) changed = true;
             logs.forEach(function (log) { rememberFactionCandidate(log); });
@@ -2477,6 +2522,12 @@
 
                 iOweFaction += Math.max(0, saleAmount - deposited - collected);
                 readyToCollect += Math.max(0, deposited - collected);
+            }
+
+            if (tx.type === 'FACTION_HELD_IN' && tx.ownership === 'FACTION' && tx.status === 'HELD') {
+                const lot=lotForSource(tx.id)||ensureSourceLot(tx);
+                const originalQty=Math.max(1,Number(tx.qty||1)), remainingQty=lot?Number(lot.qtyRemaining||0):Number(tx.qty||0);
+                assetsHeld += Math.round(Number(tx.currentValue||tx.mvTotal||0)/originalQty*remainingQty);
             }
 
             if (tx.type === 'ARMORY_OUT' &&
@@ -2806,6 +2857,7 @@
         return liveTransactions().filter(function (tx) {
             if (tx.type === 'PURCHASE' && tx.status === 'PENDING') return false;
             if (tx.type === 'ARMORY_OUT' && tx.status === 'PENDING') return false;
+            if (tx.type === 'INCOMING_TRANSFER' && tx.status === 'CLASSIFICATION_REQUIRED') return true;
             return tx.type === 'ARMORY_IN' && tx.status === 'ALLOCATION_REQUIRED';
         });
     }
@@ -2901,7 +2953,8 @@
             // Faction-held donations/transfers are physically with the user but never
             // personal stock and never reimbursable.
             if (tx.type === 'FACTION_HELD_IN' && tx.ownership === 'FACTION' && tx.status === 'HELD') {
-                item.factionHeldQty = Number(item.factionHeldQty || 0) + Number(tx.qtyRemaining != null ? tx.qtyRemaining : tx.qty || 0);
+                const heldLot=lotForSource(tx.id)||ensureSourceLot(tx);
+                item.factionHeldQty = Number(item.factionHeldQty || 0) + Number(heldLot ? heldLot.qtyRemaining : (tx.qtyRemaining != null ? tx.qtyRemaining : tx.qty || 0));
             }
         });
 
@@ -3324,6 +3377,15 @@
             actions = '';
         }
 
+        if (pendingActions && tx.type === 'INCOMING_TRANSFER' && tx.status === 'CLASSIFICATION_REQUIRED') {
+            actions = '<div class="fliq-muted" style="margin-top:8px">Classify this incoming player transfer once. This determines ownership; whitelist does not apply.</div>' +
+                '<div class="fliq-actions">' +
+                '<button class="fliq-btn fliq-btn-primary" data-fliq="incoming-faction" data-id="' + esc(tx.id) + '">Raffle / Faction-Owned</button>' +
+                '<button class="fliq-btn" data-fliq="incoming-purchase" data-id="' + esc(tx.id) + '">Personal Purchase</button>' +
+                '<button class="fliq-btn" data-fliq="incoming-gift" data-id="' + esc(tx.id) + '">Personal Gift</button>' +
+                '</div>';
+        }
+
         if (pendingActions && tx.type === 'ARMORY_IN' && tx.status === 'ALLOCATION_REQUIRED') {
             const ids = Array.isArray(tx.allocationCandidateIds) ? tx.allocationCandidateIds : [];
             const candidates = ids.map(function (id) { return liveTransactions().find(function (p) { return p.id === id; }); })
@@ -3359,7 +3421,10 @@
                 Number(tx.qty || 0).toLocaleString() + '</b><span class="fliq-pill">' +
                 esc(tx.type) + '</span></div>' +
             '<div>' + esc(actor(tx)) + ' · ' + esc(new Date(tx.timestamp).toLocaleString()) + '</div>' +
-            (tx.type === 'PURCHASE'
+            (tx.type === 'INCOMING_TRANSFER'
+                ? '<div>From <b>' + esc(personLabel(tx.personName,tx.personId)) + '</b>' +
+                    (tx.transferMessage ? ' · Message: ' + esc(tx.transferMessage) : '') + '</div>'
+                : (tx.type === 'PURCHASE'
                 ? '<div>Actual ' + money(tx.actualTotal) + ' · MV ' + money(tx.mvTotal) +
                     ' · Billable <b>' + money(tx.billableTotal) + '</b></div>'
                 : (tx.type === 'ARMORY_IN'
@@ -3376,7 +3441,7 @@
                                     (moneyTxOrigin(tx) ? ' · From ' + esc(moneyTxOrigin(tx)) + ' sale' : '') + '</div>'
                                 : (tx.type === 'ARMORY_OUT' && Number(tx.mvTotal || 0)
                                     ? '<div>Movement MV ' + money(tx.mvTotal) + ' · Faction-owned</div>'
-                                    : '')))))) +
+                                    : ''))))))) +
             '<div class="fliq-muted">' + esc(tx.source || '') +
                 (tx.source && tx.destination ? ' → ' : '') + esc(tx.destination || '') +
                 ' · ' + esc(tx.status) + '</div>' +
@@ -3779,6 +3844,29 @@
             searchHistoricalApiLogs(days).then(function(count){render();toast('Historical search found '+count+' log(s)');})
                 .catch(function(err){btn.disabled=false;btn.textContent='Search '+days+' Days';toast('Historical search failed: '+String(err&&err.message||err));});
             return;
+        }
+
+        if ((action === 'incoming-faction' || action === 'incoming-gift' || action === 'incoming-purchase') && tx &&
+            tx.type === 'INCOMING_TRANSFER' && tx.status === 'CLASSIFICATION_REQUIRED') {
+            if(action==='incoming-faction'){
+                tx.type='FACTION_HELD_IN'; tx.ownership='FACTION'; tx.status='HELD'; tx.factionHeld=true;
+                tx.billableTotal=0; tx.amount=0; tx.notes='Incoming player transfer classified by user as raffle/faction-owned. No reimbursement or personal P/L.';
+                ensureSourceLot(tx); saveState(); toast('Classified as faction-owned'); return;
+            }
+            if(action==='incoming-gift'){
+                tx.type='PURCHASE'; tx.ownership='PERSONAL'; tx.status='PENDING'; tx.source='Personal Gift';
+                tx.actualTotal=0; tx.amount=0; tx.billableTotal=Number(tx.mvTotal||0); tx.costBasisKnown=false;
+                tx.notes='Incoming player transfer classified by user as personal gift. Cost basis unknown; excluded from personal P/L.';
+                ensureSourceLot(tx); saveState(); toast('Classified as personal gift'); return;
+            }
+            const raw=prompt('Total amount you paid for this transfer? Enter dollars only.','');
+            if(raw===null)return;
+            const actual=Math.max(0,Number(String(raw).replace(/[$, ]/g,'')));
+            if(!Number.isFinite(actual)){toast('Enter a valid total amount');return;}
+            tx.type='PURCHASE'; tx.ownership='PERSONAL'; tx.status='PENDING'; tx.source='Direct Player Purchase';
+            tx.actualTotal=actual; tx.amount=actual; tx.billableTotal=billable(actual,Number(tx.mvTotal||0)); tx.costBasisKnown=true;
+            tx.notes='Incoming player transfer classified by user as personal purchase. Historical transfer message retained.';
+            ensureSourceLot(tx); saveState(); toast('Classified as personal purchase'); return;
         }
 
         if (action === 'cleanup-select-all') {
