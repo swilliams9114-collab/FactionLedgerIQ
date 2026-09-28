@@ -689,7 +689,7 @@
                 if (String(p.itemId || '') !== String(dep.itemId || '')) return false;
                 if (Number(p.qty || 0) !== remaining) return false;
                 const pMs = new Date(p.timestamp).getTime();
-                return Number.isFinite(pMs) && pMs <= depMs && depMs - pMs <= 7 * 24 * 60 * 60 * 1000;
+                return Number.isFinite(pMs) && pMs <= depMs && (p.openingInventory === true || depMs - pMs <= 7 * 24 * 60 * 60 * 1000);
             }).sort(function (a, b) { return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(); });
 
             if (candidates.length !== 1) {
