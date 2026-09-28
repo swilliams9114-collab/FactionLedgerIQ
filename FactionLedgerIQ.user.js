@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.10.0
+// @version      0.10.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.10.0';
+    const VERSION = '0.10.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2864,25 +2864,55 @@
         return 'FACTIONLEDGERIQ RECEIPT\nTransaction: ' + tx.id;
     }
 
+    function receiptIsMeaningful(bundle) {
+        if (!bundle) return false;
+        if (bundle.kind === 'REIMBURSEMENT') {
+            return Number(bundle.due || 0) > 0 || Number(bundle.paid || 0) > 0;
+        }
+        if (bundle.kind === 'SALE') {
+            return Number(bundle.proceeds || 0) > 0 || Number(bundle.returned || 0) > 0 || Number(bundle.collected || 0) > 0;
+        }
+        if (bundle.kind === 'ASSET') {
+            return bundle.members.some(function (tx) {
+                return tx.type === 'DISPLAY_IN' || tx.type === 'DISPLAY_OUT' ||
+                    (tx.type === 'ARMORY_OUT' && tx.ownership === 'FACTION');
+            });
+        }
+        return false;
+    }
+
+    function receiptItemLines(bundle) {
+        if (!bundle || !bundle.items || !bundle.items.length) return '';
+        if (bundle.items.length === 1) {
+            const item = bundle.items[0];
+            return '<div>' + Number(item.qty || 0).toLocaleString() + '× ' + esc(item.itemName) + '</div>';
+        }
+        return '<div style="margin-top:5px">' + bundle.items.map(function (item) {
+            return '<div>• ' + Number(item.qty || 0).toLocaleString() + '× ' + esc(item.itemName) +
+                (bundle.kind === 'REIMBURSEMENT' && Number(item.due || 0) > 0 ? ' — ' + money(item.due) : '') + '</div>';
+        }).join('') + '</div>';
+    }
+
     function renderReceipts() {
-        const bundles = buildReceiptBundles();
-        if (!bundles.length) return '<div class="fliq-empty">No receipts yet.</div>';
-        const openCount = bundles.filter(function (b) { return b.status !== 'SETTLED' && b.kind !== 'ASSET'; }).length;
+        const allBundles = buildReceiptBundles();
+        const bundles = allBundles.filter(receiptIsMeaningful);
+        if (!bundles.length) return '<div class="fliq-empty">No meaningful receipts yet. Standalone detections remain available in History.</div>';
+        const openCount = bundles.filter(function (b) {
+            return b.status === 'AWAITING PAYMENT' || b.status === 'PARTIALLY PAID' ||
+                b.status === 'AWAITING PROCEEDS' || b.status === 'READY FOR COLLECTION' || b.status === 'IN PROGRESS';
+        }).length;
         return '<div class="fliq-card" style="margin-bottom:10px"><b>Bundled Receipts</b>' +
-            '<div class="fliq-muted">One real-world transaction story per receipt. History keeps every individual ledger event.</div>' +
-            '<div class="fliq-muted" style="margin-top:5px">' + openCount + ' open · ' + bundles.length + ' total</div></div>' +
+            '<div class="fliq-muted">One real-world transaction story per receipt. Standalone $0 detections stay in History.</div>' +
+            '<div class="fliq-muted" style="margin-top:5px">' + openCount + ' open · ' + bundles.length + ' meaningful receipt' + (bundles.length===1?'':'s') + '</div></div>' +
             '<div class="fliq-list">' + bundles.map(function (b) {
                 const first = b.roots[0];
-                const itemSummary = b.items.length === 1
-                    ? Number(b.items[0].qty||0).toLocaleString() + '× ' + esc(b.items[0].itemName)
-                    : b.items.length + ' item types · ' + b.items.reduce(function(n,x){return n+Number(x.qty||0);},0).toLocaleString() + ' items';
                 let moneyLine = '';
-                if (b.kind === 'REIMBURSEMENT') moneyLine = '<div><b>' + money(b.outstanding) + '</b> outstanding · ' + money(b.paid) + ' reimbursed</div>';
-                if (b.kind === 'SALE') moneyLine = '<div><b>' + money(b.proceeds) + '</b> proceeds · ' + money(b.collected) + ' collected</div>';
+                if (b.kind === 'REIMBURSEMENT') moneyLine = '<div style="margin-top:5px"><b>' + money(b.outstanding) + '</b> outstanding · ' + money(b.paid) + ' reimbursed</div>';
+                if (b.kind === 'SALE') moneyLine = '<div style="margin-top:5px"><b>' + money(b.proceeds) + '</b> proceeds · ' + money(b.collected) + ' collected</div>';
                 return '<div class="fliq-item">' +
                     '<div class="fliq-item-top"><b>' + esc(receiptTitle(b)) + '</b><span class="fliq-pill">' + esc(b.status) + '</span></div>' +
-                    '<div>' + itemSummary + '</div>' + moneyLine +
-                    '<div class="fliq-muted">' + esc(new Date(b.timestamp).toLocaleString()) +
+                    receiptItemLines(b) + moneyLine +
+                    '<div class="fliq-muted" style="margin-top:5px">' + esc(new Date(b.timestamp).toLocaleString()) +
                         (b.lastTimestamp !== b.timestamp ? ' → ' + esc(new Date(b.lastTimestamp).toLocaleString()) : '') + '</div>' +
                     '<div class="fliq-muted">' + b.members.length + ' linked ledger event' + (b.members.length===1?'':'s') + '</div>' +
                     '<div class="fliq-actions"><button class="fliq-btn" data-fliq="copy-receipt" data-id="' + esc(first.id) + '">Copy Discord Receipt</button></div>' +
