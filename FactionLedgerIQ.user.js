@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.12.1
+// @version      0.12.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.12.1';
+    const VERSION = '0.12.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2804,7 +2804,7 @@
             if (!key) return;
 
             if (!map.has(key)) {
-                map.set(key, { itemName: tx.itemName, itemId: tx.itemId, qty: 0, factionQty: 0 });
+                map.set(key, { itemName: tx.itemName, itemId: tx.itemId, qty: 0, factionQty: 0, personalQty: 0 });
             }
 
             const item = map.get(key);
@@ -2818,9 +2818,20 @@
                 item.qty -= Number(tx.qty || 0);
                 if (tx.ownership === 'FACTION') item.factionQty -= Number(tx.qty || 0);
             }
+
+            // Opening personal stock is provenance for inventory the user already owns.
+            // It is not faction-owned and creates no reimbursement until a faction deposit
+            // is confirmed. Once allocated/deposited, it no longer remains personal stock.
+            if (tx.type === 'PURCHASE' && tx.openingInventory === true &&
+                tx.source === 'Opening Personal Stock' && tx.ownership === 'PERSONAL' &&
+                tx.status === 'PENDING' && !tx.depositTransactionId) {
+                item.personalQty += Number(tx.qty || 0);
+            }
         });
 
-        return Array.from(map.values()).filter(function (x) { return x.qty !== 0; });
+        return Array.from(map.values()).filter(function (x) {
+            return x.qty !== 0 || x.personalQty !== 0;
+        });
     }
 
     function renderInventory() {
@@ -2829,10 +2840,12 @@
         const inventoryHtml = inventory.length
             ? '<div class="fliq-list">' + inventory.map(function (x) {
                 return '<div class="fliq-item"><b>' + esc(x.itemName) + '</b>' +
-                    '<div>Tracked qty: ' + Number(x.qty).toLocaleString() + '</div>' +
-                    '<div class="fliq-muted">Faction-owned qty: ' + Number(x.factionQty).toLocaleString() + '</div></div>';
+                    '<div>Display Case qty: ' + Number(x.qty).toLocaleString() + '</div>' +
+                    '<div class="fliq-muted">Faction-owned qty: ' + Number(x.factionQty).toLocaleString() + '</div>' +
+                    (Number(x.personalQty||0) ? '<div class="fliq-muted">Personal stock qty: ' + Number(x.personalQty).toLocaleString() + '</div>' : '') +
+                    '</div>';
             }).join('') + '</div>'
-            : '<div class="fliq-empty">No display-case movements recorded yet.</div>';
+            : '<div class="fliq-empty">No display-case or opening personal inventory recorded yet.</div>';
 
         const whitelistHtml = state.whitelist.length
             ? state.whitelist.map(function (w) {
@@ -4141,6 +4154,14 @@
             state.updatedAt = new Date().toISOString();
             localStorage.setItem(STATE_KEY, JSON.stringify(state));
         }
+        state.migrations = state.migrations || {};
+        if (!state.migrations.personalOpeningInventoryDisplayV0122) {
+            state.migrations.personalOpeningInventoryDisplayV0122 = {at:new Date().toISOString(),
+                rule:'Pending Opening Personal Stock is shown as personal inventory only; it creates no faction asset or reimbursement liability.'};
+            state.updatedAt=new Date().toISOString();
+            localStorage.setItem(STATE_KEY,JSON.stringify(state));
+        }
+
         if (!state.migrations.aggregateDepositEligibilityV0121) {
             let repaired=0;
             liveTransactions().forEach(function(dep){
