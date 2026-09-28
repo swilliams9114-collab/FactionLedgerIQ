@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.10.2
+// @version      0.10.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.10.2';
+    const VERSION = '0.10.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2853,7 +2853,7 @@
         }
         lines.push('', 'Timeline:');
         bundle.members.forEach(function (tx) {
-            let detail = new Date(tx.timestamp).toLocaleString() + ' · ' + tx.type;
+            let detail = new Date(tx.timestamp).toLocaleString() + ' · ' + receiptEventLabel(tx);
             if (tx.source || tx.destination) detail += ' · ' + (tx.source || '') + (tx.source && tx.destination ? ' → ' : '') + (tx.destination || '');
             if (tx.type === 'REFUND' || tx.type === 'FACTION_BALANCE_IN' || tx.type === 'FACTION_COLLECTION' || tx.type === 'SALE') {
                 detail += ' · ' + money(tx.amount || tx.actualTotal || 0);
@@ -2908,6 +2908,21 @@
         return true;
     }
 
+    function receiptEventLabel(tx) {
+        const labels = {
+            PURCHASE: 'Purchased',
+            ARMORY_IN: 'Deposited to Faction Armory',
+            ARMORY_OUT: 'Withdrawn from Faction Armory',
+            DISPLAY_IN: 'Added to Display Case',
+            DISPLAY_OUT: 'Removed from Display Case',
+            SALE: 'Sold for Faction',
+            FACTION_BALANCE_IN: 'Proceeds Deposited to Faction',
+            REFUND: 'Reimbursed',
+            FACTION_COLLECTION: 'Faction Collected Proceeds'
+        };
+        return labels[tx && tx.type] || String((tx && tx.type) || 'Activity').replaceAll('_', ' ');
+    }
+
     function receiptDetailsHtml(bundle) {
         const first = bundle.roots[0] || {};
         let html = '<div style="margin-top:10px;padding-top:9px;border-top:1px solid #ffffff18">';
@@ -2925,7 +2940,7 @@
         html += '<div class="fliq-muted" style="margin-top:8px"><b>Timeline</b></div>';
         bundle.members.forEach(function (tx) {
             html += '<div class="fliq-muted" style="margin-top:4px">' +
-                esc(new Date(tx.timestamp).toLocaleString()) + ' · ' + esc(tx.type) +
+                esc(new Date(tx.timestamp).toLocaleString()) + ' · ' + esc(receiptEventLabel(tx)) +
                 ((tx.source || tx.destination) ? '<br>' + esc(tx.source || '') + (tx.source && tx.destination ? ' → ' : '') + esc(tx.destination || '') : '') +
                 ((tx.type === 'REFUND' || tx.type === 'SALE' || tx.type === 'FACTION_BALANCE_IN' || tx.type === 'FACTION_COLLECTION') ? ' · ' + money(tx.amount || tx.actualTotal || 0) : '') +
                 '</div>';
