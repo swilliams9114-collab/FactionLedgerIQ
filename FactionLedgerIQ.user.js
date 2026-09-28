@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.12.6
+// @version      0.13.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.12.6';
+    const VERSION = '0.13.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -743,6 +743,10 @@
 
     function recoverHistoricalMixedDepositsV0111() {
         state.migrations = state.migrations || {};
+        if (!state.migrations.factionHeldRaffleV0130) {
+            state.migrations.factionHeldRaffleV0130={at:new Date().toISOString(),
+                rule:'Faction-held/raffle stock is separate from personal stock and creates no reimbursement or personal P/L. Personal inventory uses remaining lot quantity.'};
+        }
         if (state.migrations.mixedProvenanceV0111) return false;
         let changed=false;
         const deposits=liveTransactions().filter(function(dep){
@@ -2869,7 +2873,7 @@
             if (!key) return;
 
             if (!map.has(key)) {
-                map.set(key, { itemName: tx.itemName, itemId: tx.itemId, qty: 0, factionQty: 0, personalQty: 0 });
+                map.set(key, { itemName: tx.itemName, itemId: tx.itemId, qty: 0, factionQty: 0, personalQty: 0, factionHeldQty: 0 });
             }
 
             const item = map.get(key);
@@ -2884,17 +2888,25 @@
                 if (tx.ownership === 'FACTION') item.factionQty -= Number(tx.qty || 0);
             }
 
-            // Any confirmed personal purchase remains personal stock until it is allocated
-            // into a faction Armory/Display deposit. Opening stock follows the same rule.
+            // Personal stock is the remaining quantity in the personal provenance lot,
+            // not the original PURCHASE quantity. This prevents historical/partially-used
+            // purchases from inflating physical personal inventory.
             if (tx.type === 'PURCHASE' && tx.ownership === 'PERSONAL' &&
-                tx.status === 'PENDING' && !purchaseHasConfirmedFactionDeposit(tx) &&
-                !purchaseIsMixedDepositComponent(tx)) {
-                item.personalQty += Number(tx.qty || 0);
+                tx.status === 'PENDING' && !purchaseIsMixedDepositComponent(tx)) {
+                const lot = ensureSourceLot(tx);
+                item.personalQty += lot ? Number(lot.qtyRemaining || 0) :
+                    (!purchaseHasConfirmedFactionDeposit(tx) ? Number(tx.qty || 0) : 0);
+            }
+
+            // Faction-held donations/transfers are physically with the user but never
+            // personal stock and never reimbursable.
+            if (tx.type === 'FACTION_HELD_IN' && tx.ownership === 'FACTION' && tx.status === 'HELD') {
+                item.factionHeldQty = Number(item.factionHeldQty || 0) + Number(tx.qtyRemaining != null ? tx.qtyRemaining : tx.qty || 0);
             }
         });
 
         return Array.from(map.values()).filter(function (x) {
-            return x.qty !== 0 || x.personalQty !== 0;
+            return x.qty !== 0 || x.personalQty !== 0 || Number(x.factionHeldQty||0) !== 0;
         });
     }
 
@@ -2907,6 +2919,7 @@
                     '<div>Display Case qty: ' + Number(x.qty).toLocaleString() + '</div>' +
                     '<div class="fliq-muted">Faction-owned qty: ' + Number(x.factionQty).toLocaleString() + '</div>' +
                     (Number(x.personalQty||0) ? '<div class="fliq-muted">Personal stock qty: ' + Number(x.personalQty).toLocaleString() + '</div>' : '') +
+                    (Number(x.factionHeldQty||0) ? '<div class="fliq-muted">Faction-held / raffle qty: ' + Number(x.factionHeldQty).toLocaleString() + '</div>' : '') +
                     '</div>';
             }).join('') + '</div>'
             : '<div class="fliq-empty">No display-case or opening personal inventory recorded yet.</div>';
@@ -2921,6 +2934,13 @@
             : '<div class="fliq-empty">Whitelist is empty.</div>';
 
         return '<div class="fliq-section"><h3>Display Case Ledger</h3>' + inventoryHtml + '</div>' +
+            '<div class="fliq-section"><h3>Faction-held / Raffle Intake</h3>' +
+                '<form id="fliq-faction-held-form" class="fliq-card">' +
+                    row(field('Search Torn items', itemSearchControl()), field('Quantity','<input name="qty" type="number" min="1" value="1" required>')) +
+                    row(field('Received from (name)','<input name="senderName" placeholder="Member name">'), field('Torn ID (optional)','<input name="senderId" inputmode="numeric">')) +
+                    field('Notes','<input name="notes" placeholder="Raffle donation, fundraiser, etc.">') +
+                    '<div class="fliq-muted">Faction-owned while held by you. Does not affect Personal stock, reimbursement, or personal P/L.</div>' +
+                    '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Record Faction-held Intake</button></div></form></div>' +
             '<div class="fliq-section"><h3>Opening Inventory</h3>' + openingInventoryForm() + '</div>' +
             '<div class="fliq-section"><h3>Whitelist</h3>' +
                 '<form id="fliq-whitelist-form" class="fliq-card">' +
@@ -3542,6 +3562,22 @@
             saveState();
             toast('Added to whitelist');
             return;
+        }
+
+        if (form.id === 'fliq-faction-held-form') {
+            const itemName=formValue(fd,'itemName'), itemId=formValue(fd,'itemId');
+            const qty=Math.max(1,Number(fd.get('qty')||1));
+            if(!itemName||!itemId){toast('Choose an item from Torn item search');return;}
+            const catalogItem=itemCatalog.find(function(item){return String(item.id)===String(itemId);});
+            const mvEach=catalogItem?Math.max(0,Number(catalogItem.marketValue||0)):0;
+            state.transactions.push({id:uid('TX'),chainId:uid('CHAIN'),parentId:null,type:'FACTION_HELD_IN',
+                timestamp:new Date().toISOString(),itemName:itemName,itemId:String(itemId),qty:qty,qtyRemaining:qty,
+                actualTotal:0,mvEach:mvEach,mvTotal:mvEach*qty,billableTotal:0,amount:0,source:'Member Transfer',
+                destination:'Held by '+(state.settings.playerName||'user'),personName:formValue(fd,'senderName'),
+                personId:formValue(fd,'senderId'),ownership:'FACTION',status:'HELD',factionHeld:true,
+                notes:formValue(fd,'notes')||'Faction-owned raffle/donation stock held by user; no reimbursement.',
+                detectionMethod:'MANUAL_FACTION_HELD_INTAKE',createdAt:new Date().toISOString()});
+            saveState(); toast('Faction-held stock recorded separately'); return;
         }
 
         if (form.id === 'fliq-opening-form') {
