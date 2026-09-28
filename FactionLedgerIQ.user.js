@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.11.3
+// @version      0.12.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.11.3';
+    const VERSION = '0.12.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1823,6 +1823,30 @@
             '<div class="fliq-muted">Linked movement: ' + esc(movement.id) + '</div></div>';
     }
 
+    function reimbursementCalculation(tx) {
+        if (!tx || tx.status === 'VOID') return {due:0, baselineQty:0, purchasedQty:0, components:[], depositMvEach:0, depositMvTotal:0};
+        if (tx.type === 'PURCHASE') {
+            return {due:Number(tx.billableTotal||0), baselineQty:0, purchasedQty:Number(tx.qty||0), components:[{
+                id:tx.id, qty:Number(tx.qty||0), actual:Number(tx.actualTotal||0), mv:Number(tx.mvTotal||0),
+                billed:Number(tx.billableTotal||0), source:tx.source||'Purchase'
+            }], depositMvEach:0, depositMvTotal:Number(tx.mvTotal||0)};
+        }
+        if (tx.type !== 'ARMORY_IN') return {due:0, baselineQty:0, purchasedQty:0, components:[], depositMvEach:0, depositMvTotal:0};
+        const qty=Number(tx.qty||0);
+        const depositMvTotal=Number(tx.mvTotal||tx.billableTotal||0);
+        const depositMvEach=Number(tx.mvEach||0) || (qty>0 ? depositMvTotal/qty : 0);
+        const ids=Array.isArray(tx.purchaseAllocationIds)?tx.purchaseAllocationIds:[];
+        const components=ids.map(function(id){return liveTransactions().find(function(p){return p.id===id&&p.type==='PURCHASE'&&p.status!=='VOID';});}).filter(Boolean)
+            .map(function(p){return {id:p.id,qty:Number(p.qty||0),actual:Number(p.actualTotal||0),mv:Number(p.mvTotal||0),
+                billed:Number(p.billableTotal||0),source:p.source||'Purchase'};});
+        const purchasedQty=components.reduce(function(n,p){return n+p.qty;},0);
+        const baselineQty=Math.max(0,qty-purchasedQty);
+        const purchasedDue=components.reduce(function(n,p){return n+Math.max(p.actual,p.mv,p.billed);},0);
+        const baselineDue=Math.round(baselineQty*depositMvEach);
+        return {due:purchasedDue+baselineDue,baselineQty:baselineQty,purchasedQty:purchasedQty,components:components,
+            depositMvEach:depositMvEach,depositMvTotal:depositMvTotal,baselineDue:baselineDue,purchasedDue:purchasedDue};
+    }
+
     function reimbursementOutstanding(tx) {
         if (!tx || tx.status === 'VOID') return 0;
         let total = 0;
@@ -1833,7 +1857,7 @@
         } else if (tx.type === 'ARMORY_IN' &&
             (tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
              (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' && tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED')) &&
-            !tx.purchaseAllocationId) total = Number(tx.billableTotal || tx.mvTotal || 0);
+            !tx.purchaseAllocationId) total = reimbursementCalculation(tx).due;
         else return 0;
         const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum,r) { return sum + Number(r.amount || r.actualTotal || 0); },0);
         return Math.max(0,total-refunded);
@@ -2271,10 +2295,10 @@
                 movement.purchaseAllocationIds.includes(tx.id) && Number(movement.mixedBaselineQty || 0) > 0;
             const depositEach = mixed ? Number(movement.billableTotal || movement.mvTotal || 0) / Math.max(1,Number(movement.qty||1)) : 0;
             const mixedMvShare = mixed ? Math.round(depositEach * Number(tx.qty||0)) : 0;
-            const due = mixed ? Math.max(Number(tx.billableTotal || 0), mixedMvShare) : Number(tx.billableTotal || 0);
+            const due = mixed ? Math.max(Number(tx.actualTotal||0), Number(tx.mvTotal||0), Number(tx.billableTotal||0)) : Number(tx.billableTotal || 0);
             // Refunds for mixed deposits live on the deposit root. Allocate realized payment
             // proportionally; until then these remain potential P/L.
-            const depositPaid = mixed ? Math.min(Number(movement.billableTotal||movement.mvTotal||0),
+            const depositPaid = mixed ? Math.min(reimbursementCalculation(movement).due,
                 childrenOf(movement.id,'REFUND').reduce(function(n,r){return n+Number(r.amount||r.actualTotal||0);},0)) : 0;
             const paid = mixed ? Math.min(due, Math.round(depositPaid * (Number(tx.qty||0)/Math.max(1,Number(movement.qty||1))))) :
                 Math.min(due, receiptRefunds(tx));
@@ -2372,7 +2396,7 @@
                     return sum + Number(r.amount || r.actualTotal || 0);
                 }, 0);
                 if (!tx.purchaseAllocationId) {
-                    factionOwesMe += Math.max(0, Number(tx.billableTotal || tx.mvTotal || 0) - refunded);
+                    factionOwesMe += Math.max(0, reimbursementCalculation(tx).due - refunded);
                 }
             }
 
@@ -2441,7 +2465,7 @@
                 const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
                     return sum + Number(r.amount || r.actualTotal || 0);
                 }, 0);
-                const original = Number(tx.billableTotal || tx.mvTotal || 0);
+                const original = reimbursementCalculation(tx).due;
                 const outstanding = Math.max(0, original - refunded);
                 if (outstanding > 0) {
                     rows.push({
@@ -2876,11 +2900,14 @@
 
     function reimbursementDueForRoot(root) {
         if (!root) return 0;
-        if (root.type === 'PURCHASE') return purchaseHasConfirmedFactionDeposit(root) ? Number(root.billableTotal || 0) : 0;
-        if (root.type === 'ARMORY_IN' && !root.purchaseAllocationId && !root.purchaseAllocationIds &&
-            root.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
-            root.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED') {
-            return Number(root.billableTotal || root.mvTotal || 0);
+        if (root.type === 'PURCHASE') {
+            if (purchaseIsMixedDepositComponent(root)) return 0;
+            return purchaseHasConfirmedFactionDeposit(root) ? Number(root.billableTotal || 0) : 0;
+        }
+        if (root.type === 'ARMORY_IN' && !root.purchaseAllocationId &&
+            (root.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
+             (root.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' && root.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED'))) {
+            return reimbursementCalculation(root).due;
         }
         return 0;
     }
@@ -2924,8 +2951,12 @@
                     items[key].mv += Number(root.mvTotal || 0);
                     if (root.costBasisKnown === false || !(Number(root.actualTotal || 0) > 0)) items[key].knownCost = false;
                 } else {
-                    items[key].mv += Number(root.mvTotal || root.billableTotal || 0);
+                    const calc = reimbursementCalculation(root);
+                    items[key].mv += Number(calc.depositMvTotal || root.mvTotal || 0);
                     items[key].knownCost = false;
+                    items[key].pricing = items[key].pricing || [];
+                    calc.components.forEach(function(c){ items[key].pricing.push({kind:'PURCHASE',qty:c.qty,actual:c.actual,mv:c.mv,billed:Math.max(c.actual,c.mv,c.billed),source:c.source}); });
+                    if (calc.baselineQty > 0) items[key].pricing.push({kind:'BASELINE',qty:calc.baselineQty,actual:null,mv:calc.baselineDue,billed:calc.baselineDue,source:'Previously held personal stock'});
                 }
             }
         });
@@ -2960,8 +2991,8 @@
         // This is presentation-only: the underlying transactions and accounting remain separate.
         const deposits = roots.filter(function (tx) {
             return tx.type === 'ARMORY_IN' && !tx.purchaseAllocationId &&
-                tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
-                tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED';
+                (tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
+                 (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' && tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED'));
         });
         deposits.forEach(function (tx) {
             if (consumed.has(tx.id)) return;
@@ -3021,9 +3052,20 @@
         if (bundle.kind === 'REIMBURSEMENT') {
             lines.push('');
             bundle.items.forEach(function(item){
-                lines.push(item.itemName + ' · Actual cost: ' + (item.knownCost ? money(item.actual) : 'Unknown') +
-                    ' · MV: ' + money(item.mv) + ' · Billed: ' + money(item.due) +
-                    ' · Billing vs MV: ' + signedMoney(Number(item.due||0)-Number(item.mv||0)));
+                const pricing=item.pricing||[];
+                if (pricing.length) {
+                    lines.push(item.itemName + ' reimbursement breakdown:');
+                    pricing.forEach(function(p){
+                        lines.push('  ' + Number(p.qty||0).toLocaleString() + 'x ' + (p.kind==='BASELINE'?'Previously held personal stock':p.source||'Purchased') +
+                            ' · ' + (p.actual==null?'Deposit MV '+money(p.mv):'Actual '+money(p.actual)+' · MV '+money(p.mv)) +
+                            ' · Billed '+money(p.billed));
+                    });
+                    lines.push('  Total billed: '+money(item.due)+' · Billing vs MV: '+signedMoney(Number(item.due||0)-Number(item.mv||0)));
+                } else {
+                    lines.push(item.itemName + ' · Actual cost: ' + (item.knownCost ? money(item.actual) : 'Unknown') +
+                        ' · MV: ' + money(item.mv) + ' · Billed: ' + money(item.due) +
+                        ' · Billing vs MV: ' + signedMoney(Number(item.due||0)-Number(item.mv||0)));
+                }
             });
             lines.push('Amount due: ' + money(bundle.due), 'Reimbursed: ' + money(bundle.paid), 'Balance: ' + money(bundle.outstanding));
         }
@@ -3108,10 +3150,15 @@
         html += '<div><b>Person:</b> ' + esc(actor(first)) + '</div>';
         if (bundle.kind === 'REIMBURSEMENT') {
             html += bundle.items.map(function(item){
-                return '<div class="fliq-proof"><b>' + esc(item.itemName) + '</b><div>Actual cost: ' + (item.knownCost ? money(item.actual) : 'Unknown') +
-                    ' · MV: ' + money(item.mv) + ' · Billed: ' + money(item.due) + '</div>' +
-                    '<div class="fliq-muted">Billing vs MV: ' + signedMoney(Number(item.due||0)-Number(item.mv||0)) +
-                    (item.knownCost ? ' · Potential P/L: ' + signedMoney(Number(item.due||0)-Number(item.actual||0)) : ' · P/L excluded: unknown cost basis') + '</div></div>';
+                const pricing=(item.pricing||[]);
+                return '<div class="fliq-proof"><b>' + esc(item.itemName) + '</b>' +
+                    (pricing.length ? pricing.map(function(p){
+                        return '<div>' + Number(p.qty||0).toLocaleString() + '× ' + esc(p.kind==='BASELINE'?'Previously held':p.source||'Purchased') +
+                            ' · ' + (p.actual==null?'Deposit MV '+money(p.mv):'Actual '+money(p.actual)+' · MV '+money(p.mv)) +
+                            ' · Billed <b>'+money(p.billed)+'</b></div>';
+                    }).join('') : '<div>Actual cost: ' + (item.knownCost ? money(item.actual) : 'Unknown') +
+                        ' · MV: ' + money(item.mv) + ' · Billed: ' + money(item.due) + '</div>') +
+                    '<div class="fliq-muted">Total billed vs MV: ' + signedMoney(Number(item.due||0)-Number(item.mv||0)) + '</div></div>';
             }).join('') +
                 '<div><b>Amount due:</b> ' + money(bundle.due) + '</div>' +
                 '<div><b>Reimbursed:</b> ' + money(bundle.paid) + '</div>' +
@@ -4091,6 +4138,13 @@
             localStorage.setItem(STATE_KEY, JSON.stringify(state));
         }
         if (markMixedLiabilityRepairV0113()) {
+            state.updatedAt = new Date().toISOString();
+            localStorage.setItem(STATE_KEY, JSON.stringify(state));
+        }
+        state.migrations = state.migrations || {};
+        if (!state.migrations.universalReimbursementV0120) {
+            state.migrations.universalReimbursementV0120 = {at:new Date().toISOString(),
+                rule:'All personal faction deposits: known purchase portions bill at max(actual,MV); previously held remainder bills at deposit-time MV. Receipts share this calculation; personal P/L stays private.'};
             state.updatedAt = new Date().toISOString();
             localStorage.setItem(STATE_KEY, JSON.stringify(state));
         }
