@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.12.4
+// @version      0.12.5
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.12.4';
+    const VERSION = '0.12.5';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2391,8 +2391,6 @@
                 const mixedChild = purchaseIsMixedDepositComponent(tx);
                 if (deposited && !mixedChild) {
                     factionOwesMe += Math.max(0, Number(tx.billableTotal || 0) - refunded);
-                } else if (!deposited) {
-                    pending += 1;
                 }
             }
 
@@ -2428,6 +2426,12 @@
             }
         });
 
+        // Dashboard unresolved count must mirror the actions that actually require attention.
+        // Ordinary pending purchases/opening personal stock are provenance/inventory records, not unresolved work.
+        pending = pendingTransactions().length +
+            (Array.isArray(state.detection.balanceMovements)
+                ? state.detection.balanceMovements.filter(function (m) { return m.status === 'UNCLASSIFIED'; }).length
+                : 0);
         return { factionOwesMe, iOweFaction, readyToCollect, assetsHeld, pending };
     }
 
