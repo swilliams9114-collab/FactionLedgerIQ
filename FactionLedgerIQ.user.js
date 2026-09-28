@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.14.0
+// @version      0.14.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.14.0';
+    const VERSION = '0.14.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2183,12 +2183,42 @@
         }).filter(Boolean);
     }
 
+    function repairIncomingTransferDuplicatesV0141() {
+        state.migrations = state.migrations || {};
+        if (state.migrations.incomingTransferVoidDedupV0141) return false;
+        const groups = new Map();
+        state.transactions.forEach(function(tx){
+            if(tx.detectionMethod!=='API_INCOMING_PLAYER_TRANSFER' || !tx.apiLogId) return;
+            const key=[tx.apiLogId,String(tx.itemId||'')].join('|');
+            if(!groups.has(key))groups.set(key,[]);
+            groups.get(key).push(tx);
+        });
+        let changed=false;
+        groups.forEach(function(rows){
+            const voided=rows.filter(function(x){return x.status==='VOID';});
+            const active=rows.filter(function(x){return x.status!=='VOID';});
+            if(!voided.length || !active.length)return;
+            active.forEach(function(tx){
+                tx.status='VOID'; tx.voidReason='Auto-voided duplicate resurrection of previously voided API transfer';
+                tx.voidedAt=new Date().toISOString(); tx.duplicateOf=voided[0].id; changed=true;
+            });
+        });
+        state.migrations.incomingTransferVoidDedupV0141={at:new Date().toISOString(),
+            rule:'VOID incoming API transfers remain terminal; duplicate resurrected copies auto-voided.'};
+        return true;
+    }
+
     async function reconcileIncomingPlayerTransfers(logs) {
         try{await ensureItemCatalog(false);}catch(e){}
         let changed=false;
         for(const log of (logs||[])){
             for(const part of incomingPlayerTransferParts(log)){
-                const dup=liveTransactions().some(function(tx){return tx.type==='INCOMING_TRANSFER'&&tx.apiLogId===part.logId&&String(tx.itemId)===part.itemId;});
+                // Dedup against the full audit ledger, not only live transactions. A VOID
+                // transfer must remain terminal and must never be resurrected by API polling.
+                const dup=state.transactions.some(function(tx){
+                    return tx.detectionMethod==='API_INCOMING_PLAYER_TRANSFER' &&
+                        tx.apiLogId===part.logId && String(tx.itemId)===part.itemId;
+                });
                 if(dup)continue;
                 const item=itemCatalog.find(function(x){return String(x.id)===part.itemId;});
                 const mvEach=item?Math.max(0,Number(item.marketValue||0)):0;
@@ -2226,6 +2256,7 @@
             }
             rememberApiEvents(logs);
             let changed = false;
+            if (repairIncomingTransferDuplicatesV0141()) changed = true;
             if (await reconcileIncomingPlayerTransfers(logs)) changed = true;
             const saleRecoveryLogs = logs.concat(Array.isArray(state.detection.recentApiEvents) ? state.detection.recentApiEvents : []);
             if (repairObservedBazaarSales(saleRecoveryLogs)) changed = true;
@@ -4055,6 +4086,16 @@
             tx.status = 'VOID';
             tx.voidReason = reason.trim() || 'Voided by user';
             tx.voidedAt = new Date().toISOString();
+            // Preserve authoritative API identity when voiding. Reconciliation checks the
+            // complete audit ledger, including VOID records, so this event cannot reappear.
+            if (tx.detectionMethod === 'API_INCOMING_PLAYER_TRANSFER' && tx.apiLogId) {
+                state.detection.ignoredIncomingTransferKeys = Array.isArray(state.detection.ignoredIncomingTransferKeys)
+                    ? state.detection.ignoredIncomingTransferKeys : [];
+                const ignoredKey = [tx.apiLogId, String(tx.itemId || '')].join('|');
+                if (!state.detection.ignoredIncomingTransferKeys.includes(ignoredKey)) {
+                    state.detection.ignoredIncomingTransferKeys.push(ignoredKey);
+                }
+            }
             saveState();
             toast('Transaction voided; audit retained');
             return;
