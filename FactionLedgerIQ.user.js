@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.12.5
+// @version      0.12.6
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.12.5';
+    const VERSION = '0.12.6';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1390,9 +1390,67 @@
         return changed;
     }
 
+    function cityShopPurchasePart(log) {
+        const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+        const itemId = String(data.item || data.item_id || '').trim();
+        const qty = Math.max(0, Number(data.quantity || data.qty || 0));
+        const costEach = Math.max(0, Number(data.cost_each || 0));
+        const costTotal = Math.max(0, Number(data.cost_total || 0));
+        // Observed Torn City Shop signature: singular item + quantity + cost fields + area.
+        // Requiring area avoids confusing this with market/trade log shapes.
+        if (!itemId || !(qty > 0) || (data.cost_each == null && data.cost_total == null) || data.area == null) return null;
+        return { logId:logId(log), timestamp:Number(log.timestamp||0), itemId:itemId, qty:qty,
+            costEach:costEach, costTotal:costTotal || (costEach*qty), area:String(data.area) };
+    }
+
+    async function reconcileCityShopPurchase(log, allowProcessed) {
+        const part = cityShopPurchasePart(log);
+        if (!part || !part.logId) return false;
+        if (!allowProcessed && isLogProcessed(part.logId)) return false;
+        const existing = liveTransactions().some(function(tx){
+            return tx.type==='PURCHASE' && tx.apiLogId===part.logId && String(tx.itemId||'')===part.itemId;
+        });
+        if (existing) return false;
+        if (!itemCatalog.length) {
+            try { await ensureItemCatalog(false); } catch(err) { console.warn('[FactionLedgerIQ] City Shop catalog lookup failed',err); }
+        }
+        const catalogItem=itemCatalog.find(function(item){return String(item.id)===part.itemId;});
+        const itemName=catalogItem?catalogItem.name:'';
+        const wl=whitelistMatch(itemName,part.itemId);
+        if (!wl) { if(!allowProcessed) markLogProcessed(part.logId); return false; }
+        const actualTotal=part.costTotal;
+        const mvEach=catalogItem?Math.max(0,Number(catalogItem.marketValue||0)):0;
+        const mvTotal=mvEach*part.qty;
+        const billedTotal=billable(actualTotal,mvTotal);
+        state.transactions.push({
+            id:uid('TX'),chainId:uid('CHAIN'),parentId:null,type:'PURCHASE',
+            timestamp:part.timestamp?new Date(part.timestamp*1000).toISOString():new Date().toISOString(),
+            itemName:wl.itemName||itemName||('Item #'+part.itemId),itemId:wl.itemId||part.itemId,qty:part.qty,
+            actualTotal:actualTotal,mvTotal:mvTotal,mvEach:mvEach,billableTotal:billedTotal,amount:actualTotal,
+            source:'City Shop',destination:'Personal Inventory',personName:state.settings.playerName,personId:state.settings.playerId,
+            notes:'API-confirmed City Shop purchase. Area: '+part.area+'. Purchase-time MV frozen at '+money(mvTotal)+
+                (actualTotal>mvTotal&&mvTotal>0?'; actual cost was above MV.':'; billing uses the greater of actual cost or MV.'),
+            ownership:'PERSONAL',status:'PENDING',detectionMethod:'API_CITY_SHOP_PURCHASE',apiLogId:part.logId,
+            costEach:part.costEach,cityShopArea:part.area,createdAt:new Date().toISOString()
+        });
+        markLogProcessed(part.logId);
+        state.detection.lastDetectedAt=new Date().toISOString();
+        state.detection.lastSource='Torn API · City Shop';
+        return true;
+    }
+
+    async function recoverCityShopPurchasesFromDiagnostics() {
+        let changed=false;
+        const events=Array.isArray(state.detection.recentApiEvents)?state.detection.recentApiEvents:[];
+        for (const ev of events) if (await reconcileCityShopPurchase(ev,true)) changed=true;
+        return changed;
+    }
+
     async function reconcileApiPurchase(log) {
         const id = logId(log);
-        if (!id || isLogProcessed(id)) return false;
+        if (!id) return false;
+        if (cityShopPurchasePart(log)) return await reconcileCityShopPurchase(log, false);
+        if (isLogProcessed(id)) return false;
 
         const data = log && log.data && typeof log.data === 'object' ? log.data : {};
         const items = Array.isArray(data.items) ? data.items : [];
@@ -2144,6 +2202,7 @@
             });
             if (repairObservedBazaarSources(bazaarRecoveryLogs)) changed = true;
             if (await reconcileObservedBazaarPurchases(bazaarRecoveryLogs)) changed = true;
+            if (await recoverCityShopPurchasesFromDiagnostics()) changed = true;
             if (reconcileTradeSales(logs)) changed = true;
             if (await reconcileTradePurchases(logs)) changed = true;
             if (reconcileItemMarketSales(logs)) changed = true;
@@ -2825,12 +2884,11 @@
                 if (tx.ownership === 'FACTION') item.factionQty -= Number(tx.qty || 0);
             }
 
-            // Opening personal stock is provenance for inventory the user already owns.
-            // It is not faction-owned and creates no reimbursement until a faction deposit
-            // is confirmed. Once allocated/deposited, it no longer remains personal stock.
-            if (tx.type === 'PURCHASE' && tx.openingInventory === true &&
-                tx.source === 'Opening Personal Stock' && tx.ownership === 'PERSONAL' &&
-                tx.status === 'PENDING' && !tx.depositTransactionId) {
+            // Any confirmed personal purchase remains personal stock until it is allocated
+            // into a faction Armory/Display deposit. Opening stock follows the same rule.
+            if (tx.type === 'PURCHASE' && tx.ownership === 'PERSONAL' &&
+                tx.status === 'PENDING' && !purchaseHasConfirmedFactionDeposit(tx) &&
+                !purchaseIsMixedDepositComponent(tx)) {
                 item.personalQty += Number(tx.qty || 0);
             }
         });
