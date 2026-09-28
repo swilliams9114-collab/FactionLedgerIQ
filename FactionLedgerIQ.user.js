@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.11.0
+// @version      0.11.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.11.0';
+    const VERSION = '0.11.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -140,7 +140,7 @@
                 itemId: String(tx.itemId), itemName: tx.itemName || '', ownership: ownership,
                 reimbursable: reimbursable, location: location, qtyOriginal: Number(tx.qty || 0),
                 qtyRemaining: Number(tx.qty || 0), actualTotal: Number(tx.actualTotal || 0),
-                mvTotal: Number(tx.mvTotal || 0), billableTotal: Number(tx.billableTotal || 0),
+                mvTotal: Number(tx.mvTotal || 0), billableTotal: Number(tx.billableTotal || 0), costBasisKnown: tx.costBasisKnown !== false && Number(tx.actualTotal || 0) > 0,
                 createdAt: tx.timestamp || new Date().toISOString(), status: 'OPEN' };
             state.accounting.lots.push(lot);
         }
@@ -174,7 +174,7 @@
                 movementId: tx.id, itemId: tx.itemId, qty: take, ownership: lot.ownership,
                 actualTotal: Math.round(Number(lot.actualTotal || 0) / q * take),
                 mvTotal: Math.round(Number(lot.mvTotal || 0) / q * take),
-                billableTotal: Math.round(Number(lot.billableTotal || 0) / q * take),
+                billableTotal: Math.round(Number(lot.billableTotal || 0) / q * take), costBasisKnown: lot.costBasisKnown !== false,
                 createdAt: new Date().toISOString(), status: 'ACTIVE' });
             remaining -= take; changed = true;
             lot.qtyRemaining = Math.max(0, Number(lot.qtyRemaining || 0) - take);
@@ -676,64 +676,104 @@
         const deposits = liveTransactions().filter(function (tx) {
             return tx.type === 'ARMORY_IN' &&
                 tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
-                !tx.purchaseAllocationId &&
+                !tx.purchaseAllocationId && !tx.purchaseAllocationIds &&
                 new Date(tx.timestamp).getTime() >= cutoffMs;
-        }).sort(function (a, b) { return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(); });
+        }).sort(function (a,b){ return new Date(a.timestamp)-new Date(b.timestamp); });
 
         deposits.forEach(function (dep) {
-            const remaining = Number(dep.qty || 0);
-            if (!(remaining > 0)) return;
+            const depQty = Number(dep.qty || 0);
+            if (!(depQty > 0)) return;
             const depMs = new Date(dep.timestamp).getTime();
-            const candidates = liveTransactions().filter(function (p) {
+            const eligible = liveTransactions().filter(function (p) {
                 if (p.type !== 'PURCHASE' || p.status !== 'PENDING') return false;
                 if (String(p.itemId || '') !== String(dep.itemId || '')) return false;
-                if (Number(p.qty || 0) !== remaining) return false;
                 const pMs = new Date(p.timestamp).getTime();
-                return Number.isFinite(pMs) && pMs <= depMs && (p.openingInventory === true || depMs - pMs <= 7 * 24 * 60 * 60 * 1000);
-            }).sort(function (a, b) { return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(); });
+                return Number.isFinite(pMs) && pMs <= depMs &&
+                    (p.openingInventory === true || depMs - pMs <= 7*24*60*60*1000);
+            }).sort(function(a,b){ return new Date(a.timestamp)-new Date(b.timestamp); });
 
-            if (candidates.length !== 1) {
-                if (candidates.length > 1) {
-                    const nextIds = candidates.map(function (p) { return p.id; });
-                    const wasSame = dep.status === 'ALLOCATION_REQUIRED' &&
-                        JSON.stringify(dep.allocationCandidateIds || []) === JSON.stringify(nextIds);
-                    dep.status = 'ALLOCATION_REQUIRED';
-                    dep.allocationRequired = true;
-                    dep.allocationCandidateIds = nextIds;
-                    if (!wasSame) {
-                        dep.notes = [dep.notes, 'Multiple exact-quantity personal purchase lots exist; select which purchase funded this armory deposit.']
-                            .filter(Boolean).join(' | ');
-                        changed = true;
-                    }
-                }
+            // Exact quantity remains the strongest provenance signal.
+            const exact = eligible.filter(function(p){ return Number(p.qty || 0) === depQty; });
+            let selected = [];
+            if (exact.length === 1) selected = exact;
+            else if (exact.length > 1) {
+                dep.status='ALLOCATION_REQUIRED'; dep.allocationRequired=true;
+                dep.allocationCandidateIds=exact.map(function(p){return p.id;});
                 return;
+            } else {
+                // Mixed-stack support: use all known eligible purchase lots only when their
+                // combined quantity does not exceed the deposit. Any remainder is pre-existing
+                // personal inventory and keeps unknown cost basis.
+                let total=0;
+                eligible.forEach(function(p){
+                    const q=Number(p.qty||0);
+                    if (q>0 && total+q<=depQty) { selected.push(p); total+=q; }
+                });
+                if (!selected.length) return;
             }
 
-            const purchase = candidates[0];
-            purchase.status = 'DEPOSITED';
-            purchase.depositTransactionId = dep.id;
-            dep.purchaseAllocationId = purchase.id;
-            dep.ownership = 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT';
-            dep.provenanceStatus = 'TRACKED_PERSONAL_PURCHASE';
-            dep.status = 'RECORDED';
-            dep.allocationRequired = false;
-            dep.allocationCandidateIds = [];
-            dep.billableTotal = Number(purchase.billableTotal || dep.billableTotal || dep.mvTotal || 0);
-            dep.actualTotal = Number(purchase.actualTotal || 0);
-            dep.mvTotal = Number(purchase.mvTotal || dep.mvTotal || 0);
-            dep.mvEach = Number(purchase.mvEach || dep.mvEach || 0);
-            dep.notes = [dep.notes, 'Matched to the only exact-quantity eligible purchase ' + purchase.id + '; frozen purchase billable amount retained.']
-                .filter(Boolean).join(' | ');
-            purchase.notes = [purchase.notes, 'Automatically matched to faction armory deposit ' + dep.id + '.']
-                .filter(Boolean).join(' | ');
-            ensureAccounting();
-            state.accounting.allocations.push({
-                id: uid('ALLOC'), kind: 'PURCHASE_TO_ARMORY', purchaseId: purchase.id,
-                movementId: dep.id, itemId: dep.itemId, qty: remaining,
-                billableTotal: dep.billableTotal, createdAt: new Date().toISOString(), status: 'ACTIVE'
+            const purchasedQty=selected.reduce(function(n,p){return n+Number(p.qty||0);},0);
+            if (purchasedQty>depQty) return;
+            const baselineQty=depQty-purchasedQty;
+            dep.purchaseAllocationIds=selected.map(function(p){return p.id;});
+            dep.ownership='PERSONAL_PURCHASE_PENDING_REIMBURSEMENT';
+            dep.provenanceStatus=baselineQty ? 'MIXED_TRACKED_AND_BASELINE' : 'TRACKED_PERSONAL_PURCHASE';
+            dep.status='RECORDED'; dep.allocationRequired=false; dep.allocationCandidateIds=[];
+            dep.mixedBaselineQty=baselineQty;
+            dep.mixedPurchasedQty=purchasedQty;
+            dep.mixedCostBasisKnown=baselineQty===0 && selected.every(function(p){return p.costBasisKnown!==false && Number(p.actualTotal||0)>0;});
+            dep.mixedKnownActualTotal=selected.reduce(function(n,p){return n+Number(p.actualTotal||0);},0);
+            dep.mixedKnownMvTotal=selected.reduce(function(n,p){return n+Number(p.mvTotal||0);},0);
+            dep.mixedKnownBillableTotal=selected.reduce(function(n,p){return n+Number(p.billableTotal||0);},0);
+            selected.forEach(function(p){
+                p.status='DEPOSITED'; p.depositTransactionId=dep.id;
+                p.notes=[p.notes,'Allocated automatically into mixed faction deposit '+dep.id+'.'].filter(Boolean).join(' | ');
+                ensureAccounting();
+                state.accounting.allocations.push({id:uid('ALLOC'),kind:'PURCHASE_TO_ARMORY',purchaseId:p.id,
+                    movementId:dep.id,itemId:dep.itemId,qty:Number(p.qty||0),billableTotal:Number(p.billableTotal||0),
+                    actualTotal:Number(p.actualTotal||0),mvTotal:Number(p.mvTotal||0),costBasisKnown:p.costBasisKnown!==false && Number(p.actualTotal||0)>0,
+                    createdAt:new Date().toISOString(),status:'ACTIVE'});
             });
-            changed = true;
+            dep.notes=[dep.notes,'Automatic mixed provenance: '+purchasedQty+' purchased item(s) linked'+
+                (baselineQty ? '; '+baselineQty+' pre-existing personal item(s) retained at deposit-MV baseline.' : '.')].filter(Boolean).join(' | ');
+            changed=true;
         });
+        return changed;
+    }
+
+    function recoverHistoricalMixedDepositsV0111() {
+        state.migrations = state.migrations || {};
+        if (state.migrations.mixedProvenanceV0111) return false;
+        let changed=false;
+        const deposits=liveTransactions().filter(function(dep){
+            return dep.type==='ARMORY_IN' && !dep.purchaseAllocationId && !dep.purchaseAllocationIds &&
+                dep.ownership==='PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
+                dep.provenanceStatus==='PERSONAL_BASELINE_CONFIRMED';
+        });
+        deposits.forEach(function(dep){
+            const depMs=new Date(dep.timestamp).getTime(), depQty=Number(dep.qty||0);
+            const purchases=liveTransactions().filter(function(p){
+                if(p.type!=='PURCHASE'||p.status!=='PENDING'||String(p.itemId||'')!==String(dep.itemId||''))return false;
+                const t=new Date(p.timestamp).getTime();
+                return Number.isFinite(t)&&t<=depMs&&depMs-t<=7*24*60*60*1000;
+            }).sort(function(a,b){return new Date(a.timestamp)-new Date(b.timestamp);});
+            let used=[],q=0;
+            purchases.forEach(function(p){const pq=Number(p.qty||0); if(pq>0&&q+pq<=depQty){used.push(p);q+=pq;}});
+            if(!used.length)return;
+            dep.purchaseAllocationIds=used.map(function(p){return p.id;});
+            dep.mixedPurchasedQty=q; dep.mixedBaselineQty=Math.max(0,depQty-q);
+            dep.provenanceStatus=dep.mixedBaselineQty?'MIXED_TRACKED_AND_BASELINE':'TRACKED_PERSONAL_PURCHASE';
+            dep.mixedKnownActualTotal=used.reduce(function(n,p){return n+Number(p.actualTotal||0);},0);
+            dep.mixedKnownMvTotal=used.reduce(function(n,p){return n+Number(p.mvTotal||0);},0);
+            dep.mixedKnownBillableTotal=used.reduce(function(n,p){return n+Number(p.billableTotal||0);},0);
+            used.forEach(function(p){
+                p.status='DEPOSITED'; p.depositTransactionId=dep.id;
+                p.notes=[p.notes,'v0.11.1 recovered as part of historical mixed deposit '+dep.id+'.'].filter(Boolean).join(' | ');
+            });
+            dep.notes=[dep.notes,'v0.11.1 recovered '+q+' tracked purchased item(s) inside this historical mixed deposit; remaining '+dep.mixedBaselineQty+' treated as pre-existing personal inventory.'].filter(Boolean).join(' | ');
+            changed=true;
+        });
+        state.migrations.mixedProvenanceV0111={at:new Date().toISOString(),changed:changed};
         return changed;
     }
 
@@ -2023,6 +2063,7 @@
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
             if (reconcileDisplayCaseWithdrawals(logs)) changed = true;
             if (reconcileOwnershipLots()) changed = true;
+        if (recoverHistoricalMixedDepositsV0111()) saveState();
             // Bazaar recovery must also inspect the persisted diagnostic cache. Torn's latest
             // 100-log page can advance past a purchase before a newer script version gets a
             // chance to reconcile it; recentApiEvents retains the authoritative sanitized log.
@@ -2214,7 +2255,12 @@
             pending: rows.reduce(function(n,r){ return n + (r.pending == null ? 0 : r.pending); },0),
             reimbursedKnown: rows.reduce(function(n,r){ return n + (r.known ? r.paid : 0); },0),
             knownCost: rows.reduce(function(n,r){ return n + (r.known ? r.actual : 0); },0),
-            unknownCount: rows.filter(function(r){ return !r.known; }).length
+            unknownCount: rows.filter(function(r){ return !r.known; }).length +
+                liveTransactions().filter(function(tx){
+                    return tx.type==='ARMORY_IN' && !tx.purchaseAllocationId && !tx.purchaseAllocationIds &&
+                        tx.ownership==='PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
+                        tx.provenanceStatus==='PERSONAL_BASELINE_CONFIRMED' && reimbursementOutstanding(tx)>0;
+                }).length
         };
     }
 
@@ -2782,7 +2828,7 @@
     function reimbursementDueForRoot(root) {
         if (!root) return 0;
         if (root.type === 'PURCHASE') return purchaseHasConfirmedFactionDeposit(root) ? Number(root.billableTotal || 0) : 0;
-        if (root.type === 'ARMORY_IN' && !root.purchaseAllocationId &&
+        if (root.type === 'ARMORY_IN' && !root.purchaseAllocationId && !root.purchaseAllocationIds &&
             root.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
             root.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED') {
             return Number(root.billableTotal || root.mvTotal || 0);
