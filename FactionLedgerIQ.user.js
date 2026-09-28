@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.11.2
+// @version      0.11.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.11.2';
+    const VERSION = '0.11.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -775,6 +775,16 @@
         });
         state.migrations.mixedProvenanceV0111={at:new Date().toISOString(),changed:changed};
         return changed;
+    }
+
+    function markMixedLiabilityRepairV0113() {
+        state.migrations = state.migrations || {};
+        if (state.migrations.mixedLiabilityV0113) return false;
+        const affected = liveTransactions().filter(purchaseIsMixedDepositComponent).length;
+        state.migrations.mixedLiabilityV0113 = {at:new Date().toISOString(), affectedPurchases:affected,
+            rule:'Centralized mixed-component classification: purchase components never create separate faction debt; they remain provenance/P&L evidence.'};
+        if (affected) state.detection.lastSource='v0.11.3 centralized mixed liability · '+affected+' component purchase(s)';
+        return true;
     }
 
     function markMixedLiabilityRepairV0112() {
@@ -1765,6 +1775,18 @@
     }
 
 
+    function mixedDepositForPurchase(tx) {
+        if (!tx || tx.type !== 'PURCHASE' || !tx.depositTransactionId) return null;
+        const movement = liveTransactions().find(function(m){ return m.id === tx.depositTransactionId && m.type === 'ARMORY_IN'; });
+        if (!movement || !Array.isArray(movement.purchaseAllocationIds)) return null;
+        return movement.purchaseAllocationIds.includes(tx.id) ? movement : null;
+    }
+
+    function purchaseIsMixedDepositComponent(tx) {
+        const movement = mixedDepositForPurchase(tx);
+        return !!(movement && Number(movement.mixedBaselineQty || 0) > 0);
+    }
+
     function purchaseHasConfirmedFactionDeposit(tx) {
         if (!tx || tx.type !== 'PURCHASE' || tx.status === 'VOID') return false;
         if (childrenOf(tx.id, 'ARMORY_IN').length || childrenOf(tx.id, 'DISPLAY_IN').length) return true;
@@ -1805,12 +1827,8 @@
         if (!tx || tx.status === 'VOID') return 0;
         let total = 0;
         if (tx.type === 'PURCHASE') {
-            const deposited = purchaseHasConfirmedFactionDeposit(tx);
-            if (!deposited) return 0;
-            // A mixed ARMORY_IN remains the single reimbursement obligation at its
-            // deposit-time baseline. Linked purchases explain cost basis/P&L only.
-            if (deposited.type === 'ARMORY_IN' && Array.isArray(deposited.purchaseAllocationIds) &&
-                deposited.purchaseAllocationIds.includes(tx.id) && Number(deposited.mixedBaselineQty || 0) > 0) return 0;
+            if (!purchaseHasConfirmedFactionDeposit(tx)) return 0;
+            if (purchaseIsMixedDepositComponent(tx)) return 0;
             total = Number(tx.billableTotal || 0);
         } else if (tx.type === 'ARMORY_IN' &&
             (tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
@@ -2252,7 +2270,8 @@
             const mixed = movement && movement.type === 'ARMORY_IN' && Array.isArray(movement.purchaseAllocationIds) &&
                 movement.purchaseAllocationIds.includes(tx.id) && Number(movement.mixedBaselineQty || 0) > 0;
             const depositEach = mixed ? Number(movement.billableTotal || movement.mvTotal || 0) / Math.max(1,Number(movement.qty||1)) : 0;
-            const due = mixed ? Math.round(depositEach * Number(tx.qty||0)) : Number(tx.billableTotal || 0);
+            const mixedMvShare = mixed ? Math.round(depositEach * Number(tx.qty||0)) : 0;
+            const due = mixed ? Math.max(Number(tx.billableTotal || 0), mixedMvShare) : Number(tx.billableTotal || 0);
             // Refunds for mixed deposits live on the deposit root. Allocate realized payment
             // proportionally; until then these remain potential P/L.
             const depositPaid = mixed ? Math.min(Number(movement.billableTotal||movement.mvTotal||0),
@@ -2337,9 +2356,7 @@
                     return sum + Number(r.amount || r.actualTotal || 0);
                 }, 0);
 
-                const mixedChild = deposited && deposited.type === 'ARMORY_IN' &&
-                    Array.isArray(deposited.purchaseAllocationIds) && deposited.purchaseAllocationIds.includes(tx.id) &&
-                    Number(deposited.mixedBaselineQty || 0) > 0;
+                const mixedChild = purchaseIsMixedDepositComponent(tx);
                 if (deposited && !mixedChild) {
                     factionOwesMe += Math.max(0, Number(tx.billableTotal || 0) - refunded);
                 } else if (!deposited) {
@@ -2393,10 +2410,7 @@
                 const deposited = purchaseHasConfirmedFactionDeposit(tx);
                 if (!deposited) return;
 
-                const mixedChild = deposited && deposited.type === 'ARMORY_IN' &&
-                    Array.isArray(deposited.purchaseAllocationIds) && deposited.purchaseAllocationIds.includes(tx.id) &&
-                    Number(deposited.mixedBaselineQty || 0) > 0;
-                if (mixedChild) return;
+                if (purchaseIsMixedDepositComponent(tx)) return;
                 const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
                     return sum + Number(r.amount || r.actualTotal || 0);
                 }, 0);
@@ -4073,6 +4087,10 @@
             localStorage.setItem(STATE_KEY, JSON.stringify(state));
         }
         if (markMixedLiabilityRepairV0112()) {
+            state.updatedAt = new Date().toISOString();
+            localStorage.setItem(STATE_KEY, JSON.stringify(state));
+        }
+        if (markMixedLiabilityRepairV0113()) {
             state.updatedAt = new Date().toISOString();
             localStorage.setItem(STATE_KEY, JSON.stringify(state));
         }
