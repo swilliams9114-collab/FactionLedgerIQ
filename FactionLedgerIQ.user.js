@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.12.2
+// @version      0.12.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.12.2';
+    const VERSION = '0.12.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3221,6 +3221,18 @@
             }).join('') + '</div>' : '<div class="fliq-empty">No receipts match this filter.</div>');
     }
 
+    function openingDisplayRoot(tx) {
+        if (!tx || tx.status === 'VOID') return null;
+        if (tx.type === 'ARMORY_OUT' && tx.openingInventory === true &&
+            tx.detectionMethod === 'OPENING_FACTION_DISPLAY') return tx;
+        if (tx.type === 'DISPLAY_IN' && tx.openingInventory === true && tx.parentId) {
+            const root = liveTransactions().find(function(x){return x.id===tx.parentId;});
+            if (root && root.type==='ARMORY_OUT' && root.openingInventory===true &&
+                root.detectionMethod==='OPENING_FACTION_DISPLAY') return root;
+        }
+        return null;
+    }
+
     function transactionCard(tx, pendingActions) {
         let actions = '';
 
@@ -3287,6 +3299,9 @@
             actions +
             '<div class="fliq-actions">' +
                 '<button class="fliq-btn" data-fliq="copy-receipt" data-id="' + esc(tx.id) + '">Receipt</button>' +
+                (openingDisplayRoot(tx)
+                    ? '<button class="fliq-btn" data-fliq="opening-display-to-personal" data-id="' + esc(openingDisplayRoot(tx).id) + '">Correct to Personal</button>'
+                    : '') +
                 (tx.status !== 'VOID'
                     ? '<button class="fliq-btn fliq-btn-danger" data-fliq="void" data-id="' + esc(tx.id) + '">Void</button>'
                     : '') +
@@ -3755,6 +3770,48 @@
             return;
         }
 
+        if (action === 'opening-display-to-personal' && tx) {
+            const root = openingDisplayRoot(tx);
+            if (!root) { toast('Opening Display entry is no longer available'); return; }
+            const displayChildren = childrenOf(root.id, 'DISPLAY_IN').filter(function(c){
+                return c.status !== 'VOID' && c.openingInventory === true;
+            });
+            if (!displayChildren.length) { toast('Linked opening Display entry was not found'); return; }
+            const ok = confirm('Correct ' + Number(root.qty||0).toLocaleString() + '× ' + root.itemName +
+                ' from faction-owned Display Case to personal opening stock?\n\nThis removes it from faction assets and records it as personal stock. No faction reimbursement will be created.');
+            if (!ok) return;
+            const at = new Date().toISOString();
+            root.status='VOID';
+            root.voidReason='Corrected opening inventory category: faction-owned Display Case → personal stock.';
+            root.voidedAt=at;
+            root.correctedAt=at;
+            root.correctedTo='OPENING_PERSONAL_STOCK';
+            displayChildren.forEach(function(c){
+                c.status='VOID';
+                c.voidReason='Voided with parent opening Display entry during category correction to personal stock.';
+                c.voidedAt=at;
+                c.correctedAt=at;
+            });
+            const personal={
+                id:uid('TX'),chainId:uid('CHAIN'),parentId:null,type:'PURCHASE',timestamp:root.timestamp || at,
+                itemName:root.itemName,itemId:root.itemId,qty:Number(root.qty||0),actualTotal:0,
+                mvTotal:Number(root.mvTotal||0),mvEach:Number(root.mvEach||0),
+                billableTotal:Number(root.mvTotal||0),amount:0,source:'Opening Personal Stock',destination:'Personal Inventory',
+                personName:root.personName||state.settings.playerName,personId:root.personId||state.settings.playerId,
+                ownership:'PERSONAL',status:'PENDING',openingInventory:true,costBasisKnown:false,
+                detectionMethod:'OPENING_PERSONAL_STOCK_CORRECTION',
+                correctedFromTransactionId:root.id,
+                notes:'Category correction from faction-owned opening Display inventory. Cost basis unknown; excluded from P/L. No faction debt until confirmed deposit.',
+                createdAt:at
+            };
+            state.transactions.push(personal);
+            root.correctionTransactionId=personal.id;
+            displayChildren.forEach(function(c){c.correctionTransactionId=personal.id;});
+            saveState();
+            toast('Corrected to personal opening stock · audit retained');
+            return;
+        }
+
         if (action === 'void' && tx) {
             const reason = prompt('Reason for void/correction?');
             if (reason === null) return;
@@ -4155,6 +4212,12 @@
             localStorage.setItem(STATE_KEY, JSON.stringify(state));
         }
         state.migrations = state.migrations || {};
+        if (!state.migrations.openingInventoryCategoryCorrectionV0123) {
+            state.migrations.openingInventoryCategoryCorrectionV0123={at:new Date().toISOString(),
+                rule:'Opening faction Display entries can be corrected to personal stock by voiding the original asset chain with audit reasons and creating one personal opening-stock record.'};
+            state.updatedAt=new Date().toISOString();
+            localStorage.setItem(STATE_KEY,JSON.stringify(state));
+        }
         if (!state.migrations.personalOpeningInventoryDisplayV0122) {
             state.migrations.personalOpeningInventoryDisplayV0122 = {at:new Date().toISOString(),
                 rule:'Pending Opening Personal Stock is shown as personal inventory only; it creates no faction asset or reimbursement liability.'};
