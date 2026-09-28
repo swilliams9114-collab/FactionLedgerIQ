@@ -2063,7 +2063,7 @@
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
             if (reconcileDisplayCaseWithdrawals(logs)) changed = true;
             if (reconcileOwnershipLots()) changed = true;
-        if (recoverHistoricalMixedDepositsV0111()) saveState();
+
             // Bazaar recovery must also inspect the persisted diagnostic cache. Torn's latest
             // 100-log page can advance past a purchase before a newer script version gets a
             // chance to reconcile it; recentApiEvents retains the authoritative sanitized log.
@@ -4033,6 +4033,10 @@
         recoverConfirmedLegacyProvenanceV091();
         simplifyLegacyReviewV092();
         repairLegacyAllocationPrompts();
+        if (recoverHistoricalMixedDepositsV0111()) {
+            state.updatedAt = new Date().toISOString();
+            localStorage.setItem(STATE_KEY, JSON.stringify(state));
+        }
         injectStyles();
         ensurePanel();
         ensureDockButton();
