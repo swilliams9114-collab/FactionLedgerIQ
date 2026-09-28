@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.12.0
+// @version      0.12.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.12.0';
+    const VERSION = '0.12.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1783,8 +1783,17 @@
     }
 
     function purchaseIsMixedDepositComponent(tx) {
-        const movement = mixedDepositForPurchase(tx);
-        return !!(movement && Number(movement.mixedBaselineQty || 0) > 0);
+        return !!mixedDepositForPurchase(tx);
+    }
+
+    function isAggregatePersonalDeposit(tx) {
+        return !!(tx && tx.type === 'ARMORY_IN' && !tx.purchaseAllocationId &&
+            (Array.isArray(tx.purchaseAllocationIds) ||
+             tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
+             (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
+              (tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED' ||
+               tx.provenanceStatus === 'MIXED_TRACKED_AND_BASELINE' ||
+               tx.provenanceStatus === 'TRACKED_PERSONAL_PURCHASE'))));
     }
 
     function purchaseHasConfirmedFactionDeposit(tx) {
@@ -1854,10 +1863,7 @@
             if (!purchaseHasConfirmedFactionDeposit(tx)) return 0;
             if (purchaseIsMixedDepositComponent(tx)) return 0;
             total = Number(tx.billableTotal || 0);
-        } else if (tx.type === 'ARMORY_IN' &&
-            (tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
-             (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' && tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED')) &&
-            !tx.purchaseAllocationId) total = reimbursementCalculation(tx).due;
+        } else if (isAggregatePersonalDeposit(tx)) total = reimbursementCalculation(tx).due;
         else return 0;
         const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum,r) { return sum + Number(r.amount || r.actualTotal || 0); },0);
         return Math.max(0,total-refunded);
@@ -2388,10 +2394,7 @@
                 }
             }
 
-            if (tx.type === 'ARMORY_IN' &&
-                (tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
-                 (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
-                  tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED'))) {
+            if (isAggregatePersonalDeposit(tx)) {
                 const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
                     return sum + Number(r.amount || r.actualTotal || 0);
                 }, 0);
@@ -2457,11 +2460,7 @@
                 return;
             }
 
-            if (tx.type === 'ARMORY_IN' &&
-                (tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
-                 (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
-                  tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED')) &&
-                !tx.purchaseAllocationId) {
+            if (isAggregatePersonalDeposit(tx)) {
                 const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
                     return sum + Number(r.amount || r.actualTotal || 0);
                 }, 0);
@@ -2904,11 +2903,7 @@
             if (purchaseIsMixedDepositComponent(root)) return 0;
             return purchaseHasConfirmedFactionDeposit(root) ? Number(root.billableTotal || 0) : 0;
         }
-        if (root.type === 'ARMORY_IN' && !root.purchaseAllocationId &&
-            (root.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
-             (root.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' && root.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED'))) {
-            return reimbursementCalculation(root).due;
-        }
+        if (isAggregatePersonalDeposit(root)) return reimbursementCalculation(root).due;
         return 0;
     }
 
@@ -2990,9 +2985,7 @@
         // Exact/near-simultaneous personal Armory deposits are displayed as one restock batch.
         // This is presentation-only: the underlying transactions and accounting remain separate.
         const deposits = roots.filter(function (tx) {
-            return tx.type === 'ARMORY_IN' && !tx.purchaseAllocationId &&
-                (tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
-                 (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' && tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED'));
+            return isAggregatePersonalDeposit(tx);
         });
         deposits.forEach(function (tx) {
             if (consumed.has(tx.id)) return;
@@ -4147,6 +4140,25 @@
                 rule:'All personal faction deposits: known purchase portions bill at max(actual,MV); previously held remainder bills at deposit-time MV. Receipts share this calculation; personal P/L stays private.'};
             state.updatedAt = new Date().toISOString();
             localStorage.setItem(STATE_KEY, JSON.stringify(state));
+        }
+        if (!state.migrations.aggregateDepositEligibilityV0121) {
+            let repaired=0;
+            liveTransactions().forEach(function(dep){
+                if (dep.type!=='ARMORY_IN' || !Array.isArray(dep.purchaseAllocationIds) || !dep.purchaseAllocationIds.length) return;
+                const linked=dep.purchaseAllocationIds.some(function(id){
+                    return liveTransactions().some(function(p){return p.id===id&&p.type==='PURCHASE'&&p.depositTransactionId===dep.id;});
+                });
+                if (!linked) return;
+                if (dep.ownership!=='PERSONAL_PURCHASE_PENDING_REIMBURSEMENT') {
+                    dep.ownership='PERSONAL_PURCHASE_PENDING_REIMBURSEMENT'; repaired++;
+                }
+                if (!dep.provenanceStatus || dep.provenanceStatus==='PERSONAL_BASELINE_CONFIRMED')
+                    dep.provenanceStatus=Number(dep.mixedBaselineQty||0)>0?'MIXED_TRACKED_AND_BASELINE':'TRACKED_PERSONAL_PURCHASE';
+            });
+            state.migrations.aggregateDepositEligibilityV0121={at:new Date().toISOString(),repaired:repaired,
+                rule:'Plural purchase allocations identify one aggregate personal-deposit reimbursement root; component purchases are provenance only.'};
+            state.updatedAt=new Date().toISOString();
+            localStorage.setItem(STATE_KEY,JSON.stringify(state));
         }
         injectStyles();
         ensurePanel();
