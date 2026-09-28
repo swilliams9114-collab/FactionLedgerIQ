@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.10.3
+// @version      0.11.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.10.3';
+    const VERSION = '0.11.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2184,6 +2184,71 @@
         return id ? name + ' [' + id + ']' : name;
     }
 
+    function profitLossRows() {
+        const rows = [];
+        liveTransactions().forEach(function (tx) {
+            if (tx.type !== 'PURCHASE' || !purchaseHasConfirmedFactionDeposit(tx)) return;
+            const due = Number(tx.billableTotal || 0);
+            const paid = Math.min(due, receiptRefunds(tx));
+            const known = tx.costBasisKnown !== false && Number(tx.actualTotal || 0) > 0;
+            const cost = known ? Number(tx.actualTotal || 0) : 0;
+            const realizedCost = due > 0 ? Math.round(cost * (paid / due)) : 0;
+            const pendingPaid = Math.max(0, due - paid);
+            const pendingCost = Math.max(0, cost - realizedCost);
+            rows.push({
+                id: tx.id, itemName: tx.itemName || 'Item', qty: Number(tx.qty || 0),
+                actual: cost, mv: Number(tx.mvTotal || 0), billed: due, paid: paid,
+                known: known, realized: known ? paid - realizedCost : null,
+                pending: known ? pendingPaid - pendingCost : null,
+                timestamp: tx.timestamp, source: tx.source || ''
+            });
+        });
+        return rows;
+    }
+
+    function profitLossSummary() {
+        const rows = profitLossRows();
+        return {
+            rows: rows,
+            realized: rows.reduce(function(n,r){ return n + (r.realized == null ? 0 : r.realized); },0),
+            pending: rows.reduce(function(n,r){ return n + (r.pending == null ? 0 : r.pending); },0),
+            reimbursedKnown: rows.reduce(function(n,r){ return n + (r.known ? r.paid : 0); },0),
+            knownCost: rows.reduce(function(n,r){ return n + (r.known ? r.actual : 0); },0),
+            unknownCount: rows.filter(function(r){ return !r.known; }).length
+        };
+    }
+
+    function signedMoney(v) {
+        const n = Math.round(Number(v || 0));
+        return (n > 0 ? '+' : n < 0 ? '-' : '') + money(Math.abs(n));
+    }
+
+    function renderProfitLossBreakdown() {
+        const p = profitLossSummary();
+        return '<div class="fliq-card" style="grid-column:1/-1">' +
+            '<div class="fliq-item-top"><div><span class="fliq-muted">Personal faction sales P/L</span><b class="' + (p.realized >= 0 ? 'fliq-good' : 'fliq-bad') + '">' + signedMoney(p.realized) + ' realized</b></div>' +
+            '<button class="fliq-btn" type="button" data-fliq="toggle-profit-loss-breakdown">Hide</button></div>' +
+            '<div class="fliq-muted">Pending potential P/L: ' + signedMoney(p.pending) + ' · Unknown cost basis excluded: ' + p.unknownCount + '</div>' +
+            (p.rows.length ? '<div class="fliq-list" style="margin-top:10px">' + p.rows.map(function(r){
+                return '<div class="fliq-item"><div class="fliq-item-top"><b>' + esc(r.itemName) + ' × ' + r.qty.toLocaleString() + '</b><span class="fliq-pill">' + (r.paid >= r.billed ? 'REALIZED' : 'PENDING') + '</span></div>' +
+                    (r.known ? '<div>Actual cost ' + money(r.actual) + ' · MV ' + money(r.mv) + ' · Billed ' + money(r.billed) + '</div>' +
+                    '<div><b>' + (r.paid > 0 ? 'Realized P/L ' + signedMoney(r.realized) : 'Potential P/L ' + signedMoney(r.pending)) + '</b></div>'
+                    : '<div>Cost basis: Unknown · Billed ' + money(r.billed) + '</div><div class="fliq-muted">Excluded from calculated profit/loss.</div>') +
+                    '<div class="fliq-muted">' + esc(new Date(r.timestamp).toLocaleString()) + ' · ' + esc(r.source) + '</div></div>';
+            }).join('') + '</div>' : '<div class="fliq-empty">No faction reimbursement sales with tracked cost basis yet.</div>') +
+        '</div>';
+    }
+
+    function openingInventoryForm() {
+        return '<form id="fliq-opening-form" class="fliq-card">' +
+            row(field('Opening inventory type','<select name="openingType"><option value="FACTION_DISPLAY">Faction-owned · already in Display Case</option><option value="PERSONAL_STOCK">Personal stock · planned faction sale</option></select>'),
+                field('Search Torn items', itemSearchControl())) +
+            row(field('Quantity','<input name="qty" type="number" min="1" value="1" required>'),
+                field('Known total cost basis (personal stock only)','<input name="costBasis" type="number" min="0" step="1" placeholder="Leave blank if unknown">')) +
+            '<div class="fliq-muted">Faction Display entries create $0 reimbursement. Personal stock remains yours until a confirmed faction deposit. Unknown cost basis is excluded from P/L.</div>' +
+            '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Add Opening Inventory</button></div></form>';
+    }
+
     function balances() {
         let factionOwesMe = 0;
         let iOweFaction = 0;
@@ -2478,14 +2543,18 @@
 
     function renderDashboard() {
         const b = balances();
+        const p = profitLossSummary();
 
         return '<div class="fliq-grid">' +
             card('Faction owes me', money(b.factionOwesMe), 'fliq-good', 'toggle-faction-owes-breakdown') +
             card('I owe faction', money(b.iOweFaction), 'fliq-bad') +
             card('Ready for faction to collect', money(b.readyToCollect), 'fliq-warn') +
             card('Faction assets held', money(b.assetsHeld), '') +
+            card('Realized personal P/L', signedMoney(p.realized), p.realized >= 0 ? 'fliq-good' : 'fliq-bad', 'toggle-profit-loss-breakdown') +
+            card('Pending potential P/L', signedMoney(p.pending), p.pending >= 0 ? 'fliq-good' : 'fliq-bad', 'toggle-profit-loss-breakdown') +
         '</div>' +
         (state.ui && state.ui.showFactionOwesBreakdown ? '<div class="fliq-section">' + renderFactionOwesBreakdown() + '</div>' : '') +
+        (state.ui && state.ui.showProfitLossBreakdown ? '<div class="fliq-section">' + renderProfitLossBreakdown() + '</div>' : '') +
         '<div class="fliq-section"><h3>Quick Record</h3>' + eventForm() + '</div>' +
         '<div class="fliq-section"><h3>Ledger Status</h3>' +
             '<div class="fliq-card">' +
@@ -2657,6 +2726,7 @@
             : '<div class="fliq-empty">Whitelist is empty.</div>';
 
         return '<div class="fliq-section"><h3>Display Case Ledger</h3>' + inventoryHtml + '</div>' +
+            '<div class="fliq-section"><h3>Opening Inventory</h3>' + openingInventoryForm() + '</div>' +
             '<div class="fliq-section"><h3>Whitelist</h3>' +
                 '<form id="fliq-whitelist-form" class="fliq-card">' +
                     row(
@@ -2747,13 +2817,21 @@
         const items = {};
         roots.forEach(function (root) {
             const key = String(root.itemId || root.itemName || root.id);
-            if (!items[key]) items[key] = { itemName: root.itemName || 'Item', itemId: root.itemId || '', qty: 0, due: 0, paid: 0 };
+            if (!items[key]) items[key] = { itemName: root.itemName || 'Item', itemId: root.itemId || '', qty: 0, due: 0, paid: 0, actual: 0, mv: 0, knownCost: true };
             items[key].qty += Number(root.qty || 0);
             if (kind === 'REIMBURSEMENT') {
                 const due = reimbursementDueForRoot(root);
                 const paid = receiptRefunds(root);
                 items[key].due += due;
                 items[key].paid += Math.min(due, paid);
+                if (root.type === 'PURCHASE') {
+                    items[key].actual += Number(root.actualTotal || 0);
+                    items[key].mv += Number(root.mvTotal || 0);
+                    if (root.costBasisKnown === false || !(Number(root.actualTotal || 0) > 0)) items[key].knownCost = false;
+                } else {
+                    items[key].mv += Number(root.mvTotal || root.billableTotal || 0);
+                    items[key].knownCost = false;
+                }
             }
         });
         const rows = Object.keys(items).map(function (k) { return items[k]; });
@@ -2846,7 +2924,13 @@
             lines.push(line);
         });
         if (bundle.kind === 'REIMBURSEMENT') {
-            lines.push('', 'Amount due: ' + money(bundle.due), 'Reimbursed: ' + money(bundle.paid), 'Balance: ' + money(bundle.outstanding));
+            lines.push('');
+            bundle.items.forEach(function(item){
+                lines.push(item.itemName + ' · Actual cost: ' + (item.knownCost ? money(item.actual) : 'Unknown') +
+                    ' · MV: ' + money(item.mv) + ' · Billed: ' + money(item.due) +
+                    ' · Billing vs MV: ' + signedMoney(Number(item.due||0)-Number(item.mv||0)));
+            });
+            lines.push('Amount due: ' + money(bundle.due), 'Reimbursed: ' + money(bundle.paid), 'Balance: ' + money(bundle.outstanding));
         }
         if (bundle.kind === 'SALE') {
             lines.push('', 'Sale proceeds: ' + money(bundle.proceeds), 'Deposited to faction: ' + money(bundle.returned), 'Collected by faction: ' + money(bundle.collected));
@@ -2928,7 +3012,13 @@
         let html = '<div style="margin-top:10px;padding-top:9px;border-top:1px solid #ffffff18">';
         html += '<div><b>Person:</b> ' + esc(actor(first)) + '</div>';
         if (bundle.kind === 'REIMBURSEMENT') {
-            html += '<div><b>Amount due:</b> ' + money(bundle.due) + '</div>' +
+            html += bundle.items.map(function(item){
+                return '<div class="fliq-proof"><b>' + esc(item.itemName) + '</b><div>Actual cost: ' + (item.knownCost ? money(item.actual) : 'Unknown') +
+                    ' · MV: ' + money(item.mv) + ' · Billed: ' + money(item.due) + '</div>' +
+                    '<div class="fliq-muted">Billing vs MV: ' + signedMoney(Number(item.due||0)-Number(item.mv||0)) +
+                    (item.knownCost ? ' · Potential P/L: ' + signedMoney(Number(item.due||0)-Number(item.actual||0)) : ' · P/L excluded: unknown cost basis') + '</div></div>';
+            }).join('') +
+                '<div><b>Amount due:</b> ' + money(bundle.due) + '</div>' +
                 '<div><b>Reimbursed:</b> ' + money(bundle.paid) + '</div>' +
                 '<div><b>Remaining:</b> ' + money(bundle.outstanding) + '</div>';
         }
@@ -3176,7 +3266,7 @@
             '<input id="fliq-import-file" type="file" accept=".json,application/json" style="display:none">' +
         '</div></div>' +
         '<div class="fliq-section"><h3>About</h3><div class="fliq-card fliq-muted">' +
-            'v' + VERSION + ' performs no Torn game actions. Legacy/test cleanup is audit-safe: eligible unresolved records can be archived as VOID without deletion, and linked/allocated records are blocked from cleanup. Faction-owned lots support partial returns plus partial Item Market, Bazaar, and Trade sales without creating false reimbursements.' +
+            'v' + VERSION + ' performs no Torn game actions. Opening inventory is explicitly labeled and additive; it does not rewrite historical transactions. Personal P/L uses known acquisition cost only, and unknown cost basis is excluded.  Legacy/test cleanup is audit-safe: eligible unresolved records can be archived as VOID without deletion, and linked/allocated records are blocked from cleanup. Faction-owned lots support partial returns plus partial Item Market, Bazaar, and Trade sales without creating false reimbursements.' +
         '</div></div>';
     }
 
@@ -3225,6 +3315,48 @@
             saveState();
             toast('Added to whitelist');
             return;
+        }
+
+        if (form.id === 'fliq-opening-form') {
+            const openingType = formValue(fd, 'openingType');
+            const itemName = formValue(fd, 'itemName');
+            const itemId = formValue(fd, 'itemId');
+            const qty = Math.max(1, Number(fd.get('qty') || 1));
+            const rawCost = formValue(fd, 'costBasis');
+            if (!itemName || !itemId) { toast('Choose an item from the Torn item list'); return; }
+            let mvEach = 0;
+            const catalogItem = itemCatalog.find(function(x){ return String(x.id) === String(itemId); });
+            if (catalogItem) mvEach = Math.max(0, Number(catalogItem.marketValue || 0));
+            const mvTotal = mvEach * qty;
+            if (openingType === 'FACTION_DISPLAY') {
+                const root = {
+                    id: uid('TX'), chainId: uid('CHAIN'), parentId: null, type: 'ARMORY_OUT',
+                    timestamp: new Date().toISOString(), itemName:itemName, itemId:itemId, qty:qty,
+                    actualTotal:0, mvTotal:mvTotal, mvEach:mvEach, billableTotal:0, amount:0,
+                    source:'Opening Inventory', destination:'Display Case', personName:state.settings.playerName,
+                    personId:state.settings.playerId, ownership:'FACTION', status:'DISPLAY',
+                    openingInventory:true, detectionMethod:'OPENING_FACTION_DISPLAY',
+                    notes:'Opening inventory: faction-owned asset already held in Display Case. No reimbursement created.',
+                    createdAt:new Date().toISOString()
+                };
+                state.transactions.push(root);
+                addChild(root,'DISPLAY_IN',{source:'Opening Inventory',destination:'Display Case',ownership:'FACTION',status:'DISPLAY',
+                    openingInventory:true,detectionMethod:'OPENING_FACTION_DISPLAY'});
+            } else {
+                const known = rawCost !== '';
+                const actual = known ? Math.max(0,Number(rawCost||0)) : 0;
+                state.transactions.push({
+                    id:uid('TX'),chainId:uid('CHAIN'),parentId:null,type:'PURCHASE',timestamp:new Date().toISOString(),
+                    itemName:itemName,itemId:itemId,qty:qty,actualTotal:actual,mvTotal:mvTotal,mvEach:mvEach,
+                    billableTotal:billable(actual,mvTotal),amount:actual,source:'Opening Personal Stock',destination:'Personal Inventory',
+                    personName:state.settings.playerName,personId:state.settings.playerId,ownership:'PERSONAL',status:'PENDING',
+                    openingInventory:true,costBasisKnown:known,detectionMethod:'OPENING_PERSONAL_STOCK',
+                    notes:'Opening personal stock intended for future faction sale. No faction debt until confirmed deposit. ' +
+                        (known ? 'Known cost basis recorded.' : 'Cost basis unknown; excluded from P/L.'),
+                    createdAt:new Date().toISOString()
+                });
+            }
+            saveState(); toast('Opening inventory added'); return;
         }
 
         if (form.id === 'fliq-event-form') {
@@ -3300,6 +3432,13 @@
 
         if (action === 'close') {
             togglePanel(false);
+            return;
+        }
+
+        if (action === 'toggle-profit-loss-breakdown') {
+            state.ui = state.ui || {};
+            state.ui.showProfitLossBreakdown = !state.ui.showProfitLossBreakdown;
+            saveState();
             return;
         }
 
