@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.13.0
+// @version      0.13.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.13.0';
+    const VERSION = '0.13.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -519,7 +519,7 @@
         });
         state.detection.recentApiEvents = merged
             .sort(function (a, b) { return Number(b.timestamp || 0) - Number(a.timestamp || 0); })
-            .slice(0, 40);
+             .slice(0, 250);
     }
 
     function logText(log) {
@@ -3418,6 +3418,45 @@
         }).join('') + '</div>';
     }
 
+    function historicalApiEvents() {
+        return Array.isArray(state.detection.historicalApiEvents) ? state.detection.historicalApiEvents : [];
+    }
+
+    async function searchHistoricalApiLogs(days) {
+        if (!apiKeyValue()) throw new Error('API key not configured');
+        const now=Math.floor(Date.now()/1000), from=now-(Math.max(1,Number(days||2))*86400);
+        let all=[], cursorTo=now, guard=0;
+        // Page backwards by the oldest timestamp returned. Dedup by authoritative log ID.
+        while(cursorTo>=from && guard++<20){
+            const data=await apiFetch('user/log',{from:String(from),to:String(cursorTo),limit:'100'});
+            const page=logArray(data); if(!page.length)break;
+            all=all.concat(page);
+            const stamps=page.map(x=>Number(x&&x.timestamp||0)).filter(Boolean);
+            if(!stamps.length)break;
+            const oldest=Math.min.apply(null,stamps);
+            if(oldest>=cursorTo)break;
+            cursorTo=oldest-1;
+            if(page.length<100)break;
+        }
+        const seen=new Set();
+        state.detection.historicalApiEvents=all.map(safeApiEvent).filter(Boolean).filter(function(ev){
+            const k=String(ev.id||'')||[ev.timestamp,JSON.stringify(ev.data||{})].join('|');
+            if(seen.has(k))return false;seen.add(k);return true;
+        }).sort((a,b)=>Number(b.timestamp||0)-Number(a.timestamp||0));
+        state.detection.historicalSearchAt=new Date().toISOString();
+        state.detection.historicalSearchDays=Math.max(1,Number(days||2));
+        saveState();
+        return state.detection.historicalApiEvents.length;
+    }
+
+    function renderHistoricalDiagnostics(){
+        const events=historicalApiEvents();
+        const body=events.length?'<div class="fliq-list">'+events.map(function(ev,i){
+            return '<div class="fliq-item"><div class="fliq-item-top"><b>Historical '+(i+1)+'</b><span class="fliq-pill">'+esc(ev.id||'no id')+'</span></div><pre class="fliq-diag">'+esc(JSON.stringify(ev,null,2))+'</pre></div>';
+        }).join('')+'</div>':'<div class="fliq-empty">No historical search results yet.</div>';
+        return '<div class="fliq-card"><div class="fliq-muted">Search older Torn user logs without changing ledger accounting. Results are diagnostic only.</div><div class="fliq-actions"><button class="fliq-btn" data-fliq="history-search" data-days="2">Search 2 Days</button><button class="fliq-btn" data-fliq="history-search" data-days="7">Search 7 Days</button></div></div>'+body;
+    }
+
     function renderApiDiagnostics() {
         const events = Array.isArray(state.detection.recentApiEvents) ? state.detection.recentApiEvents : [];
         if (!events.length) return '<div class="fliq-empty">No recent API events captured yet. Tap Test API first.</div>';
@@ -3501,7 +3540,7 @@
                 (state.detection.lastApiError ? '<br>Error: ' + esc(state.detection.lastApiError) : '') + '</div>' +
             '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button><button class="fliq-btn" type="button" data-fliq="create-api-key">Create FactionLedgerIQ API Key</button><button class="fliq-btn" type="button" data-fliq="test-api">Test API</button><button class="fliq-btn" type="button" data-fliq="toggle-api-diagnostics">Show API Diagnostics</button></div>' +
         '</form>' +
-        '<div id="fliq-api-diagnostics" class="fliq-section" style="display:none"><h3>Recent API Events</h3><div class="fliq-card fliq-muted" style="margin-bottom:8px">Diagnostic output excludes API keys/tokens. ' + esc(renderCatalogDiagnostic()) + '</div>' + renderApiDiagnostics() + '<h3 style="margin-top:12px">Faction Movement Candidates</h3>' + renderFactionDiagnostics() + '</div>' +
+        '<div id="fliq-api-diagnostics" class="fliq-section" style="display:none"><h3>Recent API Events</h3><div class="fliq-card fliq-muted" style="margin-bottom:8px">Diagnostic output excludes API keys/tokens. ' + esc(renderCatalogDiagnostic()) + '</div>' + renderApiDiagnostics() + '<h3 style="margin-top:12px">Historical Log Search</h3>' + renderHistoricalDiagnostics() + '<h3 style="margin-top:12px">Faction Movement Candidates</h3>' + renderFactionDiagnostics() + '</div>' +
         '<div class="fliq-section"><h3>Legacy/Test Cleanup</h3>' + renderCleanupTools() + '</div>' +
         '<div class="fliq-section"><h3>Backup & Restore</h3><div class="fliq-card">' +
             '<div class="fliq-muted">Ledger data is stored locally in TornPDA/browser storage. Export backups regularly.</div>' +
@@ -3731,6 +3770,14 @@
                 list.classList.remove('fliq-suggestions-open');
             }
             if (visible) visible.blur();
+            return;
+        }
+
+        if (action === 'history-search') {
+            const days=Math.max(1,Number(btn.dataset.days||2));
+            btn.disabled=true; btn.textContent='Searching…';
+            searchHistoricalApiLogs(days).then(function(count){render();toast('Historical search found '+count+' log(s)');})
+                .catch(function(err){btn.disabled=false;btn.textContent='Search '+days+' Days';toast('Historical search failed: '+String(err&&err.message||err));});
             return;
         }
 
