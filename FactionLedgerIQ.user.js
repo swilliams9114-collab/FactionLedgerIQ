@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.11.1
+// @version      0.11.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.11.1';
+    const VERSION = '0.11.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -775,6 +775,21 @@
         });
         state.migrations.mixedProvenanceV0111={at:new Date().toISOString(),changed:changed};
         return changed;
+    }
+
+    function markMixedLiabilityRepairV0112() {
+        state.migrations = state.migrations || {};
+        if (state.migrations.mixedLiabilityV0112) return false;
+        const affected = liveTransactions().filter(function(p){
+            if(p.type!=='PURCHASE'||!p.depositTransactionId)return false;
+            const d=liveTransactions().find(function(x){return x.id===p.depositTransactionId;});
+            return d && d.type==='ARMORY_IN' && Array.isArray(d.purchaseAllocationIds) &&
+                d.purchaseAllocationIds.includes(p.id) && Number(d.mixedBaselineQty||0)>0;
+        }).length;
+        state.migrations.mixedLiabilityV0112={at:new Date().toISOString(),affectedPurchases:affected,
+            rule:'Mixed deposit remains the single faction liability; linked purchases are provenance/P&L evidence only.'};
+        if(affected) state.detection.lastSource='v0.11.2 mixed-deposit liability dedup · '+affected+' purchase lot(s)';
+        return true;
     }
 
     function displayCaseDepositPart(log) {
@@ -1792,6 +1807,10 @@
         if (tx.type === 'PURCHASE') {
             const deposited = purchaseHasConfirmedFactionDeposit(tx);
             if (!deposited) return 0;
+            // A mixed ARMORY_IN remains the single reimbursement obligation at its
+            // deposit-time baseline. Linked purchases explain cost basis/P&L only.
+            if (deposited.type === 'ARMORY_IN' && Array.isArray(deposited.purchaseAllocationIds) &&
+                deposited.purchaseAllocationIds.includes(tx.id) && Number(deposited.mixedBaselineQty || 0) > 0) return 0;
             total = Number(tx.billableTotal || 0);
         } else if (tx.type === 'ARMORY_IN' &&
             (tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
@@ -2229,8 +2248,17 @@
         const rows = [];
         liveTransactions().forEach(function (tx) {
             if (tx.type !== 'PURCHASE' || !purchaseHasConfirmedFactionDeposit(tx)) return;
-            const due = Number(tx.billableTotal || 0);
-            const paid = Math.min(due, receiptRefunds(tx));
+            const movement = confirmedDepositForPurchase(tx);
+            const mixed = movement && movement.type === 'ARMORY_IN' && Array.isArray(movement.purchaseAllocationIds) &&
+                movement.purchaseAllocationIds.includes(tx.id) && Number(movement.mixedBaselineQty || 0) > 0;
+            const depositEach = mixed ? Number(movement.billableTotal || movement.mvTotal || 0) / Math.max(1,Number(movement.qty||1)) : 0;
+            const due = mixed ? Math.round(depositEach * Number(tx.qty||0)) : Number(tx.billableTotal || 0);
+            // Refunds for mixed deposits live on the deposit root. Allocate realized payment
+            // proportionally; until then these remain potential P/L.
+            const depositPaid = mixed ? Math.min(Number(movement.billableTotal||movement.mvTotal||0),
+                childrenOf(movement.id,'REFUND').reduce(function(n,r){return n+Number(r.amount||r.actualTotal||0);},0)) : 0;
+            const paid = mixed ? Math.min(due, Math.round(depositPaid * (Number(tx.qty||0)/Math.max(1,Number(movement.qty||1))))) :
+                Math.min(due, receiptRefunds(tx));
             const known = tx.costBasisKnown !== false && Number(tx.actualTotal || 0) > 0;
             const cost = known ? Number(tx.actualTotal || 0) : 0;
             const realizedCost = due > 0 ? Math.round(cost * (paid / due)) : 0;
@@ -2309,9 +2337,12 @@
                     return sum + Number(r.amount || r.actualTotal || 0);
                 }, 0);
 
-                if (deposited) {
+                const mixedChild = deposited && deposited.type === 'ARMORY_IN' &&
+                    Array.isArray(deposited.purchaseAllocationIds) && deposited.purchaseAllocationIds.includes(tx.id) &&
+                    Number(deposited.mixedBaselineQty || 0) > 0;
+                if (deposited && !mixedChild) {
                     factionOwesMe += Math.max(0, Number(tx.billableTotal || 0) - refunded);
-                } else {
+                } else if (!deposited) {
                     pending += 1;
                 }
             }
@@ -2362,6 +2393,10 @@
                 const deposited = purchaseHasConfirmedFactionDeposit(tx);
                 if (!deposited) return;
 
+                const mixedChild = deposited && deposited.type === 'ARMORY_IN' &&
+                    Array.isArray(deposited.purchaseAllocationIds) && deposited.purchaseAllocationIds.includes(tx.id) &&
+                    Number(deposited.mixedBaselineQty || 0) > 0;
+                if (mixedChild) return;
                 const refunded = childrenOf(tx.id, 'REFUND').reduce(function (sum, r) {
                     return sum + Number(r.amount || r.actualTotal || 0);
                 }, 0);
@@ -4034,6 +4069,10 @@
         simplifyLegacyReviewV092();
         repairLegacyAllocationPrompts();
         if (recoverHistoricalMixedDepositsV0111()) {
+            state.updatedAt = new Date().toISOString();
+            localStorage.setItem(STATE_KEY, JSON.stringify(state));
+        }
+        if (markMixedLiabilityRepairV0112()) {
             state.updatedAt = new Date().toISOString();
             localStorage.setItem(STATE_KEY, JSON.stringify(state));
         }
