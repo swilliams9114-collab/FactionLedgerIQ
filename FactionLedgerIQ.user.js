@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.16.0
+// @version      0.16.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.16.0';
+    const VERSION = '0.16.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3812,6 +3812,76 @@
             }).join('') + '</div></div>';
     }
 
+    function runReadOnlyRegressionTests() {
+        const tests = [];
+        function add(name, pass, detail) { tests.push({ name:name, pass:!!pass, detail:detail || '' }); }
+        const txs = liveTransactions();
+        const inv = displayInventory();
+        const allocs = (state.accounting && state.accounting.allocations || []).filter(function(a){ return a.status !== 'VOID'; });
+
+        add('No negative inventory quantities', inv.every(function(x){
+            return Number(x.personalQty||0) >= 0 && Number(x.factionQty||0) >= 0 &&
+                Number(x.qty||0) >= 0 && Number(x.armoryQty||0) >= 0 && Number(x.factionHeldQty||0) >= 0;
+        }), 'Checks personal, faction, Armory, Display Case and faction-held balances.');
+
+        const seen = new Set(), dupes = [];
+        allocs.forEach(function(a){
+            const key = String(a.movementId||'')+'|'+String(a.lotId||'')+'|'+String(a.kind||'');
+            if (seen.has(key)) dupes.push(key); else seen.add(key);
+        });
+        add('No duplicate active allocations', dupes.length === 0, dupes.length ? dupes.length+' duplicate allocation key(s)' : 'No duplicate movement/lot/kind allocations.');
+
+        const badFactionReimbursements = txs.filter(function(tx){
+            return tx.type === 'ARMORY_IN' && tx.ownership === 'FACTION' && reimbursementCalculation(tx).due > 0;
+        });
+        add('Faction-owned Armory returns owe $0', badFactionReimbursements.length === 0,
+            badFactionReimbursements.length ? badFactionReimbursements.length+' faction return(s) have reimbursement due.' : 'Faction property does not create reimbursement.');
+
+        const badDisplay = inv.filter(function(x){ return Number(x.qty||0) > Number(x.factionQty||0); });
+        add('Display Case stock is faction-owned', badDisplay.length === 0,
+            badDisplay.length ? badDisplay.map(function(x){return x.itemName;}).slice(0,5).join(', ') : 'Every Display Case unit is included in faction-owned quantity.');
+
+        const ipecac = txs.find(function(tx){
+            return tx.type === 'ARMORY_IN' && String(tx.itemName||'').toLowerCase() === 'ipecac syrup' && Number(tx.qty||0) === 3 &&
+                Number(tx.mvTotal||tx.billableTotal||0) === 126990;
+        });
+        add('Regression: 3× Ipecac crime deposit', !!ipecac && reimbursementCalculation(ipecac).due === 126990,
+            ipecac ? 'Expected $126,990; calculated '+money(reimbursementCalculation(ipecac).due)+'.' : 'Known Ipecac deposit not found.');
+
+        const ipecacInv = inv.find(function(x){ return String(x.itemName||'').toLowerCase() === 'ipecac syrup'; });
+        add('Regression: Ipecac ownership', !!ipecacInv && Number(ipecacInv.personalQty||0) === 367 && Number(ipecacInv.factionQty||0) >= 3,
+            ipecacInv ? 'Personal '+Number(ipecacInv.personalQty||0).toLocaleString()+' · Faction '+Number(ipecacInv.factionQty||0).toLocaleString() : 'Ipecac inventory not found.');
+
+        const ebb = inv.find(function(x){ return String(x.itemName||'').toLowerCase() === 'empty blood bag'; });
+        add('Regression: Empty Blood Bag phantom 38', !!ebb && Number(ebb.personalQty||0) === 566,
+            ebb ? 'Personal stock '+Number(ebb.personalQty||0).toLocaleString()+'; expected 566.' : 'Empty Blood Bag inventory not found.');
+
+        const before = JSON.stringify({
+            txCount: state.transactions.length,
+            allocCount: allocs.length,
+            inventory: inv.map(function(x){return [x.itemId,x.itemName,x.qty,x.armoryQty,x.factionQty,x.personalQty,x.factionHeldQty];})
+        });
+        const after = JSON.stringify({
+            txCount: state.transactions.length,
+            allocCount: (state.accounting && state.accounting.allocations || []).filter(function(a){return a.status!=='VOID';}).length,
+            inventory: displayInventory().map(function(x){return [x.itemId,x.itemName,x.qty,x.armoryQty,x.factionQty,x.personalQty,x.factionHeldQty];})
+        });
+        add('Read-only repeat is idempotent', before === after, before === after ? 'Repeated calculation did not change ledger state.' : 'Ledger-derived values changed during repeated calculation.');
+
+        return {version:VERSION, generatedAt:new Date().toISOString(), passed:tests.filter(function(t){return t.pass;}).length,
+            failed:tests.filter(function(t){return !t.pass;}).length, tests:tests};
+    }
+
+    function renderTestCenter() {
+        const r = runReadOnlyRegressionTests();
+        return '<div class="fliq-card"><div class="fliq-item-top"><b>Read-Only Test Center</b><span class="fliq-pill">'+
+            r.passed+' PASS · '+r.failed+' FAIL</span></div><div class="fliq-muted">These tests inspect the current ledger only. They do not create, edit, move, reimburse, or void any transaction.</div>'+
+            '<div class="fliq-list" style="margin-top:8px">'+r.tests.map(function(t){
+                return '<div class="fliq-item"><div class="fliq-item-top"><b>'+esc(t.name)+'</b><span class="fliq-pill">'+(t.pass?'PASS':'FAIL')+
+                    '</span></div><div class="fliq-muted">'+esc(t.detail)+'</div></div>';
+            }).join('')+'</div><div class="fliq-actions"><button class="fliq-btn" type="button" data-fliq="copy-test-report">Copy Test Report</button></div></div>';
+    }
+
     function renderSettings() {
         return '<form id="fliq-settings-form" class="fliq-card">' +
             row(
@@ -3833,6 +3903,7 @@
             '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button><button class="fliq-btn" type="button" data-fliq="create-api-key">Create FactionLedgerIQ API Key</button><button class="fliq-btn" type="button" data-fliq="test-api">Test API</button><button class="fliq-btn" type="button" data-fliq="toggle-api-diagnostics">Show API Diagnostics</button><button class="fliq-btn" type="button" data-fliq="copy-ipecac-diagnostic">Copy Ipecac Diagnostic</button></div>' +
         '</form>' +
         '<div id="fliq-api-diagnostics" class="fliq-section" style="display:none"><h3>Recent API Events</h3><div class="fliq-card fliq-muted" style="margin-bottom:8px">Diagnostic output excludes API keys/tokens. ' + esc(renderCatalogDiagnostic()) + '</div>' + renderApiDiagnostics() + '<h3 style="margin-top:12px">Historical Log Search</h3>' + renderHistoricalDiagnostics() + '<h3 style="margin-top:12px">Faction Movement Candidates</h3>' + renderFactionDiagnostics() + '</div>' +
+        '<div class="fliq-section"><h3>Test Center</h3>' + renderTestCenter() + '</div>' +
         '<div class="fliq-section"><h3>Legacy/Test Cleanup</h3>' + renderCleanupTools() + '</div>' +
         '<div class="fliq-section"><h3>Backup & Restore</h3><div class="fliq-card">' +
             '<div class="fliq-muted">Ledger data is stored locally in TornPDA/browser storage. Export backups regularly.</div>' +
@@ -4458,6 +4529,11 @@
             const out = JSON.stringify({ version: VERSION, generatedAt: new Date().toISOString(),
                 transactions: relevant, invariants:{issues:invariantIssues,duplicateAllocationKeys:duplicateMovementIds} }, null, 2);
             copyText(out).then(function () { toast('Ipecac diagnostic copied'); });
+            return;
+        }
+
+        if (action === 'copy-test-report') {
+            copyText(JSON.stringify(runReadOnlyRegressionTests(), null, 2)).then(function () { toast('Test report copied'); });
             return;
         }
 
