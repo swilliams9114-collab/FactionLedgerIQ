@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.14.5
+// @version      0.14.6
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.14.5';
+    const VERSION = '0.14.6';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -700,6 +700,29 @@
             let selected = [];
             if (exact.length === 1) selected = exact;
             else if (exact.length > 1) {
+                const allCrimeRewards = exact.every(function (p) {
+                    return p.crimeReward === true || p.detectionMethod === 'API_CRIME_REWARD' || p.source === 'Crime Reward';
+                });
+                if (allCrimeRewards) {
+                    // Equivalent crime-reward lots all have $0 acquisition cost, but faction
+                    // reimbursement must remain deposit-time MV. Consume one provenance lot
+                    // without routing the deposit through normal purchase-cost reimbursement.
+                    const crime = exact[0];
+                    crime.status = 'DEPOSITED';
+                    crime.depositTransactionId = dep.id;
+                    crime.notes = [crime.notes, 'Auto-matched to faction deposit ' + dep.id +
+                        '; crime reward remains reimbursable at deposit-time MV.'].filter(Boolean).join(' | ');
+                    dep.ownership = 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT';
+                    dep.provenanceStatus = 'PERSONAL_BASELINE_CONFIRMED';
+                    dep.status = 'RECORDED';
+                    dep.allocationRequired = false;
+                    dep.allocationCandidateIds = [];
+                    dep.crimeRewardAllocationIds = [crime.id];
+                    dep.notes = [dep.notes, 'Automatically matched equivalent Crime Reward lot ' + crime.id +
+                        '; reimbursement retained at deposit-time MV.'].filter(Boolean).join(' | ');
+                    changed = true;
+                    return;
+                }
                 dep.status='ALLOCATION_REQUIRED'; dep.allocationRequired=true;
                 dep.allocationCandidateIds=exact.map(function(p){return p.id;});
                 return;
