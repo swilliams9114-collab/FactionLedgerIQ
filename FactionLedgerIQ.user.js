@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.17.0
+// @version      0.17.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.17.0';
+    const VERSION = '0.17.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2355,6 +2355,13 @@
             logs.forEach(function (log) { rememberFactionCandidate(log); });
             if (suppressDuplicateArmoryOuts()) changed = true;
             if (reconcileLegacyPurchaseDuplicates()) changed = true;
+            // Reconcile purchase logs before Armory deposits. A purchase and its later deposit
+            // can both be present on the same API page; creating the deposit first would make
+            // provenance reconciliation miss the purchase until a later poll (or permanently
+            // if the deposit was classified as a faction return by interim lot reconciliation).
+            for (const log of logs) {
+                if (await reconcileApiPurchase(log)) changed = true;
+            }
             if (await reconcileFactionMovement(logs)) changed = true;
             if (reconcilePurchasesToArmoryDeposits()) changed = true;
             if (reconcileDisplayCaseDeposits(logs)) changed = true;
@@ -2382,9 +2389,6 @@
             if (await reconcileFactionBalanceCredits(logs)) changed = true;
             if (await reconcileFactionCollections(logs)) changed = true;
             if (await reconcileFactionBalance()) changed = true;
-            for (const log of logs) {
-                if (await reconcileApiPurchase(log)) changed = true;
-            }
             state.detection.lastApiPollAt = new Date().toISOString();
             state.detection.lastApiError = '';
             state.detection.apiStatus = 'Connected';
