@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.14.3
+// @version      0.14.4
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.14.3';
+    const VERSION = '0.14.4';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -4524,7 +4524,53 @@
         }
     }
 
+    function repairKnownEmptyBloodBagTestLotsV0144() {
+        state.migrations = state.migrations || {};
+        if (state.migrations.emptyBloodBagTestLotRepairV0144) return false;
+
+        // One-time, deliberately narrow repair for the four historical Empty Blood Bag
+        // test PURCHASE roots that inflated Personal stock by exactly 38 (7+21+9+1).
+        // Never delete history and never touch linked/allocated/deposited records.
+        const wanted = [1, 7, 9, 21];
+        const candidates = liveTransactions().filter(function (tx) {
+            if (tx.type !== 'PURCHASE' || String(tx.itemId || '') !== '731') return false;
+            if (tx.status !== 'PENDING' || tx.ownership !== 'PERSONAL') return false;
+            if (!wanted.includes(Number(tx.qty || 0))) return false;
+            if (childrenOf(tx.id).length || purchaseHasConfirmedFactionDeposit(tx)) return false;
+            const lot = lotForSource(tx.id);
+            if (lot && allocatedQty(lot.id) > 0) return false;
+            return true;
+        });
+
+        const qtys = candidates.map(function (tx) { return Number(tx.qty || 0); }).sort(function (a,b) { return a-b; });
+        const exactFingerprint = qtys.length === 4 && qtys.every(function (q, i) { return q === wanted[i]; });
+        let archived = 0;
+
+        if (exactFingerprint) {
+            candidates.forEach(function (tx) {
+                if (!archiveTestTransaction(tx)) return;
+                tx.voidReason = 'v0.14.4 verified Empty Blood Bag test-lot repair; excluded from live Personal stock';
+                tx.notes = [tx.notes, 'v0.14.4: historical test lot retained in audit history but excluded from live inventory.']
+                    .filter(Boolean).join(' | ');
+                archived += 1;
+            });
+        }
+
+        state.migrations.emptyBloodBagTestLotRepairV0144 = {
+            at: new Date().toISOString(),
+            archived: archived,
+            expectedQty: 38,
+            matchedQty: candidates.reduce(function (n, tx) { return n + Number(tx.qty || 0); }, 0),
+            rule: 'Only the exact four unlinked/unallocated item 731 test roots (1,7,9,21) may be voided; otherwise make no accounting change.'
+        };
+        if (archived) state.detection.lastSource = 'v0.14.4 inventory repair · 38 Empty Blood Bag test units excluded';
+        state.updatedAt = new Date().toISOString();
+        localStorage.setItem(STATE_KEY, JSON.stringify(state));
+        return archived > 0;
+    }
+
     function init() {
+        repairKnownEmptyBloodBagTestLotsV0144();
         migrateLegacyOwnershipForV090();
         recoverConfirmedLegacyProvenanceV091();
         simplifyLegacyReviewV092();
