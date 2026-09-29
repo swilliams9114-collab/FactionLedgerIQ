@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.16.5
+// @version      0.17.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.16.5';
+    const VERSION = '0.17.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3968,6 +3968,82 @@
             failed:tests.filter(function(t){return !t.pass;}).length, tests:tests};
     }
 
+    function runFullSystemAudit() {
+        const base = runReadOnlyRegressionTests();
+        const tests = base.tests.slice();
+        function add(category,name,pass,detail,mode) { tests.push({category:category,name:name,pass:pass===true,detail:detail||'',mode:mode||'AUTOMATED'}); }
+        tests.forEach(function(t){ if(!t.category)t.category='Accounting & Regression'; if(!t.mode)t.mode='AUTOMATED'; });
+
+        const txs=liveTransactions(), inv=displayInventory(), bundles=buildReceiptBundles();
+        const ids=txs.map(function(x){return x.id;});
+        add('Ledger Integrity','Transaction IDs are unique',new Set(ids).size===ids.length,
+            new Set(ids).size===ids.length ? ids.length+' live transaction IDs are unique.' : 'Duplicate live transaction IDs found.');
+
+        const orphanChildren=txs.filter(function(x){return x.parentId && !txs.some(function(p){return p.id===x.parentId;});});
+        add('Ledger Integrity','No orphan child transactions',orphanChildren.length===0,
+            orphanChildren.length ? orphanChildren.slice(0,5).map(function(x){return x.id;}).join(', ') : 'Every live child points to a live parent.');
+
+        const badNumbers=txs.filter(function(x){return ['qty','actualTotal','mvTotal','billableTotal','amount'].some(function(k){return x[k]!=null && !Number.isFinite(Number(x[k]));});});
+        add('Ledger Integrity','Transaction numeric fields are valid',badNumbers.length===0,
+            badNumbers.length ? badNumbers.slice(0,5).map(function(x){return x.id;}).join(', ') : 'No NaN/invalid numeric transaction values.');
+
+        const invalidOutstanding=txs.filter(function(x){return reimbursementOutstanding(x)<0 || saleOutstanding(x)<0;});
+        add('Accounting','Outstanding balances never go negative',invalidOutstanding.length===0,
+            invalidOutstanding.length ? invalidOutstanding.length+' invalid balance(s).' : 'Reimbursement and sale balances clamp at zero.');
+
+        const duplicateBalanceLogs=(state.detection.balanceMovements||[]).map(function(x){return String(x.logId||'');}).filter(Boolean);
+        add('API & Detection','Faction balance log IDs are unique',new Set(duplicateBalanceLogs).size===duplicateBalanceLogs.length,
+            new Set(duplicateBalanceLogs).size===duplicateBalanceLogs.length ? duplicateBalanceLogs.length+' balance movement log IDs are unique.' : 'Duplicate balance movement log IDs found.');
+
+        const badBundles=bundles.filter(function(b){return !b.id || !Array.isArray(b.members) || !Array.isArray(b.items) || Number(b.outstanding||0)<0;});
+        add('Receipts','Receipt bundles are structurally valid',badBundles.length===0,
+            badBundles.length ? badBundles.length+' malformed bundle(s).' : bundles.length+' receipt bundle(s) validated.');
+
+        const receiptErrors=[];
+        bundles.filter(receiptIsMeaningful).forEach(function(b){try{const t=bundledReceiptText(b); if(!t || !t.includes('FACTION LEDGER IQ'))receiptErrors.push(b.id);}catch(e){receiptErrors.push(b.id);}});
+        add('Receipts','Meaningful receipts render without errors',receiptErrors.length===0,
+            receiptErrors.length ? receiptErrors.slice(0,5).join(', ') : 'All '+bundles.filter(receiptIsMeaningful).length+' meaningful receipts rendered.');
+
+        const wlNames=(state.whitelist||[]).map(function(x){return normalizeItemName(x.itemName||x.name||'');}).filter(Boolean);
+        add('Whitelist','Whitelist has no duplicate normalized names',new Set(wlNames).size===wlNames.length,
+            new Set(wlNames).size===wlNames.length ? wlNames.length+' whitelist entries are unique.' : 'Duplicate normalized whitelist entries found.');
+
+        let backupPass=false;
+        try{const copy=JSON.parse(JSON.stringify(state)); backupPass=Array.isArray(copy.transactions)&&Array.isArray(copy.whitelist)&&!!copy.settings;}catch(e){}
+        add('Backup & Restore','Current state survives JSON export/import round trip',backupPass,
+            backupPass?'State serializes and parses with required top-level structures.':'State JSON round trip failed.');
+
+        const snapshot=JSON.stringify({transactions:state.transactions,accounting:state.accounting,detection:state.detection,whitelist:state.whitelist});
+        displayInventory(); buildReceiptBundles(); profitLossRows(); balances();
+        const snapshot2=JSON.stringify({transactions:state.transactions,accounting:state.accounting,detection:state.detection,whitelist:state.whitelist});
+        add('Read-only Safety','Dashboard/inventory/receipt calculations do not mutate ledger',snapshot===snapshot2,
+            snapshot===snapshot2?'Read-only render calculations left persisted ledger data unchanged.':'A read-only calculation mutated ledger state.');
+
+        const requiredFns=[parsePurchaseConfirmation,factionTransferPart,displayCaseDepositPart,displayCaseWithdrawalPart,cityShopPurchasePart,crimeRewardParts,itemMarketSalePart,factionBalanceCreditPart,incomingPlayerTransferParts];
+        add('Feature Coverage','Core detector functions are present',requiredFns.every(function(fn){return typeof fn==='function';}),
+            'Purchase, faction movement, Display Case, city shop, crime, sale, balance and incoming-transfer detectors checked.');
+
+        const live=[
+            ['Torn API event shapes','Verify real Torn logs still match every parser after Torn-side changes.'],
+            ['TornPDA UI interactions','Verify dock, forms, buttons, clipboard and file picker on the actual device.'],
+            ['Real external event delivery','Verify Torn exposes each purchase/deposit/withdrawal/sale/payment event expected by LedgerIQ.']
+        ];
+        return {version:VERSION,generatedAt:new Date().toISOString(),passed:tests.filter(function(t){return t.pass;}).length,
+            failed:tests.filter(function(t){return !t.pass;}).length,tests:tests,liveVerification:live};
+    }
+
+    function renderFullSystemAudit() {
+        const r=runFullSystemAudit();
+        const cats={}; r.tests.forEach(function(t){(cats[t.category]||(cats[t.category]=[])).push(t);});
+        return '<div class="fliq-card"><div class="fliq-item-top"><b>Full-System Bug Hunt</b><span class="fliq-pill">'+r.passed+' PASS · '+r.failed+' FAIL</span></div>'+
+            '<div class="fliq-muted">Automated audit across current ledger, accounting, detection safeguards, receipts, whitelist, backup structure and read-only behavior. No Torn actions are performed.</div>'+
+            Object.keys(cats).map(function(cat){return '<h4 style="margin:12px 0 6px">'+esc(cat)+'</h4>'+cats[cat].map(function(t){
+                return '<div class="fliq-item"><div class="fliq-item-top"><b>'+esc(t.name)+'</b><span class="fliq-pill">'+(t.pass?'PASS':'FAIL')+'</span></div><div class="fliq-muted">'+esc(t.detail)+'</div></div>';
+            }).join('');}).join('')+
+            '<h4 style="margin:12px 0 6px">Live Verification Required</h4>'+r.liveVerification.map(function(x){return '<div class="fliq-item"><b>'+esc(x[0])+'</b><div class="fliq-muted">'+esc(x[1])+'</div></div>';}).join('')+
+            '<div class="fliq-actions"><button class="fliq-btn" type="button" data-fliq="copy-full-test-report">Copy Full Test Report</button></div></div>';
+    }
+
     function renderTestCenter() {
         const r = runReadOnlyRegressionTests();
         return '<div class="fliq-card"><div class="fliq-item-top"><b>Read-Only Test Center</b><span class="fliq-pill">'+
@@ -3999,7 +4075,8 @@
             '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button><button class="fliq-btn" type="button" data-fliq="create-api-key">Create FactionLedgerIQ API Key</button><button class="fliq-btn" type="button" data-fliq="test-api">Test API</button><button class="fliq-btn" type="button" data-fliq="toggle-api-diagnostics">Show API Diagnostics</button><button class="fliq-btn" type="button" data-fliq="copy-ipecac-diagnostic">Copy Ipecac Diagnostic</button></div>' +
         '</form>' +
         '<div id="fliq-api-diagnostics" class="fliq-section" style="display:none"><h3>Recent API Events</h3><div class="fliq-card fliq-muted" style="margin-bottom:8px">Diagnostic output excludes API keys/tokens. ' + esc(renderCatalogDiagnostic()) + '</div>' + renderApiDiagnostics() + '<h3 style="margin-top:12px">Historical Log Search</h3>' + renderHistoricalDiagnostics() + '<h3 style="margin-top:12px">Faction Movement Candidates</h3>' + renderFactionDiagnostics() + '</div>' +
-        '<div class="fliq-section"><h3>Test Center</h3>' + renderTestCenter() + '</div>' +
+        '<div class="fliq-section"><h3>Full-System Test Center</h3>' + renderFullSystemAudit() + '</div>' +
+        '<div class="fliq-section"><h3>Regression Test Center</h3>' + renderTestCenter() + '</div>' +
         '<div class="fliq-section"><h3>Legacy/Test Cleanup</h3>' + renderCleanupTools() + '</div>' +
         '<div class="fliq-section"><h3>Backup & Restore</h3><div class="fliq-card">' +
             '<div class="fliq-muted">Ledger data is stored locally in TornPDA/browser storage. Export backups regularly.</div>' +
@@ -4625,6 +4702,11 @@
             const out = JSON.stringify({ version: VERSION, generatedAt: new Date().toISOString(),
                 transactions: relevant, invariants:{issues:invariantIssues,duplicateAllocationKeys:duplicateMovementIds} }, null, 2);
             copyText(out).then(function () { toast('Ipecac diagnostic copied'); });
+            return;
+        }
+
+        if (action === 'copy-full-test-report') {
+            copyText(JSON.stringify(runFullSystemAudit(), null, 2)).then(function () { toast('Full-system test report copied'); });
             return;
         }
 
