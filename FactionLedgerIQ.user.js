@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.16.3
+// @version      0.16.4
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.16.3';
+    const VERSION = '0.16.4';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3862,6 +3862,45 @@
         const ebb = inv.find(function(x){ return String(x.itemName||'').toLowerCase() === 'empty blood bag'; });
         add('Regression: Empty Blood Bag phantom 38', !!ebb && Number(ebb.personalQty||0) === 566,
             ebb ? 'Personal stock '+Number(ebb.personalQty||0).toLocaleString()+'; expected 566.' : 'Empty Blood Bag inventory not found.');
+
+        // Pure synthetic rule tests. These use local fixture math only and never touch state.
+        function syntheticPersonalDeposit(qty, mvEach) { return Math.round(qty * mvEach); }
+        function syntheticPurchaseDeposit(qty, actualEach, mvEach) { return Math.round(qty * Math.max(actualEach, mvEach)); }
+        function syntheticOutstanding(due, paid) { return Math.max(0, due - paid); }
+        function syntheticFactionSale(qty, soldEach) { return Math.round(qty * soldEach); }
+
+        add('Synthetic: personal stock bills at deposit MV',
+            syntheticPersonalDeposit(100, 16250) === 1625000,
+            '100 × $16,250 = $1,625,000 owed.');
+
+        add('Synthetic: purchase uses higher of cost or MV',
+            syntheticPurchaseDeposit(200, 1250, 1100) === 250000 &&
+            syntheticPurchaseDeposit(309, 950, 1000) === 309000,
+            'Protects both above-MV purchase cost and higher deposit MV.');
+
+        add('Synthetic: partial reimbursement leaves balance',
+            syntheticOutstanding(5850000, 3000000) === 2850000,
+            '$5,850,000 due − $3,000,000 paid = $2,850,000 outstanding.');
+
+        add('Synthetic: faction return creates no debt',
+            reimbursementCalculation({type:'ARMORY_IN',status:'RETURNED',ownership:'FACTION',qty:24,mvTotal:500000,source:'Display Case'}).due === 0,
+            'Faction-owned Display/Armory return remains $0 owed.');
+
+        add('Synthetic: raffle intake is faction property with no reimbursement',
+            reimbursementCalculation({type:'ARMORY_IN',status:'RECORDED',ownership:'FACTION',qty:10,mvTotal:1000000,source:'Raffle Intake'}).due === 0,
+            'Raffle intake cannot create member reimbursement.');
+
+        add('Synthetic: faction sale proceeds belong to faction',
+            syntheticFactionSale(500, 16500) === 8250000,
+            '500 × $16,500 sale = $8,250,000 owed to faction.');
+
+        add('Synthetic: void transaction creates no reimbursement',
+            reimbursementCalculation({type:'ARMORY_IN',status:'VOID',ownership:'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT',qty:100,mvTotal:1625000}).due === 0,
+            'VOID movements produce $0 reimbursement.');
+
+        add('Synthetic: mixed provenance counted once',
+            syntheticPurchaseDeposit(200,1250,1100) + syntheticPersonalDeposit(100,1100) + syntheticPersonalDeposit(3,42330) === 486990,
+            'Purchased + personal baseline + crime reward portions sum once to $486,990.');
 
         const before = JSON.stringify({
             txCount: state.transactions.length,
