@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.15.0
+// @version      0.15.1
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.15.0';
+    const VERSION = '0.15.1';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3803,7 +3803,7 @@
             '<div class="fliq-muted" data-fliq-api-status>API status: ' + esc(state.detection.apiStatus || 'Not configured') +
                 (state.detection.lastApiPollAt ? ' · Last check ' + esc(new Date(state.detection.lastApiPollAt).toLocaleTimeString()) : '') +
                 (state.detection.lastApiError ? '<br>Error: ' + esc(state.detection.lastApiError) : '') + '</div>' +
-            '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button><button class="fliq-btn" type="button" data-fliq="create-api-key">Create FactionLedgerIQ API Key</button><button class="fliq-btn" type="button" data-fliq="test-api">Test API</button><button class="fliq-btn" type="button" data-fliq="toggle-api-diagnostics">Show API Diagnostics</button></div>' +
+            '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="submit">Save Settings</button><button class="fliq-btn" type="button" data-fliq="create-api-key">Create FactionLedgerIQ API Key</button><button class="fliq-btn" type="button" data-fliq="test-api">Test API</button><button class="fliq-btn" type="button" data-fliq="toggle-api-diagnostics">Show API Diagnostics</button><button class="fliq-btn" type="button" data-fliq="copy-ipecac-diagnostic">Copy Ipecac Diagnostic</button></div>' +
         '</form>' +
         '<div id="fliq-api-diagnostics" class="fliq-section" style="display:none"><h3>Recent API Events</h3><div class="fliq-card fliq-muted" style="margin-bottom:8px">Diagnostic output excludes API keys/tokens. ' + esc(renderCatalogDiagnostic()) + '</div>' + renderApiDiagnostics() + '<h3 style="margin-top:12px">Historical Log Search</h3>' + renderHistoricalDiagnostics() + '<h3 style="margin-top:12px">Faction Movement Candidates</h3>' + renderFactionDiagnostics() + '</div>' +
         '<div class="fliq-section"><h3>Legacy/Test Cleanup</h3>' + renderCleanupTools() + '</div>' +
@@ -4394,6 +4394,30 @@
             const showing = box.style.display !== 'none';
             box.style.display = showing ? 'none' : 'block';
             btn.textContent = showing ? 'Show API Diagnostics' : 'Hide API Diagnostics';
+            return;
+        }
+
+        if (action === 'copy-ipecac-diagnostic') {
+            const relevant = liveTransactions().filter(function (tx) {
+                return String(tx.itemName || '').toLowerCase().includes('ipecac') ||
+                    String(tx.itemId || '') === '128' ||
+                    (tx.type === 'ARMORY_IN' && Number(tx.billableTotal || tx.mvTotal || 0) === 126990);
+            }).map(function (tx) {
+                return {
+                    id: tx.id, parentId: tx.parentId || null, type: tx.type, status: tx.status,
+                    itemId: tx.itemId, itemName: tx.itemName, qty: tx.qty, timestamp: tx.timestamp,
+                    ownership: tx.ownership || null, source: tx.source || null, crimeReward: !!tx.crimeReward,
+                    actualTotal: tx.actualTotal, mvTotal: tx.mvTotal, billableTotal: tx.billableTotal,
+                    depositTransactionId: tx.depositTransactionId || null,
+                    purchaseAllocationId: tx.purchaseAllocationId || null,
+                    purchaseAllocationIds: tx.purchaseAllocationIds || null,
+                    crimeRewardAllocationIds: tx.crimeRewardAllocationIds || null,
+                    baselineQty: tx.baselineQty, mixedBaselineQty: tx.mixedBaselineQty,
+                    reimbursement: tx.type === 'ARMORY_IN' ? reimbursementCalculation(tx) : null
+                };
+            });
+            const out = JSON.stringify({ version: VERSION, generatedAt: new Date().toISOString(), transactions: relevant }, null, 2);
+            copyText(out).then(function () { toast('Ipecac diagnostic copied'); });
             return;
         }
 
