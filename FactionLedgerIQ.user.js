@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.14.7
+// @version      0.14.8
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.14.7';
+    const VERSION = '0.14.8';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1933,6 +1933,7 @@
     function isAggregatePersonalDeposit(tx) {
         return !!(tx && tx.type === 'ARMORY_IN' && !tx.purchaseAllocationId &&
             (Array.isArray(tx.purchaseAllocationIds) ||
+             (Array.isArray(tx.crimeRewardAllocationIds) && tx.crimeRewardAllocationIds.length > 0) ||
              tx.ownership === 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT' ||
              (tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
               (tx.provenanceStatus === 'PERSONAL_BASELINE_CONFIRMED' ||
