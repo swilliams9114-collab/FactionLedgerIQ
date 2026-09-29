@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.17.1
+// @version      0.17.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.17.1';
+    const VERSION = '0.17.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1090,7 +1090,22 @@
                 const item = itemCatalog.find(function (x) { return String(x.id) === itemId; });
                 const mvEach = item ? Math.max(0, Number(item.marketValue || 0)) : 0;
                 const mvTotal = mvEach * qty;
-                const factionSource = factionHeldSourceForMovement(itemId, qty, log.timestamp);
+                // A recent unmatched personal purchase of the same item is stronger
+                // provenance evidence than an older faction-held lot. Without this guard,
+                // common items (Beer, meds, temps) can be misclassified as faction returns
+                // merely because an unrelated open faction lot of that item exists.
+                const eventMs = Number(log.timestamp || 0) * 1000;
+                const recentPersonalPurchases = liveTransactions().filter(function (p) {
+                    if (p.type !== 'PURCHASE' || p.status !== 'PENDING') return false;
+                    if (String(p.itemId || '') !== itemId) return false;
+                    const pMs = new Date(p.timestamp).getTime();
+                    return Number.isFinite(pMs) && Number.isFinite(eventMs) && pMs <= eventMs &&
+                        eventMs - pMs <= 7*24*60*60*1000;
+                });
+                const exactRecentPurchase = recentPersonalPurchases.filter(function (p) {
+                    return Number(p.qty || 0) === qty;
+                }).length === 1;
+                const factionSource = exactRecentPurchase ? null : factionHeldSourceForMovement(itemId, qty, log.timestamp);
                 if (factionSource) {
                     const returned = {
                         id: uid('TX'), chainId: factionSource.chainId || factionSource.id, parentId: factionSource.id,
@@ -3990,6 +4005,15 @@
         const badNumbers=txs.filter(function(x){return ['qty','actualTotal','mvTotal','billableTotal','amount'].some(function(k){return x[k]!=null && !Number.isFinite(Number(x[k]));});});
         add('Ledger Integrity','Transaction numeric fields are valid',badNumbers.length===0,
             badNumbers.length ? badNumbers.slice(0,5).map(function(x){return x.id;}).join(', ') : 'No NaN/invalid numeric transaction values.');
+
+        const ambiguousFactionReturnRisk=txs.filter(function(tx){
+            if(tx.type!=='ARMORY_IN'||tx.ownership!=='FACTION'||tx.detectionMethod!=='API_FACTION_ARMORY_RETURN')return false;
+            const t=new Date(tx.timestamp).getTime();
+            return txs.some(function(p){return p.type==='PURCHASE'&&p.status==='PENDING'&&String(p.itemId||'')===String(tx.itemId||'')&&
+                Number(p.qty||0)===Number(tx.qty||0)&&new Date(p.timestamp).getTime()<=t&&t-new Date(p.timestamp).getTime()<=7*24*60*60*1000;});
+        });
+        add('Ownership & Provenance','Faction returns do not shadow exact recent purchases',ambiguousFactionReturnRisk.length===0,
+            ambiguousFactionReturnRisk.length ? ambiguousFactionReturnRisk.length+' Armory return(s) conflict with an exact recent pending purchase.' : 'No faction-return classification shadows an exact recent purchase.');
 
         const invalidOutstanding=txs.filter(function(x){return reimbursementOutstanding(x)<0 || saleOutstanding(x)<0;});
         add('Accounting','Outstanding balances never go negative',invalidOutstanding.length===0,
