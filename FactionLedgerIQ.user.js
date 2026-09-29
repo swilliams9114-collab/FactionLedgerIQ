@@ -3276,18 +3276,29 @@
             bundle.items.forEach(function (item) {
                 const qty = Number(item.qty || 0);
                 const pricing = item.pricing || [];
-                const mixedPricing = pricing.length > 1 ||
-                    pricing.some(function (p) { return p.kind === 'BASELINE'; });
+                const hasBaseline = pricing.some(function (p) { return p.kind === 'BASELINE'; });
+                const cleanPricing = pricing.length === 1 && !hasBaseline && pricing[0].kind === 'PURCHASE';
+                const mixedPricing = pricing.length > 1 || hasBaseline;
 
                 lines.push('', '**' + item.itemName + '**');
                 lines.push('Qty: ' + qty.toLocaleString());
 
                 // Only show price detail when one clean purchase basis exists.
                 // Mixed-source/rate items stay intentionally compact: total quantity + total owed.
-                if (!mixedPricing && item.knownCost && qty > 0 && Number(item.actual || 0) > 0) {
-                    const actualEach = Number(item.actual || 0) / qty;
-                    const mvEach = Number(item.mv || 0) / qty;
-                    totalActual += Number(item.actual || 0);
+                let actualTotal = 0;
+                let mvTotal = 0;
+                if (cleanPricing) {
+                    actualTotal = Number(pricing[0].actual || 0);
+                    mvTotal = Number(pricing[0].mv || 0);
+                } else if (!pricing.length && item.knownCost) {
+                    actualTotal = Number(item.actual || 0);
+                    mvTotal = Number(item.mv || 0);
+                }
+
+                if (!mixedPricing && qty > 0 && actualTotal > 0) {
+                    const actualEach = actualTotal / qty;
+                    const mvEach = mvTotal / qty;
+                    totalActual += actualTotal;
                     hasActual = true;
                     if (Math.round(actualEach) === Math.round(mvEach)) {
                         lines.push('Paid/MV: ' + money(actualEach) + ' ea');
@@ -3295,15 +3306,21 @@
                         lines.push('Paid: ' + money(actualEach) + ' ea');
                         lines.push('MV: ' + money(mvEach) + ' ea');
                     }
-                } else if (!mixedPricing && !item.knownCost && qty > 0 && Number(item.mv || 0) > 0) {
+                } else if (!mixedPricing && !cleanPricing && !item.knownCost && qty > 0 && Number(item.mv || 0) > 0) {
                     lines.push('MV: ' + money(Number(item.mv || 0) / qty) + ' ea');
                 }
 
                 lines.push('Owed: **' + money(item.due) + '**');
             });
 
+            const allItemsHaveCleanPurchaseCost = bundle.items.length > 0 && bundle.items.every(function (item) {
+                const pricing = item.pricing || [];
+                return (pricing.length === 1 && pricing[0].kind === 'PURCHASE' && Number(pricing[0].actual || 0) > 0) ||
+                    (!pricing.length && item.knownCost && Number(item.actual || 0) > 0);
+            });
+
             lines.push('');
-            if (hasActual) lines.push('**TOTAL PAID:** ' + money(totalActual));
+            if (hasActual && allItemsHaveCleanPurchaseCost) lines.push('**TOTAL PAID:** ' + money(totalActual));
             lines.push('**TOTAL OWED:** ' + money(bundle.due));
             if (Number(bundle.paid || 0) > 0) {
                 lines.push('Reimbursed: ' + money(bundle.paid));
