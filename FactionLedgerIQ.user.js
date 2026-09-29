@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.15.3
+// @version      0.15.4
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.15.3';
+    const VERSION = '0.15.4';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3077,14 +3077,16 @@
 
             const item = map.get(key);
 
+            // Anything physically in the faction Display Case is faction-owned,
+            // regardless of the provenance label on the movement that put it there.
             if (tx.type === 'DISPLAY_IN') {
                 item.qty += Number(tx.qty || 0);
-                if (tx.ownership === 'FACTION') item.factionQty += Number(tx.qty || 0);
+                item.factionQty += Number(tx.qty || 0);
             }
 
             if (tx.type === 'DISPLAY_OUT') {
                 item.qty -= Number(tx.qty || 0);
-                if (tx.ownership === 'FACTION') item.factionQty -= Number(tx.qty || 0);
+                item.factionQty -= Number(tx.qty || 0);
             }
 
             // Any confirmed item deposit into the faction Armory becomes faction property
