@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.16.1
+// @version      0.16.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.16.1';
+    const VERSION = '0.16.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3835,7 +3835,11 @@
             return tx.type === 'ARMORY_IN' && tx.ownership === 'FACTION' && reimbursementCalculation(tx).due > 0;
         });
         add('Faction-owned Armory returns owe $0', badFactionReimbursements.length === 0,
-            badFactionReimbursements.length ? badFactionReimbursements.length+' faction return(s) have reimbursement due.' : 'Faction property does not create reimbursement.');
+            badFactionReimbursements.length ? badFactionReimbursements.map(function(tx){
+                return (tx.itemName||'Item')+' × '+Number(tx.qty||0).toLocaleString()+
+                    ' · '+tx.id+' · calculated due '+money(reimbursementCalculation(tx).due)+
+                    ' · status '+String(tx.status||'')+' · source '+String(tx.source||'');
+            }).join(' | ') : 'Faction property does not create reimbursement.');
 
         const badDisplay = inv.filter(function(x){ return Number(x.qty||0) > Number(x.factionQty||0); });
         add('Display Case stock is faction-owned', badDisplay.length === 0,
