@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.15.1
+// @version      0.15.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.15.1';
+    const VERSION = '0.15.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1989,16 +1989,27 @@
         const qty=Number(tx.qty||0);
         const depositMvTotal=Number(tx.mvTotal||tx.billableTotal||0);
         const depositMvEach=Number(tx.mvEach||0) || (qty>0 ? depositMvTotal/qty : 0);
-        const ids=Array.isArray(tx.purchaseAllocationIds)?tx.purchaseAllocationIds:[];
-        const components=ids.map(function(id){return liveTransactions().find(function(p){return p.id===id&&p.type==='PURCHASE'&&p.status!=='VOID';});}).filter(Boolean)
+        const crimeIds=Array.isArray(tx.crimeRewardAllocationIds)?tx.crimeRewardAllocationIds:[];
+        const crimeSet=new Set(crimeIds);
+        const ids=(Array.isArray(tx.purchaseAllocationIds)?tx.purchaseAllocationIds:[]).filter(function(id){return !crimeSet.has(id);});
+        const components=ids.map(function(id){return liveTransactions().find(function(p){
+            return p.id===id&&p.type==='PURCHASE'&&p.status!=='VOID'&&!p.crimeReward;
+        });}).filter(Boolean)
             .map(function(p){return {id:p.id,qty:Number(p.qty||0),actual:Number(p.actualTotal||0),mv:Number(p.mvTotal||0),
                 billed:Number(p.billableTotal||0),source:p.source||'Purchase'};});
+        const crimeComponents=crimeIds.map(function(id){return liveTransactions().find(function(p){
+            return p.id===id&&p.type==='PURCHASE'&&p.status!=='VOID'&&p.crimeReward===true;
+        });}).filter(Boolean).map(function(p){return {id:p.id,qty:Number(p.qty||0),actual:0,mv:0,
+            billed:Math.round(Number(p.qty||0)*depositMvEach),source:'Crime Reward'};});
         const purchasedQty=components.reduce(function(n,p){return n+p.qty;},0);
-        const baselineQty=Math.max(0,qty-purchasedQty);
+        const crimeQty=crimeComponents.reduce(function(n,p){return n+p.qty;},0);
+        const baselineQty=Math.max(0,qty-purchasedQty-crimeQty);
         const purchasedDue=components.reduce(function(n,p){return n+Math.max(p.actual,p.mv,p.billed);},0);
+        const crimeDue=Math.round(crimeQty*depositMvEach);
         const baselineDue=Math.round(baselineQty*depositMvEach);
-        return {due:purchasedDue+baselineDue,baselineQty:baselineQty,purchasedQty:purchasedQty,components:components,
-            depositMvEach:depositMvEach,depositMvTotal:depositMvTotal,baselineDue:baselineDue,purchasedDue:purchasedDue};
+        return {due:purchasedDue+crimeDue+baselineDue,baselineQty:baselineQty,purchasedQty:purchasedQty,crimeQty:crimeQty,
+            components:components.concat(crimeComponents),depositMvEach:depositMvEach,depositMvTotal:depositMvTotal,
+            baselineDue:baselineDue,purchasedDue:purchasedDue,crimeDue:crimeDue};
     }
 
     function reimbursementOutstanding(tx) {
@@ -4658,6 +4669,31 @@
         }
     }
 
+    function repairCrimeAllocationFieldsV0152() {
+        state.migrations = state.migrations || {};
+        if (state.migrations.crimeAllocationFieldsV0152) return false;
+        let changed = 0;
+        liveTransactions().filter(function (tx) {
+            return tx.type === 'ARMORY_IN' && Array.isArray(tx.crimeRewardAllocationIds) && tx.crimeRewardAllocationIds.length;
+        }).forEach(function (tx) {
+            const crimeIds = new Set(tx.crimeRewardAllocationIds);
+            const before = Array.isArray(tx.purchaseAllocationIds) ? tx.purchaseAllocationIds.slice() : [];
+            const after = before.filter(function (id) {
+                if (crimeIds.has(id)) return false;
+                const p = liveTransactions().find(function (x) { return x.id === id; });
+                return !(p && p.type === 'PURCHASE' && p.crimeReward === true);
+            });
+            if (after.length !== before.length) {
+                tx.purchaseAllocationIds = after;
+                changed++;
+            }
+        });
+        state.migrations.crimeAllocationFieldsV0152 = { at:new Date().toISOString(), correctedDeposits:changed };
+        state.updatedAt = new Date().toISOString();
+        localStorage.setItem(STATE_KEY, JSON.stringify(state));
+        return changed > 0;
+    }
+
     function repairRepeatedCrimeRewardAllocationsV0147() {
         state.migrations = state.migrations || {};
         if (state.migrations.crimeRewardIdempotencyRepairV0147) return false;
@@ -4742,6 +4778,7 @@
     }
 
     function init() {
+        repairCrimeAllocationFieldsV0152();
         repairRepeatedCrimeRewardAllocationsV0147();
         repairKnownEmptyBloodBagTestLotsV0144();
         migrateLegacyOwnershipForV090();
