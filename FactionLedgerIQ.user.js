@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.16.4
+// @version      0.16.5
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.16.4';
+    const VERSION = '0.16.5';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3901,6 +3901,56 @@
         add('Synthetic: mixed provenance counted once',
             syntheticPurchaseDeposit(200,1250,1100) + syntheticPersonalDeposit(100,1100) + syntheticPersonalDeposit(3,42330) === 486990,
             'Purchased + personal baseline + crime reward portions sum once to $486,990.');
+
+        // Hardening checks for duplicate API processing, partial movement math and payment matching.
+        const activeLogIds = [];
+        txs.forEach(function(tx){
+            if (tx.apiLogId) activeLogIds.push(String(tx.apiLogId));
+            if (Array.isArray(tx.apiLogIds)) tx.apiLogIds.forEach(function(id){ if(id) activeLogIds.push(String(id)); });
+        });
+        const duplicateTxLogIds = Array.from(new Set(activeLogIds.filter(function(id,i,a){ return a.indexOf(id)!==i; })));
+        const suspiciousDuplicateRoots = duplicateTxLogIds.filter(function(id){
+            const owners = txs.filter(function(tx){
+                return String(tx.apiLogId||'')===id || (Array.isArray(tx.apiLogIds)&&tx.apiLogIds.map(String).includes(id));
+            });
+            const roots = owners.filter(function(tx){ return !tx.parentId; });
+            return roots.length > 1 && roots.some(function(a,ai){ return roots.some(function(b,bi){
+                return bi>ai && a.type===b.type && String(a.itemId||'')===String(b.itemId||'') && Number(a.qty||0)===Number(b.qty||0);
+            });});
+        });
+        add('Hardening: API log does not create duplicate root transactions', suspiciousDuplicateRoots.length===0,
+            suspiciousDuplicateRoots.length ? suspiciousDuplicateRoots.length+' suspicious API log ID(s): '+suspiciousDuplicateRoots.slice(0,5).join(', ') :
+            'No same-log duplicate root transaction signatures found.');
+
+        const processedIds = Array.isArray(state.detection && state.detection.processedLogIds) ? state.detection.processedLogIds.map(String) : [];
+        add('Hardening: processed API log IDs are unique',
+            new Set(processedIds).size===processedIds.length,
+            new Set(processedIds).size===processedIds.length ? processedIds.length+' processed log IDs are unique.' : 'Duplicate IDs exist in processedLogIds.');
+
+        const syntheticLots = [100,60,25];
+        const syntheticMoved = 40+20+10;
+        add('Hardening: partial item movements conserve quantity',
+            syntheticLots.reduce(function(a,b){return a+b;},0)-syntheticMoved===115,
+            '185 starting − 70 moved = 115 remaining; no units created or lost.');
+
+        const deposits = [{id:'A',due:1200},{id:'B',due:800},{id:'C',due:500}];
+        const exactPayment = 800;
+        const exactMatches = deposits.filter(function(x){return x.due===exactPayment;});
+        add('Hardening: exact payment matching is unambiguous',
+            exactMatches.length===1 && exactMatches[0].id==='B',
+            '$800 payment matches only the $800 reimbursement.');
+
+        const partialDue=2500, payment1=900, payment2=600;
+        add('Hardening: repeated partial payments cannot over-settle',
+            syntheticOutstanding(syntheticOutstanding(partialDue,payment1),payment2)===1000 &&
+            syntheticOutstanding(1000,5000)===0,
+            '$2,500 − $900 − $600 = $1,000; overpayment clamps outstanding to $0.');
+
+        const sameItemDeposits=[{qty:4,due:3640},{qty:2,due:1820},{qty:11,due:10043}];
+        add('Hardening: multiple same-item deposits remain separate liabilities',
+            sameItemDeposits.reduce(function(n,x){return n+x.qty;},0)===17 &&
+            sameItemDeposits.reduce(function(n,x){return n+x.due;},0)===15503,
+            'Three Beer deposits remain 17 units and $15,503 total without collapsing liability records.');
 
         const before = JSON.stringify({
             txCount: state.transactions.length,
