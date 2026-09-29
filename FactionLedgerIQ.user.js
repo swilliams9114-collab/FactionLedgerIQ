@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.15.4
+// @version      0.16.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.15.4';
+    const VERSION = '0.16.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3066,63 +3066,63 @@
 
     function displayInventory() {
         const map = new Map();
+        const txs = liveTransactions().slice().sort(function(a,b){ return new Date(a.timestamp)-new Date(b.timestamp); });
 
-        liveTransactions().forEach(function (tx) {
+        function entry(tx) {
             const key = String(tx.itemId || tx.itemName || '').toLowerCase();
-            if (!key) return;
+            if (!key) return null;
+            if (!map.has(key)) map.set(key, {
+                itemName: tx.itemName, itemId: tx.itemId,
+                qty: 0, armoryQty: 0, factionQty: 0, personalQty: 0, factionHeldQty: 0
+            });
+            return map.get(key);
+        }
 
-            if (!map.has(key)) {
-                map.set(key, { itemName: tx.itemName, itemId: tx.itemId, qty: 0, factionQty: 0, personalQty: 0, factionHeldQty: 0 });
-            }
+        txs.forEach(function (tx) {
+            const item = entry(tx);
+            if (!item) return;
+            const q = Number(tx.qty || 0);
 
-            const item = map.get(key);
+            // Physical faction storage. All stock in either faction storage location is
+            // faction-owned regardless of reimbursement provenance.
+            if (tx.type === 'ARMORY_IN') item.armoryQty += q;
+            if (tx.type === 'ARMORY_OUT') item.armoryQty = Math.max(0, item.armoryQty - q);
+            if (tx.type === 'DISPLAY_IN') item.qty += q;
+            if (tx.type === 'DISPLAY_OUT') item.qty = Math.max(0, item.qty - q);
 
-            // Anything physically in the faction Display Case is faction-owned,
-            // regardless of the provenance label on the movement that put it there.
-            if (tx.type === 'DISPLAY_IN') {
-                item.qty += Number(tx.qty || 0);
-                item.factionQty += Number(tx.qty || 0);
-            }
-
-            if (tx.type === 'DISPLAY_OUT') {
-                item.qty -= Number(tx.qty || 0);
-                item.factionQty -= Number(tx.qty || 0);
-            }
-
-            // Any confirmed item deposit into the faction Armory becomes faction property
-            // immediately. Provenance/ownership fields still determine whether reimbursement
-            // is owed, but they do not change physical faction ownership after ARMORY_IN.
-            if (tx.type === 'ARMORY_IN' && tx.status === 'RECORDED') {
-                item.factionQty += Number(tx.qty || 0);
-            }
-
-            // Items withdrawn from the faction Armory are no longer physically in the Armory.
-            // Their faction provenance remains on the withdrawal/held chain for later return,
-            // sale, Display Case movement, or member distribution accounting.
-            if (tx.type === 'ARMORY_OUT' && tx.status !== 'VOID') {
-                item.factionQty -= Number(tx.qty || 0);
-            }
-
-            // Personal stock is the remaining quantity in the personal provenance lot,
-            // not the original PURCHASE quantity. This prevents historical/partially-used
-            // purchases from inflating physical personal inventory.
+            // Personal stock is remaining personal provenance, never original acquired qty.
             if (tx.type === 'PURCHASE' && tx.ownership === 'PERSONAL' &&
                 tx.status === 'PENDING' && !purchaseIsMixedDepositComponent(tx)) {
                 const lot = ensureSourceLot(tx);
                 item.personalQty += lot ? Number(lot.qtyRemaining || 0) :
-                    (!purchaseHasConfirmedFactionDeposit(tx) ? Number(tx.qty || 0) : 0);
+                    (!purchaseHasConfirmedFactionDeposit(tx) ? q : 0);
             }
 
-            // Faction-held donations/transfers are physically with the user but never
-            // personal stock and never reimbursable.
+            // Faction property temporarily held by the player. Source-lot remainder prevents
+            // partial sales/returns from overstating held stock. ARMORY_OUT is the authoritative
+            // held chain even after a Display Case round-trip, so DISPLAY_OUT is not double-counted.
+            if (tx.type === 'ARMORY_OUT' && tx.ownership === 'FACTION' &&
+                (tx.status === 'PENDING' || tx.status === 'HELD')) {
+                const heldLot = lotForSource(tx.id) || ensureSourceLot(tx);
+                item.factionHeldQty += Number(heldLot ? heldLot.qtyRemaining : q);
+            }
             if (tx.type === 'FACTION_HELD_IN' && tx.ownership === 'FACTION' && tx.status === 'HELD') {
-                const heldLot=lotForSource(tx.id)||ensureSourceLot(tx);
-                item.factionHeldQty = Number(item.factionHeldQty || 0) + Number(heldLot ? heldLot.qtyRemaining : (tx.qtyRemaining != null ? tx.qtyRemaining : tx.qty || 0));
+                const heldLot = lotForSource(tx.id) || ensureSourceLot(tx);
+                item.factionHeldQty += Number(heldLot ? heldLot.qtyRemaining : (tx.qtyRemaining != null ? tx.qtyRemaining : q));
             }
         });
 
+        // One ownership number across all locations: Armory + Display Case + faction stock
+        // temporarily held by the player. Location changes never change ownership.
+        map.forEach(function(item){
+            item.armoryQty = Math.max(0, Number(item.armoryQty || 0));
+            item.qty = Math.max(0, Number(item.qty || 0));
+            item.factionHeldQty = Math.max(0, Number(item.factionHeldQty || 0));
+            item.factionQty = item.armoryQty + item.qty + item.factionHeldQty;
+        });
+
         return Array.from(map.values()).filter(function (x) {
-            return x.qty !== 0 || x.personalQty !== 0 || Number(x.factionHeldQty||0) !== 0;
+            return x.qty !== 0 || x.armoryQty !== 0 || x.personalQty !== 0 || x.factionHeldQty !== 0;
         });
     }
 
@@ -4443,7 +4443,20 @@
                     reimbursement: tx.type === 'ARMORY_IN' ? reimbursementCalculation(tx) : null
                 };
             });
-            const out = JSON.stringify({ version: VERSION, generatedAt: new Date().toISOString(), transactions: relevant }, null, 2);
+            const inv = displayInventory();
+            const invariantIssues = [];
+            inv.forEach(function(x){
+                if (Number(x.personalQty||0) < 0 || Number(x.factionQty||0) < 0 || Number(x.qty||0) < 0 || Number(x.armoryQty||0) < 0)
+                    invariantIssues.push({itemName:x.itemName, issue:'NEGATIVE_INVENTORY', values:x});
+            });
+            const duplicateMovementIds = [];
+            const seenMovement = new Set();
+            (state.accounting && state.accounting.allocations || []).filter(function(a){return a.status!=='VOID';}).forEach(function(a){
+                const key=String(a.movementId||'')+'|'+String(a.lotId||'')+'|'+String(a.kind||'');
+                if(seenMovement.has(key)) duplicateMovementIds.push(key); else seenMovement.add(key);
+            });
+            const out = JSON.stringify({ version: VERSION, generatedAt: new Date().toISOString(),
+                transactions: relevant, invariants:{issues:invariantIssues,duplicateAllocationKeys:duplicateMovementIds} }, null, 2);
             copyText(out).then(function () { toast('Ipecac diagnostic copied'); });
             return;
         }
