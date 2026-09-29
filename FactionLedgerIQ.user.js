@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.14.4
+// @version      0.14.5
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.14.4';
+    const VERSION = '0.14.5';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3263,50 +3263,101 @@
         if (!bundle) return '';
         const roots = bundle.roots || [];
         const who = roots[0] ? actor(roots[0]) : actor({});
-        const lines = [
-            'FACTIONLEDGERIQ · ' + receiptTitle(bundle),
-            'Receipt: ' + bundle.id,
-            'Status: ' + bundle.status,
-            'Person: ' + who,
-            'Date: ' + new Date(bundle.timestamp).toLocaleString()
-        ];
-        lines.push('');
-        bundle.items.forEach(function (item) {
-            let line = Number(item.qty || 0).toLocaleString() + 'x ' + item.itemName;
-            if (bundle.kind === 'REIMBURSEMENT' && item.due) line += ' — ' + money(item.due);
-            lines.push(line);
-        });
+        const lines = [];
+
         if (bundle.kind === 'REIMBURSEMENT') {
-            lines.push('');
-            bundle.items.forEach(function(item){
-                const pricing=item.pricing||[];
-                if (pricing.length) {
-                    lines.push(item.itemName + ' reimbursement breakdown:');
-                    pricing.forEach(function(p){
-                        lines.push('  ' + Number(p.qty||0).toLocaleString() + 'x ' + (p.kind==='BASELINE'?'Previously held personal stock':p.source||'Purchased') +
-                            ' · ' + (p.actual==null?'Deposit MV '+money(p.mv):'Actual '+money(p.actual)+' · MV '+money(p.mv)) +
-                            ' · Billed '+money(p.billed));
-                    });
-                    lines.push('  Total billed: '+money(item.due)+' · Billing vs MV: '+signedMoney(Number(item.due||0)-Number(item.mv||0)));
-                } else {
-                    lines.push(item.itemName + ' · Actual cost: ' + (item.knownCost ? money(item.actual) : 'Unknown') +
-                        ' · MV: ' + money(item.mv) + ' · Billed: ' + money(item.due) +
-                        ' · Billing vs MV: ' + signedMoney(Number(item.due||0)-Number(item.mv||0)));
+            lines.push('**FACTION LEDGER IQ — ARMORY DEPOSIT**', '');
+            lines.push('Player: ' + who);
+            lines.push('Deposited To: Faction Armory');
+
+            let totalActual = 0;
+            let hasActual = false;
+
+            bundle.items.forEach(function (item) {
+                const qty = Number(item.qty || 0);
+                const pricing = item.pricing || [];
+                const hasBaseline = pricing.some(function (p) { return p.kind === 'BASELINE'; });
+                const cleanPricing = pricing.length === 1 && !hasBaseline && pricing[0].kind === 'PURCHASE';
+                const mixedPricing = pricing.length > 1 || hasBaseline;
+
+                lines.push('', '**' + item.itemName + '**');
+                lines.push('Qty: ' + qty.toLocaleString());
+
+                // Only show price detail when one clean purchase basis exists.
+                // Mixed-source/rate items stay intentionally compact: total quantity + total owed.
+                let actualTotal = 0;
+                let mvTotal = 0;
+                if (cleanPricing) {
+                    actualTotal = Number(pricing[0].actual || 0);
+                    mvTotal = Number(pricing[0].mv || 0);
+                } else if (!pricing.length && item.knownCost) {
+                    actualTotal = Number(item.actual || 0);
+                    mvTotal = Number(item.mv || 0);
                 }
+
+                if (!mixedPricing && qty > 0 && actualTotal > 0) {
+                    const actualEach = actualTotal / qty;
+                    const mvEach = mvTotal / qty;
+                    totalActual += actualTotal;
+                    hasActual = true;
+                    if (Math.round(actualEach) === Math.round(mvEach)) {
+                        lines.push('Paid/MV: ' + money(actualEach) + ' ea');
+                    } else {
+                        lines.push('Paid: ' + money(actualEach) + ' ea');
+                        lines.push('MV: ' + money(mvEach) + ' ea');
+                    }
+                } else if (!mixedPricing && !cleanPricing && !item.knownCost && qty > 0 && Number(item.mv || 0) > 0) {
+                    lines.push('MV: ' + money(Number(item.mv || 0) / qty) + ' ea');
+                }
+
+                lines.push('Owed: **' + money(item.due) + '**');
             });
-            lines.push('Amount due: ' + money(bundle.due), 'Reimbursed: ' + money(bundle.paid), 'Balance: ' + money(bundle.outstanding));
-        }
-        if (bundle.kind === 'SALE') {
-            lines.push('', 'Sale proceeds: ' + money(bundle.proceeds), 'Deposited to faction: ' + money(bundle.returned), 'Collected by faction: ' + money(bundle.collected));
-        }
-        lines.push('', 'Timeline:');
-        bundle.members.forEach(function (tx) {
-            let detail = new Date(tx.timestamp).toLocaleString() + ' · ' + receiptEventLabel(tx);
-            if (tx.source || tx.destination) detail += ' · ' + (tx.source || '') + (tx.source && tx.destination ? ' → ' : '') + (tx.destination || '');
-            if (tx.type === 'REFUND' || tx.type === 'FACTION_BALANCE_IN' || tx.type === 'FACTION_COLLECTION' || tx.type === 'SALE') {
-                detail += ' · ' + money(tx.amount || tx.actualTotal || 0);
+
+            const allItemsHaveCleanPurchaseCost = bundle.items.length > 0 && bundle.items.every(function (item) {
+                const pricing = item.pricing || [];
+                return (pricing.length === 1 && pricing[0].kind === 'PURCHASE' && Number(pricing[0].actual || 0) > 0) ||
+                    (!pricing.length && item.knownCost && Number(item.actual || 0) > 0);
+            });
+
+            lines.push('');
+            if (hasActual && allItemsHaveCleanPurchaseCost) lines.push('**TOTAL PAID:** ' + money(totalActual));
+            lines.push('**TOTAL OWED:** ' + money(bundle.due));
+            if (Number(bundle.paid || 0) > 0) {
+                lines.push('Reimbursed: ' + money(bundle.paid));
+                lines.push('**REMAINING OWED:** ' + money(bundle.outstanding));
             }
-            lines.push(detail);
+            return lines.join('\n');
+        }
+
+        if (bundle.kind === 'SALE') {
+            lines.push('**FACTION LEDGER IQ — FACTION SALE**', '');
+            lines.push('Player: ' + who);
+            bundle.items.forEach(function (item) {
+                lines.push('', '**' + item.itemName + '**');
+                lines.push('Qty: ' + Number(item.qty || 0).toLocaleString());
+            });
+            lines.push('', 'Sold For: ' + money(bundle.proceeds));
+            if (Number(bundle.returned || 0) > 0) lines.push('Deposited To Faction: ' + money(bundle.returned));
+            if (Number(bundle.collected || 0) > 0) lines.push('Collected By Faction: ' + money(bundle.collected));
+            lines.push('**OWED TO FACTION:** ' + money(Math.max(0, Number(bundle.proceeds || 0) - Number(bundle.returned || 0))));
+            return lines.join('\n');
+        }
+
+        if (bundle.kind === 'ASSET') {
+            lines.push('**FACTION LEDGER IQ — FACTION TRANSFER**', '');
+            lines.push('Player: ' + who);
+            bundle.items.forEach(function (item) {
+                lines.push('', '**' + item.itemName + '**');
+                lines.push('Qty: ' + Number(item.qty || 0).toLocaleString());
+            });
+            lines.push('', 'Faction Property');
+            lines.push('**OWED: $0**');
+            return lines.join('\n');
+        }
+
+        lines.push('**FACTION LEDGER IQ — ACTIVITY**', '', 'Player: ' + who);
+        bundle.items.forEach(function (item) {
+            lines.push('', '**' + item.itemName + '**', 'Qty: ' + Number(item.qty || 0).toLocaleString());
         });
         return lines.join('\n');
     }
