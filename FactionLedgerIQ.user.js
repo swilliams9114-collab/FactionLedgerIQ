@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.14.2
+// @version      0.14.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.14.2';
+    const VERSION = '0.14.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3500,14 +3500,20 @@
             actions = '';
         }
 
+        const crimeReward = tx.detectionMethod === 'API_CRIME_REWARD' || tx.crimeReward === true;
+        const displayType = crimeReward ? 'CRIME REWARD' : tx.type;
+        const displayStatus = crimeReward && tx.status === 'PENDING' ? 'HELD' : tx.status;
         return '<div class="fliq-item">' +
             '<div class="fliq-item-top"><b>' + esc(tx.itemName) + ' × ' +
                 Number(tx.qty || 0).toLocaleString() + '</b><span class="fliq-pill">' +
-                esc(tx.type) + '</span></div>' +
+                esc(displayType) + '</span></div>' +
             '<div>' + esc(actor(tx)) + ' · ' + esc(new Date(tx.timestamp).toLocaleString()) + '</div>' +
             (tx.type === 'INCOMING_TRANSFER'
                 ? '<div>From <b>' + esc(personLabel(tx.personName,tx.personId)) + '</b>' +
                     (tx.transferMessage ? ' · Message: ' + esc(tx.transferMessage) : '') + '</div>'
+                : (crimeReward
+                ? '<div>Acquisition Cost <b>$0</b>' +
+                    (tx.crimeAction ? ' · ' + esc(tx.crimeAction) : '') + '</div>'
                 : (tx.type === 'PURCHASE'
                 ? '<div>Actual ' + money(tx.actualTotal) + ' · MV ' + money(tx.mvTotal) +
                     ' · Billable <b>' + money(tx.billableTotal) + '</b></div>'
@@ -3525,10 +3531,10 @@
                                     (moneyTxOrigin(tx) ? ' · From ' + esc(moneyTxOrigin(tx)) + ' sale' : '') + '</div>'
                                 : (tx.type === 'ARMORY_OUT' && Number(tx.mvTotal || 0)
                                     ? '<div>Movement MV ' + money(tx.mvTotal) + ' · Faction-owned</div>'
-                                    : ''))))))) +
+                                    : '')))))))) +
             '<div class="fliq-muted">' + esc(tx.source || '') +
                 (tx.source && tx.destination ? ' → ' : '') + esc(tx.destination || '') +
-                ' · ' + esc(tx.status) + '</div>' +
+                ' · ' + esc(displayStatus) + '</div>' +
             actions +
             '<div class="fliq-actions">' +
                 '<button class="fliq-btn" data-fliq="copy-receipt" data-id="' + esc(tx.id) + '">Receipt</button>' +
