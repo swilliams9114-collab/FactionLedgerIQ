@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.16.2
+// @version      0.16.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.16.2';
+    const VERSION = '0.16.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1986,6 +1986,9 @@
             }], depositMvEach:0, depositMvTotal:Number(tx.mvTotal||0)};
         }
         if (tx.type !== 'ARMORY_IN') return {due:0, baselineQty:0, purchasedQty:0, components:[], depositMvEach:0, depositMvTotal:0};
+        // Faction property returning to the Armory never creates a member reimbursement,
+        // even when legacy records retain a Personal Inventory source label.
+        if (tx.ownership === 'FACTION') return {due:0, baselineQty:0, purchasedQty:0, components:[], depositMvEach:0, depositMvTotal:Number(tx.mvTotal||tx.billableTotal||0)};
         const qty=Number(tx.qty||0);
         const depositMvTotal=Number(tx.mvTotal||tx.billableTotal||0);
         const depositMvEach=Number(tx.mvEach||0) || (qty>0 ? depositMvTotal/qty : 0);
