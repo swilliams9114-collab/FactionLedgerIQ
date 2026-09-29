@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.17.2
+// @version      0.17.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.17.2';
+    const VERSION = '0.17.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -5088,7 +5088,79 @@
         return archived > 0;
     }
 
+    function repairShadowedRecentPurchaseDepositsV0173() {
+        state.migrations = state.migrations || {};
+        if (state.migrations.shadowedPurchaseDepositsV0173) return false;
+        let repaired = 0;
+        const txs = liveTransactions();
+        const returns = txs.filter(function (dep) {
+            return dep.type === 'ARMORY_IN' && dep.ownership === 'FACTION' &&
+                dep.status === 'RETURNED' && dep.detectionMethod === 'API_FACTION_ARMORY_RETURN';
+        }).sort(function(a,b){return new Date(a.timestamp)-new Date(b.timestamp);});
+
+        returns.forEach(function (dep) {
+            const depMs = new Date(dep.timestamp).getTime();
+            const matches = txs.filter(function (p) {
+                if (p.type !== 'PURCHASE' || p.status !== 'PENDING') return false;
+                if (String(p.itemId || '') !== String(dep.itemId || '')) return false;
+                if (Number(p.qty || 0) !== Number(dep.qty || 0)) return false;
+                const pMs = new Date(p.timestamp).getTime();
+                return Number.isFinite(pMs) && pMs <= depMs && depMs-pMs <= 10*60*1000;
+            }).sort(function(a,b){return new Date(b.timestamp)-new Date(a.timestamp);});
+            if (matches.length !== 1) return;
+            const p = matches[0];
+
+            // Void only the allocation that caused this mistaken faction return. This restores
+            // the older faction lot quantity without deleting either audit transaction.
+            ensureAccounting();
+            state.accounting.allocations.forEach(function(a){
+                if (a.status !== 'VOID' && a.movementId === dep.id && a.kind === 'FACTION_RETURN') {
+                    a.status = 'VOID';
+                    a.voidedAt = new Date().toISOString();
+                    a.voidReason = 'v0.17.3: Armory deposit proved by exact recent personal purchase.';
+                }
+            });
+            dep.parentId = null;
+            dep.chainId = dep.chainId || uid('CHAIN');
+            dep.ownership = 'PERSONAL_PURCHASE_PENDING_REIMBURSEMENT';
+            dep.provenanceStatus = 'TRACKED_PERSONAL_PURCHASE';
+            dep.status = 'RECORDED';
+            dep.source = 'Personal Inventory';
+            dep.destination = 'Faction Armory';
+            dep.purchaseAllocationIds = [p.id];
+            dep.mixedBaselineQty = 0;
+            dep.mixedPurchasedQty = Number(p.qty || 0);
+            dep.actualTotal = Number(p.actualTotal || 0);
+            dep.billableTotal = Number(p.billableTotal || dep.mvTotal || 0);
+            dep.amount = dep.billableTotal;
+            dep.notes = [dep.notes, 'v0.17.3 repair: exact recent purchase '+p.id+
+                ' proves this was a personal purchased-item deposit, not a faction return.'].filter(Boolean).join(' | ');
+            p.status = 'DEPOSITED';
+            p.depositTransactionId = dep.id;
+            p.notes = [p.notes, 'v0.17.3 linked to repaired Armory deposit '+dep.id+'.'].filter(Boolean).join(' | ');
+            state.accounting.allocations.push({id:uid('ALLOC'),kind:'PURCHASE_TO_ARMORY',purchaseId:p.id,
+                movementId:dep.id,itemId:dep.itemId,qty:Number(p.qty||0),billableTotal:Number(p.billableTotal||0),
+                actualTotal:Number(p.actualTotal||0),mvTotal:Number(p.mvTotal||0),
+                costBasisKnown:p.costBasisKnown!==false&&Number(p.actualTotal||0)>0,
+                createdAt:new Date().toISOString(),status:'ACTIVE'});
+            repaired++;
+        });
+
+        // Recompute all source-lot remaining quantities after voiding mistaken return allocations.
+        state.accounting.lots.forEach(function(lot){
+            lot.qtyRemaining=Math.max(0,Number(lot.qtyOriginal||0)-allocatedQty(lot.id));
+            lot.status=lot.qtyRemaining?'OPEN':'CONSUMED';
+        });
+        state.migrations.shadowedPurchaseDepositsV0173={at:new Date().toISOString(),repaired:repaired,
+            rule:'Repair only API faction returns with exactly one same-item/same-qty pending purchase in the preceding 10 minutes.'};
+        if(repaired) state.detection.lastSource='v0.17.3 provenance repair · '+repaired+' purchased Armory deposit(s) restored';
+        state.updatedAt=new Date().toISOString();
+        localStorage.setItem(STATE_KEY,JSON.stringify(state));
+        return repaired>0;
+    }
+
     function init() {
+        repairShadowedRecentPurchaseDepositsV0173();
         repairCrimeAllocationFieldsV0152();
         repairRepeatedCrimeRewardAllocationsV0147();
         repairKnownEmptyBloodBagTestLotsV0144();
