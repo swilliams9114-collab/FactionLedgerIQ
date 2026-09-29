@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.15.2
+// @version      0.15.3
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.15.2';
+    const VERSION = '0.15.3';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -3085,6 +3085,20 @@
             if (tx.type === 'DISPLAY_OUT') {
                 item.qty -= Number(tx.qty || 0);
                 if (tx.ownership === 'FACTION') item.factionQty -= Number(tx.qty || 0);
+            }
+
+            // Any confirmed item deposit into the faction Armory becomes faction property
+            // immediately. Provenance/ownership fields still determine whether reimbursement
+            // is owed, but they do not change physical faction ownership after ARMORY_IN.
+            if (tx.type === 'ARMORY_IN' && tx.status === 'RECORDED') {
+                item.factionQty += Number(tx.qty || 0);
+            }
+
+            // Items withdrawn from the faction Armory are no longer physically in the Armory.
+            // Their faction provenance remains on the withdrawal/held chain for later return,
+            // sale, Display Case movement, or member distribution accounting.
+            if (tx.type === 'ARMORY_OUT' && tx.status !== 'VOID') {
+                item.factionQty -= Number(tx.qty || 0);
             }
 
             // Personal stock is the remaining quantity in the personal provenance lot,
