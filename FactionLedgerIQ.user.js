@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.14.9
+// @version      0.15.0
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.14.9';
+    const VERSION = '0.15.0';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2542,6 +2542,29 @@
                 timestamp: tx.timestamp, source: tx.source || ''
             });
         });
+        // Personal Armory contributions with unknown acquisition cost (including crime
+        // rewards) are reported from the deposit itself. The deposit is the authoritative
+        // reimbursement event; provenance records only explain where the personal item came from.
+        liveTransactions().filter(function (dep) {
+            return dep.type === 'ARMORY_IN' &&
+                dep.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
+                reimbursementCalculation(dep).due > 0 &&
+                !rows.some(function (r) {
+                    const src = liveTransactions().find(function (tx) { return tx.id === r.id; });
+                    return src && confirmedDepositForPurchase(src) && confirmedDepositForPurchase(src).id === dep.id;
+                });
+        }).forEach(function (dep) {
+            const due = reimbursementCalculation(dep).due;
+            const paid = Math.min(due, childrenOf(dep.id,'REFUND').reduce(function(n,r){
+                return n + Number(r.amount || r.actualTotal || 0);
+            },0));
+            rows.push({
+                id: dep.id, itemName: dep.itemName || 'Item', qty: Number(dep.qty || 0),
+                actual: 0, mv: Number(dep.mvTotal || dep.billableTotal || due), billed: due, paid: paid,
+                known: false, realized: null, pending: null,
+                timestamp: dep.timestamp, source: dep.crimeRewardAllocationIds && dep.crimeRewardAllocationIds.length ? 'Crime Reward → Armory' : (dep.source || 'Personal Inventory → Armory')
+            });
+        });
         return rows;
     }
 
@@ -3243,6 +3266,13 @@
     function buildReceiptBundles() {
         const txs = liveTransactions().slice().sort(function (a,b) { return new Date(a.timestamp)-new Date(b.timestamp); });
         const roots = txs.filter(function (tx) { return !tx.parentId; });
+        // A personal Armory deposit is itself an authoritative reimbursement root even if
+        // older provenance linkage left a parentId on the movement.
+        txs.filter(function (tx) {
+            return isAggregatePersonalDeposit(tx) && reimbursementCalculation(tx).due > 0;
+        }).forEach(function (tx) {
+            if (!roots.some(function (r) { return r.id === tx.id; })) roots.push(tx);
+        });
         const bundles = [], consumed = new Set();
 
         // Exact/near-simultaneous personal Armory deposits are displayed as one restock batch.
