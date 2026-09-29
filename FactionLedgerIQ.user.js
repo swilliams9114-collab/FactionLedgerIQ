@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.14.6
+// @version      0.14.7
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.14.6';
+    const VERSION = '0.14.7';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -680,6 +680,7 @@
             return tx.type === 'ARMORY_IN' &&
                 tx.ownership === 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT' &&
                 !tx.purchaseAllocationId && !tx.purchaseAllocationIds &&
+                !(Array.isArray(tx.crimeRewardAllocationIds) && tx.crimeRewardAllocationIds.length) &&
                 new Date(tx.timestamp).getTime() >= cutoffMs;
         }).sort(function (a,b){ return new Date(a.timestamp)-new Date(b.timestamp); });
 
@@ -4598,6 +4599,44 @@
         }
     }
 
+    function repairRepeatedCrimeRewardAllocationsV0147() {
+        state.migrations = state.migrations || {};
+        if (state.migrations.crimeRewardIdempotencyRepairV0147) return false;
+        let restored = 0;
+
+        liveTransactions().filter(function (dep) {
+            return dep.type === 'ARMORY_IN' && Array.isArray(dep.crimeRewardAllocationIds) &&
+                dep.crimeRewardAllocationIds.length === 1;
+        }).forEach(function (dep) {
+            const linked = liveTransactions().filter(function (tx) {
+                return tx.type === 'PURCHASE' && tx.crimeReward === true &&
+                    tx.status === 'DEPOSITED' && tx.depositTransactionId === dep.id &&
+                    String(tx.itemId || '') === String(dep.itemId || '');
+            }).sort(function (a,b) { return new Date(a.timestamp) - new Date(b.timestamp); });
+
+            if (linked.length <= 1) return;
+            const keepId = dep.crimeRewardAllocationIds[0];
+            linked.forEach(function (tx) {
+                if (tx.id === keepId) return;
+                tx.status = 'PENDING';
+                delete tx.depositTransactionId;
+                tx.notes = [tx.notes, 'v0.14.7 repair: restored after repeated crime-reward reconciliation consumed this lot more than once.']
+                    .filter(Boolean).join(' | ');
+                restored += Number(tx.qty || 0);
+            });
+        });
+
+        state.migrations.crimeRewardIdempotencyRepairV0147 = {
+            at: new Date().toISOString(),
+            restoredQty: restored,
+            rule: 'A crime-reward Armory deposit may consume exactly one selected equivalent provenance lot; repeated reconciliation must not consume additional lots.'
+        };
+        if (restored) state.detection.lastSource = 'v0.14.7 crime reward repair · ' + restored + ' personal item(s) restored';
+        state.updatedAt = new Date().toISOString();
+        localStorage.setItem(STATE_KEY, JSON.stringify(state));
+        return restored > 0;
+    }
+
     function repairKnownEmptyBloodBagTestLotsV0144() {
         state.migrations = state.migrations || {};
         if (state.migrations.emptyBloodBagTestLotRepairV0144) return false;
@@ -4644,6 +4683,7 @@
     }
 
     function init() {
+        repairRepeatedCrimeRewardAllocationsV0147();
         repairKnownEmptyBloodBagTestLotsV0144();
         migrateLegacyOwnershipForV090();
         recoverConfirmedLegacyProvenanceV091();
