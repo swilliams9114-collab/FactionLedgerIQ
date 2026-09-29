@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.14.1
+// @version      0.14.2
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.14.1';
+    const VERSION = '0.14.2';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1457,6 +1457,57 @@
         return changed;
     }
 
+    function crimeRewardParts(log) {
+        const data=log&&log.data&&typeof log.data==='object'?log.data:{};
+        const gained=data.items_gained;
+        if(!gained || typeof gained!=='object' || Array.isArray(gained) || !data.crime_action) return [];
+        const id=logId(log); if(!id)return [];
+        return Object.keys(gained).map(function(itemId){
+            const qty=Math.max(0,Number(gained[itemId]||0));
+            return qty>0?{logId:id,timestamp:Number(log.timestamp||0),itemId:String(itemId),qty:qty,
+                crimeAction:String(data.crime_action||'Crime reward'),outcome:data.outcome,nerve:data.nerve}:null;
+        }).filter(Boolean);
+    }
+
+    async function reconcileCrimeRewards(logs) {
+        const parts=[];
+        (logs||[]).forEach(function(log){crimeRewardParts(log).forEach(function(p){parts.push(p);});});
+        if(!parts.length)return false;
+        try{await ensureItemCatalog(false);}catch(e){}
+        let changed=false;
+        parts.forEach(function(part){
+            const item=itemCatalog.find(function(x){return String(x.id)===part.itemId;});
+            const itemName=item?item.name:'';
+            const wl=whitelistMatch(itemName,part.itemId);
+            if(!wl)return; // Crime rewards are intentionally whitelist-only.
+            const duplicate=state.transactions.some(function(tx){
+                return tx.detectionMethod==='API_CRIME_REWARD' && tx.apiLogId===part.logId &&
+                    String(tx.itemId||'')===part.itemId;
+            });
+            if(duplicate)return;
+            // Crime rewards are personal stock with a known $0 acquisition cost. They do
+            // not create faction debt until deposited; reimbursement then uses deposit-time MV.
+            state.transactions.push({id:uid('TX'),chainId:uid('CHAIN'),parentId:null,type:'PURCHASE',
+                timestamp:part.timestamp?new Date(part.timestamp*1000).toISOString():new Date().toISOString(),
+                itemName:wl.itemName||itemName||('Item #'+part.itemId),itemId:wl.itemId||part.itemId,qty:part.qty,
+                actualTotal:0,mvEach:0,mvTotal:0,billableTotal:0,amount:0,
+                source:'Crime Reward',destination:'Personal Inventory',personName:state.settings.playerName,
+                personId:state.settings.playerId,ownership:'PERSONAL',status:'PENDING',
+                costBasisKnown:true,crimeReward:true,crimeAction:part.crimeAction,
+                apiLogId:part.logId,detectionMethod:'API_CRIME_REWARD',
+                notes:'Whitelisted crime reward from '+part.crimeAction+'. Acquisition cost $0; faction reimbursement uses MV at the time of faction deposit.',
+                createdAt:new Date().toISOString()});
+            changed=true;
+        });
+        if(changed){state.detection.lastDetectedAt=new Date().toISOString();state.detection.lastSource='Torn API · Crime Reward';}
+        return changed;
+    }
+
+    async function recoverCrimeRewardsFromDiagnostics() {
+        const events=Array.isArray(state.detection.recentApiEvents)?state.detection.recentApiEvents:[];
+        return await reconcileCrimeRewards(events);
+    }
+
     async function reconcileApiPurchase(log) {
         const id = logId(log);
         if (!id) return false;
@@ -2258,6 +2309,8 @@
             let changed = false;
             if (repairIncomingTransferDuplicatesV0141()) changed = true;
             if (await reconcileIncomingPlayerTransfers(logs)) changed = true;
+            if (await reconcileCrimeRewards(logs)) changed = true;
+            if (await recoverCrimeRewardsFromDiagnostics()) changed = true;
             const saleRecoveryLogs = logs.concat(Array.isArray(state.detection.recentApiEvents) ? state.detection.recentApiEvents : []);
             if (repairObservedBazaarSales(saleRecoveryLogs)) changed = true;
             logs.forEach(function (log) { rememberFactionCandidate(log); });
