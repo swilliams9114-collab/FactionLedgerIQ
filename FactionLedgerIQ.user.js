@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.14.8
+// @version      0.14.9
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.14.8';
+    const VERSION = '0.14.9';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -2516,15 +2516,19 @@
             const movement = confirmedDepositForPurchase(tx);
             const mixed = movement && movement.type === 'ARMORY_IN' && Array.isArray(movement.purchaseAllocationIds) &&
                 movement.purchaseAllocationIds.includes(tx.id) && Number(movement.mixedBaselineQty || 0) > 0;
+            const crimeBacked = movement && movement.type === 'ARMORY_IN' && tx.crimeReward === true &&
+                Array.isArray(movement.crimeRewardAllocationIds) && movement.crimeRewardAllocationIds.includes(tx.id);
             const depositEach = mixed ? Number(movement.billableTotal || movement.mvTotal || 0) / Math.max(1,Number(movement.qty||1)) : 0;
             const mixedMvShare = mixed ? Math.round(depositEach * Number(tx.qty||0)) : 0;
-            const due = mixed ? Math.max(Number(tx.actualTotal||0), Number(tx.mvTotal||0), Number(tx.billableTotal||0)) : Number(tx.billableTotal || 0);
+            const due = crimeBacked ? reimbursementCalculation(movement).due :
+                (mixed ? Math.max(Number(tx.actualTotal||0), Number(tx.mvTotal||0), Number(tx.billableTotal||0)) : Number(tx.billableTotal || 0));
             // Refunds for mixed deposits live on the deposit root. Allocate realized payment
             // proportionally; until then these remain potential P/L.
-            const depositPaid = mixed ? Math.min(reimbursementCalculation(movement).due,
+            const depositPaid = (mixed || crimeBacked) ? Math.min(reimbursementCalculation(movement).due,
                 childrenOf(movement.id,'REFUND').reduce(function(n,r){return n+Number(r.amount||r.actualTotal||0);},0)) : 0;
-            const paid = mixed ? Math.min(due, Math.round(depositPaid * (Number(tx.qty||0)/Math.max(1,Number(movement.qty||1))))) :
-                Math.min(due, receiptRefunds(tx));
+            const paid = crimeBacked ? Math.min(due, depositPaid) :
+                (mixed ? Math.min(due, Math.round(depositPaid * (Number(tx.qty||0)/Math.max(1,Number(movement.qty||1))))) :
+                Math.min(due, receiptRefunds(tx)));
             const known = tx.costBasisKnown !== false && Number(tx.actualTotal || 0) > 0;
             const cost = known ? Number(tx.actualTotal || 0) : 0;
             const realizedCost = due > 0 ? Math.round(cost * (paid / due)) : 0;
@@ -3243,7 +3247,7 @@
 
         // Exact/near-simultaneous personal Armory deposits are displayed as one restock batch.
         // This is presentation-only: the underlying transactions and accounting remain separate.
-        const deposits = roots.filter(function (tx) {
+        const deposits = txs.filter(function (tx) {
             return isAggregatePersonalDeposit(tx);
         });
         deposits.forEach(function (tx) {
