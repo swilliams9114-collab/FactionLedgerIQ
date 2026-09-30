@@ -1,0 +1,23 @@
+from pathlib import Path
+
+p = Path('FactionLedgerIQ.user.js')
+s = p.read_text()
+
+s = s.replace('// @version      1.0.0', '// @version      1.0.1')
+s = s.replace("const VERSION='1.0.0';", "const VERSION='1.0.1';")
+
+old = "function save(renderAfter=true){state.updatedAt=new Date().toISOString();localStorage.setItem(STATE_KEY,JSON.stringify(state));if(renderAfter)render();}"
+new = """function trackedItemIds(){const ids=new Set();(state.whitelist||[]).forEach(x=>x&&x.itemId&&ids.add(String(x.itemId)));(state.lots||[]).forEach(x=>x&&x.itemId&&ids.add(String(x.itemId)));(state.movements||[]).forEach(x=>x&&x.itemId&&ids.add(String(x.itemId)));(state.claims||[]).forEach(x=>x&&x.itemId&&ids.add(String(x.itemId)));(state.pendingTransfers||[]).forEach(x=>x&&x.itemId&&ids.add(String(x.itemId)));return ids;}
+function syncTrackedMarket(){const ids=trackedItemIds(),old=state.market||{},next={};ids.forEach(id=>{const live=itemCatalog.find(x=>String(x.id)===String(id)),prev=old[id];if(live)next[id]={itemId:String(live.id),itemName:live.name,mv:Number(live.marketValue||0),updatedAt:new Date().toISOString()};else if(prev)next[id]=prev;});state.market=next;}
+function save(renderAfter=true){state.updatedAt=new Date().toISOString();syncTrackedMarket();const payload=JSON.stringify(state);try{localStorage.setItem(STATE_KEY,payload);}catch(e){if(e&&(e.name==='QuotaExceededError'||/quota/i.test(String(e)))){state.market={};localStorage.setItem(STATE_KEY,JSON.stringify(state));}else throw e;}if(renderAfter)render();}"""
+if old not in s:
+    raise SystemExit('save function pattern not found')
+s = s.replace(old, new)
+
+old2 = "async function ensureCatalog(force=false){if(!force&&itemCatalog.length&&Date.now()-itemCatalogLoadedAt<3600000)return itemCatalog;const d=await apiFetch('torn/items',{cat:'All'});const p=normalizeCatalog(d);if(!p.length)throw new Error('No items returned by Torn API');itemCatalog=p;itemCatalogLoadedAt=Date.now();p.forEach(i=>state.market[i.id]={itemId:i.id,itemName:i.name,mv:Number(i.marketValue||0),updatedAt:new Date().toISOString()});return p;}"
+new2 = "async function ensureCatalog(force=false){if(!force&&itemCatalog.length&&Date.now()-itemCatalogLoadedAt<3600000)return itemCatalog;const d=await apiFetch('torn/items',{cat:'All'});const p=normalizeCatalog(d);if(!p.length)throw new Error('No items returned by Torn API');itemCatalog=p;itemCatalogLoadedAt=Date.now();syncTrackedMarket();return p;}"
+if old2 not in s:
+    raise SystemExit('ensureCatalog pattern not found')
+s = s.replace(old2, new2)
+
+p.write_text(s)
