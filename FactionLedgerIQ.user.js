@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      1.0.0
+// @version      1.0.1
 // @description  Simple TornPDA-first faction inventory, raffle ownership, claims, receipts, and leadership audit.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
 'use strict';
 
-const VERSION='1.0.0';
+const VERSION='1.0.1';
 const STATE_KEY='factionledgeriq_v1_state';
 const DOCK_ID='factionledgeriq-v1-dock-btn';
 const PANEL_ID='factionledgeriq-v1-panel';
@@ -29,7 +29,9 @@ let state=loadState(),activeTab='home',dockObserver=null,dockQueued=false,apiTim
 
 function clone(v){return JSON.parse(JSON.stringify(v));}
 function loadState(){try{const r=localStorage.getItem(STATE_KEY);if(!r)return clone(DEFAULT);const x=JSON.parse(r);return {...clone(DEFAULT),...x,settings:{...DEFAULT.settings,...(x.settings||{})},diagnostics:{...DEFAULT.diagnostics,...(x.diagnostics||{})},whitelist:Array.isArray(x.whitelist)?x.whitelist:[],market:x.market||{},lots:Array.isArray(x.lots)?x.lots:[],movements:Array.isArray(x.movements)?x.movements:[],claims:Array.isArray(x.claims)?x.claims:[],raffles:Array.isArray(x.raffles)?x.raffles:[],pendingTransfers:Array.isArray(x.pendingTransfers)?x.pendingTransfers:[],receiptBatches:Array.isArray(x.receiptBatches)?x.receiptBatches:[],auditClaims:Array.isArray(x.auditClaims)?x.auditClaims:[],paymentBatches:Array.isArray(x.paymentBatches)?x.paymentBatches:[],processedLogIds:Array.isArray(x.processedLogIds)?x.processedLogIds:[]};}catch(e){console.warn('[FLIQ] state load failed',e);return clone(DEFAULT);}}
-function save(renderAfter=true){state.updatedAt=new Date().toISOString();localStorage.setItem(STATE_KEY,JSON.stringify(state));if(renderAfter)render();}
+function trackedItemIds(){const ids=new Set();(state.whitelist||[]).forEach(x=>x&&x.itemId&&ids.add(String(x.itemId)));(state.lots||[]).forEach(x=>x&&x.itemId&&ids.add(String(x.itemId)));(state.movements||[]).forEach(x=>x&&x.itemId&&ids.add(String(x.itemId)));(state.claims||[]).forEach(x=>x&&x.itemId&&ids.add(String(x.itemId)));(state.pendingTransfers||[]).forEach(x=>x&&x.itemId&&ids.add(String(x.itemId)));return ids;}
+function syncTrackedMarket(){const ids=trackedItemIds(),old=state.market||{},next={};ids.forEach(id=>{const live=itemCatalog.find(x=>String(x.id)===String(id)),prev=old[id];if(live)next[id]={itemId:String(live.id),itemName:live.name,mv:Number(live.marketValue||0),updatedAt:new Date().toISOString()};else if(prev)next[id]=prev;});state.market=next;}
+function save(renderAfter=true){state.updatedAt=new Date().toISOString();syncTrackedMarket();const payload=JSON.stringify(state);try{localStorage.setItem(STATE_KEY,payload);}catch(e){if(e&&(e.name==='QuotaExceededError'||/quota/i.test(String(e)))){state.market={};localStorage.setItem(STATE_KEY,JSON.stringify(state));}else throw e;}if(renderAfter)render();}
 function uid(p){return (p||'FLIQ')+'-'+Date.now().toString(36).toUpperCase()+'-'+Math.random().toString(36).slice(2,8).toUpperCase();}
 function esc(v){return String(v==null?'':v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;');}
 function money(v){return '$'+Math.round(Number(v||0)).toLocaleString();}
@@ -46,7 +48,7 @@ function seen(id){return !!id&&state.processedLogIds.includes(String(id));}
 function remember(id){id=String(id||'');if(!id||seen(id))return;state.processedLogIds.push(id);if(state.processedLogIds.length>2500)state.processedLogIds=state.processedLogIds.slice(-2500);}
 
 function normalizeCatalog(data){const s=data&&(data.items||data),out=[];const add=(item,key)=>{if(!item||typeof item!=='object')return;const id=String(item.id||item.item_id||key||'').trim(),name=String(item.name||item.item_name||'').trim(),mv=Number(item.market_value||item.marketValue||(item.value&&(item.value.market_price||item.value.market_value))||0)||0;if(id&&name)out.push({id,name,marketValue:mv});};if(Array.isArray(s))s.forEach(x=>add(x,''));else if(s&&typeof s==='object')Object.keys(s).forEach(k=>add(s[k],k));return out.sort((a,b)=>a.name.localeCompare(b.name));}
-async function ensureCatalog(force=false){if(!force&&itemCatalog.length&&Date.now()-itemCatalogLoadedAt<3600000)return itemCatalog;const d=await apiFetch('torn/items',{cat:'All'});const p=normalizeCatalog(d);if(!p.length)throw new Error('No items returned by Torn API');itemCatalog=p;itemCatalogLoadedAt=Date.now();p.forEach(i=>state.market[i.id]={itemId:i.id,itemName:i.name,mv:Number(i.marketValue||0),updatedAt:new Date().toISOString()});return p;}
+async function ensureCatalog(force=false){if(!force&&itemCatalog.length&&Date.now()-itemCatalogLoadedAt<3600000)return itemCatalog;const d=await apiFetch('torn/items',{cat:'All'});const p=normalizeCatalog(d);if(!p.length)throw new Error('No items returned by Torn API');itemCatalog=p;itemCatalogLoadedAt=Date.now();syncTrackedMarket();return p;}
 function itemById(id){id=String(id||'');return itemCatalog.find(x=>String(x.id)===id)||(state.market[id]?{id,name:state.market[id].itemName||('Item #'+id),marketValue:Number(state.market[id].mv||0)}:null);}
 function itemName(id){const x=itemById(id);return x?x.name:'Item #'+id;}
 function mv(id){const x=itemById(id);return x?Number(x.marketValue||0):Number(state.market[String(id)]&&state.market[String(id)].mv||0);}
