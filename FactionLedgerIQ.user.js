@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      1.0.3
+// @version      1.0.4
 // @description  Simple TornPDA-first faction inventory, raffle ownership, claims, receipts, and leadership audit.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,12 +11,13 @@
 (function () {
 'use strict';
 
-const VERSION='1.0.3';
+const VERSION='1.0.4';
 const STATE_KEY='factionledgeriq_v1_state';
 const DOCK_ID='factionledgeriq-v1-dock-btn';
 const PANEL_ID='factionledgeriq-v1-panel';
 const STYLE_ID='factionledgeriq-v1-style';
 const P='PERSONAL', F='FACTION', INV='PERSONAL_INVENTORY', DISP='DISPLAY_CASE';
+const V1_TRACKING_FLOOR_MS=Date.parse('2026-09-30T18:37:00Z');
 
 const DEFAULT={
   schemaVersion:1,
@@ -54,9 +55,9 @@ function itemName(id){const x=itemById(id);return x?x.name:'Item #'+id;}
 function mv(id){const x=itemById(id);return x?Number(x.marketValue||0):Number(state.market[String(id)]&&state.market[String(id)].mv||0);}
 function whitelist(id,name){id=String(id||'');const n=norm(name);return state.whitelist.find(w=>(id&&String(w.itemId)===id)||(n&&norm(w.itemName)===n))||null;}
 function purgePreWhitelistPurchases(){let changed=false;(state.lots||[]).forEach(l=>{if(!l||l.status==='VOID'||l.sourceType!=='PURCHASE')return;const w=whitelist(l.itemId,l.itemName);if(!w||!w.addedAt)return;const created=new Date(l.createdAt||0).getTime(),added=new Date(w.addedAt).getTime();if(Number.isFinite(created)&&Number.isFinite(added)&&created<added&&Number(l.qtyRemaining||0)===Number(l.qtyOriginal||0)){l.status='VOID';l.qtyRemaining=0;l.voidedAt=new Date().toISOString();l.voidReason='Purchase occurred before item was whitelisted';changed=true;}});return changed;}
-function trackingStartMs(){const ms=new Date(state.createdAt||0).getTime();return Number.isFinite(ms)&&ms>0?ms:0;}
+function trackingStartMs(){const created=new Date(state.createdAt||0).getTime(),safeCreated=Number.isFinite(created)&&created>0?created:0;return Math.max(V1_TRACKING_FLOOR_MS||0,safeCreated);}
 function logAfterTrackingStart(log){const start=trackingStartMs(),ts=Number(log&&log.timestamp||0)*1000;return !start||!ts||ts>=start;}
-function purgePreTrackingEvents(){const start=trackingStartMs();if(!start)return false;let changed=false;(state.movements||[]).forEach(m=>{if(!m||m.status==='VOID'||!['ARMORY_IN','ARMORY_OUT'].includes(m.type)||m.receiptBatchId||(m.claimIds||[]).length)return;const ts=new Date(m.timestamp||0).getTime();if(Number.isFinite(ts)&&ts<start){m.status='VOID';m.voidedAt=new Date().toISOString();m.voidReason='Movement occurred before LedgerIQ tracking started';changed=true;}});(state.lots||[]).forEach(l=>{if(!l||l.status==='VOID'||l.sourceType!=='ARMORY_WITHDRAWAL')return;const ts=new Date(l.createdAt||0).getTime();if(Number.isFinite(ts)&&ts<start&&Number(l.qtyRemaining||0)===Number(l.qtyOriginal||0)){l.status='VOID';l.qtyRemaining=0;l.voidedAt=new Date().toISOString();l.voidReason='Armory withdrawal occurred before LedgerIQ tracking started';changed=true;}});(state.pendingTransfers||[]).forEach(t=>{if(!t||t.status!=='PENDING')return;const ts=new Date(t.timestamp||0).getTime();if(Number.isFinite(ts)&&ts<start){t.status='VOID';t.voidedAt=new Date().toISOString();changed=true;}});return changed;}
+function purgePreTrackingEvents(){const start=trackingStartMs();if(!start)return false;let changed=false;const doomed=new Set();(state.movements||[]).forEach(m=>{if(!m||m.status==='VOID'||!['ARMORY_IN','ARMORY_OUT'].includes(m.type)||m.receiptBatchId)return;const ts=new Date(m.timestamp||0).getTime();if(!(Number.isFinite(ts)&&ts<start))return;const claims=(m.claimIds||[]).map(claimById).filter(Boolean),protectedClaim=claims.some(c=>c.status==='SUBMITTED'||c.status==='REIMBURSED');if(protectedClaim)return;m.status='VOID';m.voidedAt=new Date().toISOString();m.voidReason='Movement occurred before LedgerIQ V1 tracking began';doomed.add(m.id);claims.forEach(c=>{if(c.status==='OPEN'){c.status='VOID';c.voidedAt=new Date().toISOString();c.voidReason='Parent movement occurred before LedgerIQ V1 tracking began';}});changed=true;});(state.lots||[]).forEach(l=>{if(!l||l.status==='VOID')return;const ts=new Date(l.createdAt||0).getTime(),pre=Number.isFinite(ts)&&ts<start,linked=doomed.has(l.sourceRef);if(l.sourceType==='ARMORY_WITHDRAWAL'&&(pre||linked)){l.status='VOID';l.qtyRemaining=0;l.voidedAt=new Date().toISOString();l.voidReason='Armory withdrawal occurred before LedgerIQ V1 tracking began';changed=true;}});(state.pendingTransfers||[]).forEach(t=>{if(!t||t.status!=='PENDING')return;const ts=new Date(t.timestamp||0).getTime();if(Number.isFinite(ts)&&ts<start){t.status='VOID';t.voidedAt=new Date().toISOString();changed=true;}});return changed;}
 function parseItem(v){const t=String(v||'').trim(),m=t.match(/\[(\d+)\]\s*$/)||t.match(/^(\d+)$/);if(m)return itemById(m[1])||{id:m[1],name:itemName(m[1]),marketValue:mv(m[1])};const n=norm(t),x=itemCatalog.find(i=>norm(i.name)===n);if(x)return x;const y=Object.values(state.market).find(i=>norm(i.itemName)===n);return y?{id:String(y.itemId),name:y.itemName,marketValue:Number(y.mv||0)}:null;}
 
 function activeLots(){return state.lots.filter(l=>l.status!=='VOID'&&Number(l.qtyRemaining||0)>0);}
