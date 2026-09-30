@@ -1,0 +1,28 @@
+name: Temporary FLIQ Tracking Start Fix
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch tracking start cutoff
+        run: python3 tools/patch_tracking_start.py
+      - name: Syntax check
+        run: node --check FactionLedgerIQ.user.js
+      - name: Commit fix
+        run: |
+          if git diff --quiet; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add FactionLedgerIQ.user.js
+          git commit -m "Start API tracking from V1 activation"
+          git push
