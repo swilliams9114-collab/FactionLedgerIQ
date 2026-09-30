@@ -1,0 +1,16 @@
+name: Temporary FLIQ V1 Branch Check
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v1-rebuild
+      - name: Syntax check V1
+        run: node --check FactionLedgerIQ.v1.user.js
