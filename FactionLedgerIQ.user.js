@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.17.3
+// @version      0.17.4
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.17.3';
+    const VERSION = '0.17.4';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -44,6 +44,7 @@
     let state = loadState();
     let activeTab = 'dashboard';
     let receiptFilter = 'open';
+    let dashboardTestResultVisible = false;
     const expandedReceipts = new Set();
     let dockObserver = null;
     let dockQueued = false;
@@ -2341,8 +2342,8 @@
         return changed;
     }
 
-    async function pollApiLogs(showToast) {
-        if (apiPollBusy || !state.settings.apiPolling || !apiKeyValue()) return;
+    async function pollApiLogs(showToast, force) {
+        if (apiPollBusy || (!force && !state.settings.apiPolling) || !apiKeyValue()) return;
         apiPollBusy = true;
         try {
             // Always request Torn's latest log page. Polling with a moving from/to window
@@ -2962,6 +2963,17 @@
         '</div>' +
         (state.ui && state.ui.showFactionOwesBreakdown ? '<div class="fliq-section">' + renderFactionOwesBreakdown() + '</div>' : '') +
         (state.ui && state.ui.showProfitLossBreakdown ? '<div class="fliq-section">' + renderProfitLossBreakdown() + '</div>' : '') +
+        '<div class="fliq-section"><h3>Dashboard Tools</h3><div class="fliq-card">' +
+            '<div class="fliq-actions" style="margin-top:0">' +
+                '<button class="fliq-btn fliq-btn-primary" type="button" data-fliq="sync-now">Sync Now</button>' +
+                '<button class="fliq-btn" type="button" data-fliq="run-full-system-test">Run Full System Test</button>' +
+            '</div>' +
+            '<div class="fliq-muted" data-fliq-api-status style="margin-top:8px">API status: ' + esc(state.detection.apiStatus || 'Not configured') +
+                (state.detection.lastApiPollAt ? ' · Last check ' + esc(new Date(state.detection.lastApiPollAt).toLocaleTimeString()) : '') +
+                (state.detection.lastApiError ? '<br>Error: ' + esc(state.detection.lastApiError) : '') + '</div>' +
+            '<div class="fliq-muted" style="margin-top:4px">Sync Now uses the same Torn API reconciliation as automatic polling and can be used even when automatic polling is off.</div>' +
+        '</div></div>' +
+        (dashboardTestResultVisible ? '<div class="fliq-section"><h3>Full-System Test Results</h3>' + renderFullSystemAudit() + '</div>' : '') +
         '<div class="fliq-section"><h3>Quick Record</h3>' + eventForm() + '</div>' +
         '<div class="fliq-section"><h3>Ledger Status</h3>' +
             '<div class="fliq-card">' +
@@ -4069,7 +4081,7 @@
                 return '<div class="fliq-item"><div class="fliq-item-top"><b>'+esc(t.name)+'</b><span class="fliq-pill">'+(t.pass?'PASS':'FAIL')+'</span></div><div class="fliq-muted">'+esc(t.detail)+'</div></div>';
             }).join('');}).join('')+
             '<h4 style="margin:12px 0 6px">Live Verification Required</h4>'+r.liveVerification.map(function(x){return '<div class="fliq-item"><b>'+esc(x[0])+'</b><div class="fliq-muted">'+esc(x[1])+'</div></div>';}).join('')+
-            '<div class="fliq-actions"><button class="fliq-btn" type="button" data-fliq="copy-full-test-report">Copy Full Test Report</button></div></div>';
+            '<div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" type="button" data-fliq="run-full-system-test">Run Full System Test</button><button class="fliq-btn" type="button" data-fliq="copy-full-test-report">Copy Full Test Report</button></div></div>';
     }
 
     function renderTestCenter() {
@@ -4300,6 +4312,34 @@
 
         if (action === 'close') {
             togglePanel(false);
+            return;
+        }
+
+        if (action === 'sync-now') {
+            if (!apiKeyValue()) {
+                toast('Add Torn API key in Settings first');
+                return;
+            }
+            if (apiPollBusy) {
+                toast('Sync already running');
+                return;
+            }
+            btn.disabled = true;
+            btn.textContent = 'Syncing…';
+            pollApiLogs(true, true).finally(function () {
+                const current = document.querySelector('[data-fliq="sync-now"]');
+                if (current) {
+                    current.disabled = false;
+                    current.textContent = 'Sync Now';
+                }
+            });
+            return;
+        }
+
+        if (action === 'run-full-system-test') {
+            dashboardTestResultVisible = true;
+            render();
+            toast('Full-system test complete');
             return;
         }
 
