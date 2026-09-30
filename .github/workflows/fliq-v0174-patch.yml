@@ -36,79 +36,76 @@ jobs:
           replace_once('// @version      0.17.3', '// @version      0.17.4', 'userscript version')
           replace_once("const VERSION = '0.17.3';", "const VERSION = '0.17.4';", 'runtime version')
           replace_once("    let receiptFilter = 'open';\n", "    let receiptFilter = 'open';\n    let dashboardTestResultVisible = false;\n", 'dashboard test visibility state')
-
           replace_once(
               "    async function pollApiLogs(showToast) {\n        if (apiPollBusy || !state.settings.apiPolling || !apiKeyValue()) return;",
               "    async function pollApiLogs(showToast, force) {\n        if (apiPollBusy || (!force && !state.settings.apiPolling) || !apiKeyValue()) return;",
               'manual sync force support'
           )
 
-          old_dashboard = """        (state.ui && state.ui.showProfitLossBreakdown ? '<div class=\"fliq-section\">' + renderProfitLossBreakdown() + '</div>' : '') +
-        '<div class=\"fliq-section\"><h3>Quick Record</h3>' + eventForm() + '</div>' +"""
-          new_dashboard = """        (state.ui && state.ui.showProfitLossBreakdown ? '<div class=\"fliq-section\">' + renderProfitLossBreakdown() + '</div>' : '') +
-        '<div class=\"fliq-section\"><h3>Dashboard Tools</h3><div class=\"fliq-card\">' +
-            '<div class=\"fliq-actions\" style=\"margin-top:0\">' +
-                '<button class=\"fliq-btn fliq-btn-primary\" type=\"button\" data-fliq=\"sync-now\">Sync Now</button>' +
-                '<button class=\"fliq-btn\" type=\"button\" data-fliq=\"run-full-system-test\">Run Full System Test</button>' +
-            '</div>' +
-            '<div class=\"fliq-muted\" data-fliq-api-status style=\"margin-top:8px\">API status: ' + esc(state.detection.apiStatus || 'Not configured') +
-                (state.detection.lastApiPollAt ? ' · Last check ' + esc(new Date(state.detection.lastApiPollAt).toLocaleTimeString()) : '') +
-                (state.detection.lastApiError ? '<br>Error: ' + esc(state.detection.lastApiError) : '') + '</div>' +
-            '<div class=\"fliq-muted\" style=\"margin-top:4px\">Sync Now uses the same Torn API reconciliation as automatic polling and can be used even when automatic polling is off.</div>' +
-        '</div></div>' +
-        (dashboardTestResultVisible ? '<div class=\"fliq-section\"><h3>Full-System Test Results</h3>' + renderFullSystemAudit() + '</div>' : '') +
-        '<div class=\"fliq-section\"><h3>Quick Record</h3>' + eventForm() + '</div>' +"""
-          replace_once(old_dashboard, new_dashboard, 'dashboard tools')
+          quick_record = "        '<div class=\"fliq-section\"><h3>Quick Record</h3>' + eventForm() + '</div>' +"
+          dashboard_tools = (
+              "        '<div class=\"fliq-section\"><h3>Dashboard Tools</h3><div class=\"fliq-card\">' +\n"
+              "            '<div class=\"fliq-actions\" style=\"margin-top:0\">' +\n"
+              "                '<button class=\"fliq-btn fliq-btn-primary\" type=\"button\" data-fliq=\"sync-now\">Sync Now</button>' +\n"
+              "                '<button class=\"fliq-btn\" type=\"button\" data-fliq=\"run-full-system-test\">Run Full System Test</button>' +\n"
+              "            '</div>' +\n"
+              "            '<div class=\"fliq-muted\" data-fliq-api-status style=\"margin-top:8px\">API status: ' + esc(state.detection.apiStatus || 'Not configured') +\n"
+              "                (state.detection.lastApiPollAt ? ' · Last check ' + esc(new Date(state.detection.lastApiPollAt).toLocaleTimeString()) : '') +\n"
+              "                (state.detection.lastApiError ? '<br>Error: ' + esc(state.detection.lastApiError) : '') + '</div>' +\n"
+              "            '<div class=\"fliq-muted\" style=\"margin-top:4px\">Sync Now uses the same Torn API reconciliation as automatic polling and can be used even when automatic polling is off.</div>' +\n"
+              "        '</div></div>' +\n"
+              "        (dashboardTestResultVisible ? '<div class=\"fliq-section\"><h3>Full-System Test Results</h3>' + renderFullSystemAudit() + '</div>' : '') +\n"
+          )
+          replace_once(quick_record, dashboard_tools + quick_record, 'dashboard tools')
 
-          old_close = """        if (action === 'close') {
-            togglePanel(false);
-            return;
-        }
+          close_marker = (
+              "        if (action === 'close') {\n"
+              "            togglePanel(false);\n"
+              "            return;\n"
+              "        }\n\n"
+              "        if (action === 'toggle-profit-loss-breakdown') {"
+          )
+          control_handlers = (
+              "        if (action === 'close') {\n"
+              "            togglePanel(false);\n"
+              "            return;\n"
+              "        }\n\n"
+              "        if (action === 'sync-now') {\n"
+              "            if (!apiKeyValue()) {\n"
+              "                toast('Add Torn API key in Settings first');\n"
+              "                return;\n"
+              "            }\n"
+              "            if (apiPollBusy) {\n"
+              "                toast('Sync already running');\n"
+              "                return;\n"
+              "            }\n"
+              "            btn.disabled = true;\n"
+              "            btn.textContent = 'Syncing…';\n"
+              "            pollApiLogs(true, true).finally(function () {\n"
+              "                const current = document.querySelector('[data-fliq=\"sync-now\"]');\n"
+              "                if (current) {\n"
+              "                    current.disabled = false;\n"
+              "                    current.textContent = 'Sync Now';\n"
+              "                }\n"
+              "            });\n"
+              "            return;\n"
+              "        }\n\n"
+              "        if (action === 'run-full-system-test') {\n"
+              "            dashboardTestResultVisible = true;\n"
+              "            render();\n"
+              "            toast('Full-system test complete');\n"
+              "            return;\n"
+              "        }\n\n"
+              "        if (action === 'toggle-profit-loss-breakdown') {"
+          )
+          replace_once(close_marker, control_handlers, 'dashboard click handlers')
 
-        if (action === 'toggle-profit-loss-breakdown') {"""
-          new_close = """        if (action === 'close') {
-            togglePanel(false);
-            return;
-        }
-
-        if (action === 'sync-now') {
-            if (!apiKeyValue()) {
-                toast('Add Torn API key in Settings first');
-                return;
-            }
-            if (apiPollBusy) {
-                toast('Sync already running');
-                return;
-            }
-            btn.disabled = true;
-            btn.textContent = 'Syncing…';
-            pollApiLogs(true, true).finally(function () {
-                const current = document.querySelector('[data-fliq=\"sync-now\"]');
-                if (current) {
-                    current.disabled = false;
-                    current.textContent = 'Sync Now';
-                }
-            });
-            return;
-        }
-
-        if (action === 'run-full-system-test') {
-            dashboardTestResultVisible = true;
-            render();
-            toast('Full-system test complete');
-            return;
-        }
-
-        if (action === 'toggle-profit-loss-breakdown') {"""
-          replace_once(old_close, new_close, 'dashboard click handlers')
-
-          old_test_actions = """            '<div class=\"fliq-actions\"><button class=\"fliq-btn\" type=\"button\" data-fliq=\"copy-full-test-report\">Copy Full Test Report</button></div></div>';"""
-          new_test_actions = """            '<div class=\"fliq-actions\"><button class=\"fliq-btn fliq-btn-primary\" type=\"button\" data-fliq=\"run-full-system-test\">Run Full System Test</button><button class=\"fliq-btn\" type=\"button\" data-fliq=\"copy-full-test-report\">Copy Full Test Report</button></div></div>';"""
+          old_test_actions = "            '<div class=\"fliq-actions\"><button class=\"fliq-btn\" type=\"button\" data-fliq=\"copy-full-test-report\">Copy Full Test Report</button></div></div>';"
+          new_test_actions = "            '<div class=\"fliq-actions\"><button class=\"fliq-btn fliq-btn-primary\" type=\"button\" data-fliq=\"run-full-system-test\">Run Full System Test</button><button class=\"fliq-btn\" type=\"button\" data-fliq=\"copy-full-test-report\">Copy Full Test Report</button></div></div>';"
           replace_once(old_test_actions, new_test_actions, 'full-system test controls')
 
           path.write_text(s, encoding='utf-8')
 
-          # Guardrails: confirm all requested controls exist and accounting rules were not replaced.
           updated = path.read_text(encoding='utf-8')
           required = [
               "// @version      0.17.4",
