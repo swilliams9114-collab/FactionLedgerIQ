@@ -25,3 +25,4 @@ if old_boot not in s:
 s = s.replace(old_boot, new_boot, 1)
 
 p.write_text(s)
+# trigger workflow
