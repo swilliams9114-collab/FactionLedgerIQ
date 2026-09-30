@@ -1,0 +1,257 @@
+name: FactionLedgerIQ v0.17.5 one-time patch
+
+on:
+  push:
+    branches:
+      - v0.17.5-armory-return-order
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: v0.17.5-armory-return-order
+
+      - name: Patch FactionLedgerIQ
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('FactionLedgerIQ.user.js')
+          s = path.read_text(encoding='utf-8')
+
+          def replace_once(old, new, label):
+              global s
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected exactly 1 match, found {count}')
+              s = s.replace(old, new, 1)
+
+          replace_once('// @version      0.17.4', '// @version      0.17.5', 'userscript version')
+          replace_once("const VERSION = '0.17.4';", "const VERSION = '0.17.5';", 'runtime version')
+
+          # Reorder real faction movement reconciliation so an ARMORY_OUT that happened first
+          # exists in the ledger before a later ARMORY_IN from the same API response is classified.
+          fn = s.index('    async function reconcileFactionMovement(logs) {')
+          incoming = s.index('        // Observed ARMORY_IN signature:', fn)
+          outgoing = s.index('        // Observed ARMORY_OUT signature:', incoming)
+          tail = s.index('        return changed;\n    }\n\n    function tradeIdFromLog', outgoing)
+          incoming_block = s[incoming:outgoing].rstrip()
+          outgoing_block = s[outgoing:tail].rstrip()
+          s = s[:incoming] + outgoing_block + '\n\n' + incoming_block + '\n' + s[tail:]
+
+          broad_helper = '''    function factionHeldSourceForMovement(itemId, qty, eventTimestamp) {
+        const eventMs = Number(eventTimestamp || 0) * 1000;
+        const candidates = liveTransactions().filter(function (tx) {
+            if ((tx.type !== 'ARMORY_OUT' && tx.type !== 'FACTION_HELD_IN') || tx.ownership !== 'FACTION') return false;
+            if (tx.status !== 'HELD' && tx.status !== 'PENDING') return false;
+            if (String(tx.itemId || '') !== String(itemId || '')) return false;
+            const txMs = new Date(tx.timestamp).getTime();
+            if (!Number.isFinite(txMs) || !Number.isFinite(eventMs) || txMs > eventMs) return false;
+            const lot = lotForSource(tx.id) || ensureSourceLot(tx);
+            return lot && Number(lot.qtyRemaining || 0) >= Number(qty || 0);
+        }).sort(function (a,b) { return new Date(b.timestamp) - new Date(a.timestamp); });
+        return candidates.length === 1 ? candidates[0] : null;
+    }
+'''
+          fresh_helper = broad_helper + '''
+    function freshFactionHeldSourceForMovement(itemId, qty, eventTimestamp) {
+        const eventMs = Number(eventTimestamp || 0) * 1000;
+        const maxAgeMs = 10 * 60 * 1000;
+        const candidates = liveTransactions().filter(function (tx) {
+            if ((tx.type !== 'ARMORY_OUT' && tx.type !== 'FACTION_HELD_IN') || tx.ownership !== 'FACTION') return false;
+            if (tx.status !== 'HELD' && tx.status !== 'PENDING') return false;
+            if (String(tx.itemId || '') !== String(itemId || '')) return false;
+            if (Number(tx.qty || 0) < Number(qty || 0)) return false;
+            const txMs = new Date(tx.timestamp).getTime();
+            if (!Number.isFinite(txMs) || !Number.isFinite(eventMs) || txMs > eventMs || eventMs - txMs > maxAgeMs) return false;
+            const lot = lotForSource(tx.id) || ensureSourceLot(tx);
+            return lot && Number(lot.qtyRemaining || 0) >= Number(qty || 0);
+        }).sort(function (a,b) { return new Date(b.timestamp) - new Date(a.timestamp); });
+        return candidates.length === 1 ? candidates[0] : null;
+    }
+'''
+          replace_once(broad_helper, fresh_helper, 'fresh faction source helper')
+
+          old_source = '''                const exactRecentPurchase = recentPersonalPurchases.filter(function (p) {
+                    return Number(p.qty || 0) === qty;
+                }).length === 1;
+                const factionSource = exactRecentPurchase ? null : factionHeldSourceForMovement(itemId, qty, log.timestamp);
+'''
+          new_source = '''                const exactRecentPurchase = recentPersonalPurchases.filter(function (p) {
+                    return Number(p.qty || 0) === qty;
+                }).length === 1;
+                // A faction lot withdrawn in the preceding 10 minutes is stronger evidence
+                // of a return than an older unrelated purchase/open faction lot. This preserves
+                // v0.17.2's purchase protection while correctly pairing immediate returns.
+                const freshFactionSource = freshFactionHeldSourceForMovement(itemId, qty, log.timestamp);
+                const factionSource = freshFactionSource ||
+                    (exactRecentPurchase ? null : factionHeldSourceForMovement(itemId, qty, log.timestamp));
+'''
+          replace_once(old_source, new_source, 'fresh return precedence')
+
+          repair_anchor = '    function repairShadowedRecentPurchaseDepositsV0173() {'
+          repair_fn = '''    function repairFreshFactionReturnMisclassificationV0175() {
+        state.migrations = state.migrations || {};
+        if (state.migrations.freshFactionReturnOrderingV0175) return false;
+        let repaired = 0;
+        const txs = liveTransactions();
+        const deposits = txs.filter(function (dep) {
+            if (dep.type !== 'ARMORY_IN' || dep.detectionMethod !== 'API_FACTION_ARMORY_IN') return false;
+            if (dep.ownership !== 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT') return false;
+            if (dep.provenanceStatus !== 'PERSONAL_BASELINE_CONFIRMED') return false;
+            if (dep.status !== 'DEPOSITED' && dep.status !== 'RECORDED') return false;
+            if ((Array.isArray(dep.purchaseAllocationIds) && dep.purchaseAllocationIds.length) || dep.purchaseAllocationId) return false;
+            if (Array.isArray(dep.crimeRewardAllocationIds) && dep.crimeRewardAllocationIds.length) return false;
+            if (childrenOf(dep.id, 'REFUND').length) return false;
+            return true;
+        }).sort(function(a,b){ return new Date(a.timestamp)-new Date(b.timestamp); });
+
+        deposits.forEach(function (dep) {
+            const depMs = new Date(dep.timestamp).getTime();
+            if (!Number.isFinite(depMs)) return;
+            const matches = txs.filter(function (src) {
+                if (src.type !== 'ARMORY_OUT' || src.ownership !== 'FACTION') return false;
+                if (src.detectionMethod !== 'API_FACTION_ARMORY_OUT') return false;
+                if (src.status !== 'PENDING' && src.status !== 'HELD') return false;
+                if (String(src.itemId || '') !== String(dep.itemId || '')) return false;
+                if (Number(src.qty || 0) !== Number(dep.qty || 0)) return false;
+                if (src.factionId && dep.factionId && String(src.factionId) !== String(dep.factionId)) return false;
+                const srcMs = new Date(src.timestamp).getTime();
+                if (!Number.isFinite(srcMs) || srcMs > depMs || depMs - srcMs > 10*60*1000) return false;
+                if (childrenOf(src.id, 'ARMORY_IN').some(function(c){ return c.status !== 'VOID' && c.ownership === 'FACTION'; })) return false;
+                const lot = lotForSource(src.id) || ensureSourceLot(src);
+                return lot && Number(lot.qtyRemaining || 0) >= Number(dep.qty || 0);
+            }).sort(function(a,b){ return new Date(b.timestamp)-new Date(a.timestamp); });
+            if (matches.length !== 1) return;
+
+            ensureAccounting();
+            const hasActiveAllocation = state.accounting.allocations.some(function(a){
+                return a.status !== 'VOID' && a.movementId === dep.id;
+            });
+            if (hasActiveAllocation) return;
+
+            const src = matches[0];
+            dep.parentId = src.id;
+            dep.chainId = src.chainId || src.id;
+            dep.ownership = 'FACTION';
+            dep.provenanceStatus = 'FACTION_CONFIRMED';
+            dep.status = 'RETURNED';
+            dep.actualTotal = 0;
+            dep.billableTotal = 0;
+            dep.amount = 0;
+            dep.source = 'Personal Inventory';
+            dep.destination = 'Faction Armory';
+            dep.detectionMethod = 'API_FACTION_ARMORY_RETURN';
+            dep.notes = [dep.notes, 'v0.17.5 repair: exact same-item/same-quantity faction withdrawal within 10 minutes proves this was faction-owned stock returned to Armory; reimbursement removed.'].filter(Boolean).join(' | ');
+            if (allocateFactionLotSlice(src, dep, Number(dep.qty || 0), 'FACTION_RETURN')) repaired++;
+        });
+
+        state.migrations.freshFactionReturnOrderingV0175 = {
+            at: new Date().toISOString(), repaired: repaired,
+            rule: 'Repair only unallocated personal-baseline API Armory deposits with exactly one same-item/same-qty faction Armory withdrawal in the preceding 10 minutes and no reimbursement payment.'
+        };
+        if (repaired) state.detection.lastSource = 'v0.17.5 Armory return repair · ' + repaired + ' false reimbursement(s) removed';
+        state.updatedAt = new Date().toISOString();
+        localStorage.setItem(STATE_KEY, JSON.stringify(state));
+        return repaired > 0;
+    }
+
+'''
+          if repair_anchor not in s:
+              raise SystemExit('repair anchor not found')
+          s = s.replace(repair_anchor, repair_fn + repair_anchor, 1)
+
+          replace_once('    function init() {\n        repairShadowedRecentPurchaseDepositsV0173();',
+                       '    function init() {\n        repairFreshFactionReturnMisclassificationV0175();\n        repairShadowedRecentPurchaseDepositsV0173();',
+                       'init repair ordering')
+
+          test_anchor = '''        add('Faction-owned Armory returns owe $0', badFactionReimbursements.length === 0,
+            badFactionReimbursements.length ? badFactionReimbursements.map(function(tx){
+                return (tx.itemName||'Item')+' × '+Number(tx.qty||0).toLocaleString()+
+                    ' · '+tx.id+' · calculated due '+money(reimbursementCalculation(tx).due)+
+                    ' · status '+String(tx.status||'')+' · source '+String(tx.source||'');
+            }).join(' | ') : 'Faction property does not create reimbursement.');
+'''
+          test_add = test_anchor + '''
+        const misclassifiedFreshFactionReturns = txs.filter(function(dep){
+            if(dep.type!=='ARMORY_IN'||dep.detectionMethod!=='API_FACTION_ARMORY_IN'||
+                dep.ownership!=='PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT') return false;
+            const depMs=new Date(dep.timestamp).getTime();
+            if(!Number.isFinite(depMs)) return false;
+            return txs.some(function(src){
+                if(src.type!=='ARMORY_OUT'||src.ownership!=='FACTION'||src.detectionMethod!=='API_FACTION_ARMORY_OUT') return false;
+                if(String(src.itemId||'')!==String(dep.itemId||'')||Number(src.qty||0)!==Number(dep.qty||0)) return false;
+                const srcMs=new Date(src.timestamp).getTime();
+                return Number.isFinite(srcMs)&&srcMs<=depMs&&depMs-srcMs<=10*60*1000;
+            });
+        });
+        add('Regression: fresh faction Armory return creates no reimbursement', misclassifiedFreshFactionReturns.length===0,
+            misclassifiedFreshFactionReturns.length ? misclassifiedFreshFactionReturns.map(function(dep){
+                return (dep.itemName||'Item')+' × '+Number(dep.qty||0)+' · '+dep.id+' · due '+money(reimbursementCalculation(dep).due);
+            }).join(' | ') : 'A same-item/same-qty faction withdrawal returned within 10 minutes is retained as faction-owned and owes $0.');
+'''
+          replace_once(test_anchor, test_add, 'fresh return regression test')
+
+          old_risk = '''        const ambiguousFactionReturnRisk=txs.filter(function(tx){
+            if(tx.type!=='ARMORY_IN'||tx.ownership!=='FACTION'||tx.detectionMethod!=='API_FACTION_ARMORY_RETURN')return false;
+            const t=new Date(tx.timestamp).getTime();
+            return txs.some(function(p){return p.type==='PURCHASE'&&p.status==='PENDING'&&String(p.itemId||'')===String(tx.itemId||'')&&
+                Number(p.qty||0)===Number(tx.qty||0)&&new Date(p.timestamp).getTime()<=t&&t-new Date(p.timestamp).getTime()<=7*24*60*60*1000;});
+        });
+'''
+          new_risk = '''        const ambiguousFactionReturnRisk=txs.filter(function(tx){
+            if(tx.type!=='ARMORY_IN'||tx.ownership!=='FACTION'||tx.detectionMethod!=='API_FACTION_ARMORY_RETURN')return false;
+            const t=new Date(tx.timestamp).getTime();
+            const provenFreshParent = tx.parentId && txs.some(function(src){
+                if(src.id!==tx.parentId||src.type!=='ARMORY_OUT'||src.ownership!=='FACTION')return false;
+                const srcMs=new Date(src.timestamp).getTime();
+                return Number.isFinite(srcMs)&&Number.isFinite(t)&&srcMs<=t&&t-srcMs<=10*60*1000&&
+                    String(src.itemId||'')===String(tx.itemId||'')&&Number(src.qty||0)>=Number(tx.qty||0);
+            });
+            if(provenFreshParent)return false;
+            return txs.some(function(p){return p.type==='PURCHASE'&&p.status==='PENDING'&&String(p.itemId||'')===String(tx.itemId||'')&&
+                Number(p.qty||0)===Number(tx.qty||0)&&new Date(p.timestamp).getTime()<=t&&t-new Date(p.timestamp).getTime()<=7*24*60*60*1000;});
+        });
+'''
+          replace_once(old_risk, new_risk, 'purchase-shadow regression exemption for proven fresh returns')
+
+          path.write_text(s, encoding='utf-8')
+
+          updated = path.read_text(encoding='utf-8')
+          required = [
+              '// @version      0.17.5',
+              "const VERSION = '0.17.5';",
+              'function freshFactionHeldSourceForMovement',
+              'function repairFreshFactionReturnMisclassificationV0175',
+              'Regression: fresh faction Armory return creates no reimbursement',
+              'repairFreshFactionReturnMisclassificationV0175();'
+          ]
+          missing = [x for x in required if x not in updated]
+          if missing:
+              raise SystemExit('Missing required markers: ' + repr(missing))
+          fn = updated.index('    async function reconcileFactionMovement(logs) {')
+          fn_end = updated.index('    function tradeIdFromLog', fn)
+          body = updated[fn:fn_end]
+          if body.index('// Observed ARMORY_OUT signature:') > body.index('// Observed ARMORY_IN signature:'):
+              raise SystemExit('Armory movement ordering guard failed: IN still precedes OUT')
+          PY
+
+      - name: JavaScript syntax check
+        run: node --check FactionLedgerIQ.user.js
+
+      - name: Remove one-time workflow and commit patch
+        shell: bash
+        run: |
+          rm .github/workflows/fliq-v0175-patch.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add FactionLedgerIQ.user.js .github/workflows/fliq-v0175-patch.yml
+          git commit -m "v0.17.5 fix faction Armory return ordering and repair false reimbursement"
+          git push origin HEAD:v0.17.5-armory-return-order
