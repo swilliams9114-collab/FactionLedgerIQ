@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      0.17.4
+// @version      0.17.5
 // @description  TornPDA-first faction purchase, asset, reimbursement, and receipt ledger.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.17.4';
+    const VERSION = '0.17.5';
     const STATE_KEY = 'factionledgeriq_state_v1';
     const DOCK_ID = 'factionledgeriq-dock-btn';
     const PANEL_ID = 'factionledgeriq-panel';
@@ -1044,6 +1044,22 @@
         return candidates.length === 1 ? candidates[0] : null;
     }
 
+    function freshFactionHeldSourceForMovement(itemId, qty, eventTimestamp) {
+        const eventMs = Number(eventTimestamp || 0) * 1000;
+        const maxAgeMs = 10 * 60 * 1000;
+        const candidates = liveTransactions().filter(function (tx) {
+            if ((tx.type !== 'ARMORY_OUT' && tx.type !== 'FACTION_HELD_IN') || tx.ownership !== 'FACTION') return false;
+            if (tx.status !== 'HELD' && tx.status !== 'PENDING') return false;
+            if (String(tx.itemId || '') !== String(itemId || '')) return false;
+            if (Number(tx.qty || 0) < Number(qty || 0)) return false;
+            const txMs = new Date(tx.timestamp).getTime();
+            if (!Number.isFinite(txMs) || !Number.isFinite(eventMs) || txMs > eventMs || eventMs - txMs > maxAgeMs) return false;
+            const lot = lotForSource(tx.id) || ensureSourceLot(tx);
+            return lot && Number(lot.qtyRemaining || 0) >= Number(qty || 0);
+        }).sort(function (a,b) { return new Date(b.timestamp) - new Date(a.timestamp); });
+        return candidates.length === 1 ? candidates[0] : null;
+    }
+
     function allocateFactionLotSlice(source, movement, qty, kind) {
         ensureAccounting();
         const lot = lotForSource(source.id) || ensureSourceLot(source);
@@ -1069,82 +1085,6 @@
         try { await ensureItemCatalog(false); } catch (e) {}
         const actorId = String(state.settings.playerId || '').trim();
         let changed = false;
-
-        // Observed ARMORY_IN signature: faction + items[], with no sender/receiver.
-        // This is distinct from Item Market purchases because there are no cost fields/seller.
-        (logs || []).forEach(function (log) {
-            const data = log && log.data && typeof log.data === 'object' ? log.data : {};
-            const rows = Array.isArray(data.items) ? data.items : [];
-            if (data.faction == null || !rows.length || data.sender != null || data.receiver != null) return;
-            if (data.cost_total != null || data.cost_each != null || data.seller != null) return;
-
-            rows.forEach(function (row) {
-                const itemId = String(row.id || row.item_id || '').trim();
-                const qty = Math.max(1, Number(row.qty || row.quantity || 1));
-                if (!itemId) return;
-                const key = ['IN', log.timestamp || 0, data.faction, itemId, qty, logId(log)].join('|');
-                if (liveTransactions().some(function (tx) {
-                    return tx.factionMovementKey === key ||
-                        sameMovement(tx, 'ARMORY_IN', log.timestamp, data.faction, itemId, qty);
-                })) return;
-
-                const item = itemCatalog.find(function (x) { return String(x.id) === itemId; });
-                const mvEach = item ? Math.max(0, Number(item.marketValue || 0)) : 0;
-                const mvTotal = mvEach * qty;
-                // A recent unmatched personal purchase of the same item is stronger
-                // provenance evidence than an older faction-held lot. Without this guard,
-                // common items (Beer, meds, temps) can be misclassified as faction returns
-                // merely because an unrelated open faction lot of that item exists.
-                const eventMs = Number(log.timestamp || 0) * 1000;
-                const recentPersonalPurchases = liveTransactions().filter(function (p) {
-                    if (p.type !== 'PURCHASE' || p.status !== 'PENDING') return false;
-                    if (String(p.itemId || '') !== itemId) return false;
-                    const pMs = new Date(p.timestamp).getTime();
-                    return Number.isFinite(pMs) && Number.isFinite(eventMs) && pMs <= eventMs &&
-                        eventMs - pMs <= 7*24*60*60*1000;
-                });
-                const exactRecentPurchase = recentPersonalPurchases.filter(function (p) {
-                    return Number(p.qty || 0) === qty;
-                }).length === 1;
-                const factionSource = exactRecentPurchase ? null : factionHeldSourceForMovement(itemId, qty, log.timestamp);
-                if (factionSource) {
-                    const returned = {
-                        id: uid('TX'), chainId: factionSource.chainId || factionSource.id, parentId: factionSource.id,
-                        type: 'ARMORY_IN',
-                        timestamp: log.timestamp ? new Date(Number(log.timestamp) * 1000).toISOString() : new Date().toISOString(),
-                        itemName: factionSource.itemName || (item ? item.name : ('Item #' + itemId)),
-                        itemId: itemId, qty: qty, actualTotal: 0, mvTotal: mvTotal, mvEach: mvEach,
-                        billableTotal: 0, amount: 0, source: 'Personal Inventory', destination: 'Faction Armory',
-                        personName: state.settings.playerName, personId: state.settings.playerId,
-                        notes: 'API-confirmed return of faction-owned inventory to faction armory. No reimbursement created.',
-                        ownership: 'FACTION', status: 'RETURNED', detectionMethod: 'API_FACTION_ARMORY_RETURN',
-                        factionId: String(data.faction), factionMovementKey: key,
-                        apiLogIds: [logId(log)].filter(Boolean), createdAt: new Date().toISOString()
-                    };
-                    state.transactions.push(returned);
-                    allocateFactionLotSlice(factionSource, returned, qty, 'FACTION_RETURN');
-                    changed = true;
-                    return;
-                }
-                state.transactions.push({
-                    id: uid('TX'), chainId: uid('CHAIN'), parentId: null,
-                    type: 'ARMORY_IN',
-                    timestamp: log.timestamp ? new Date(Number(log.timestamp) * 1000).toISOString() : new Date().toISOString(),
-                    itemName: item ? item.name : ('Item #' + itemId), itemId: itemId, qty: qty,
-                    actualTotal: 0, mvTotal: mvTotal, mvEach: mvEach,
-                    billableTotal: mvTotal, amount: mvTotal,
-                    source: 'Personal Inventory', destination: 'Faction Armory',
-                    personName: state.settings.playerName, personId: state.settings.playerId,
-                    notes: 'API-confirmed personal inventory deposit to faction armory. Full deposited quantity valued at movement-time MV.',
-                    ownership: 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT',
-                    provenanceStatus: 'PERSONAL_BASELINE_CONFIRMED',
-                    status: 'DEPOSITED', detectionMethod: 'API_FACTION_ARMORY_IN',
-                    factionId: String(data.faction), factionMovementKey: key,
-                    apiLogIds: [logId(log)].filter(Boolean), createdAt: new Date().toISOString()
-                });
-                changed = true;
-            });
-        });
 
         // Observed ARMORY_OUT signature: matching sender/receiver events for the player.
         const parts = (logs || []).map(factionTransferPart).filter(Boolean);
@@ -1184,6 +1124,87 @@
                 createdAt: new Date().toISOString()
             });
             changed = true;
+        });
+
+        // Observed ARMORY_IN signature: faction + items[], with no sender/receiver.
+        // This is distinct from Item Market purchases because there are no cost fields/seller.
+        (logs || []).forEach(function (log) {
+            const data = log && log.data && typeof log.data === 'object' ? log.data : {};
+            const rows = Array.isArray(data.items) ? data.items : [];
+            if (data.faction == null || !rows.length || data.sender != null || data.receiver != null) return;
+            if (data.cost_total != null || data.cost_each != null || data.seller != null) return;
+
+            rows.forEach(function (row) {
+                const itemId = String(row.id || row.item_id || '').trim();
+                const qty = Math.max(1, Number(row.qty || row.quantity || 1));
+                if (!itemId) return;
+                const key = ['IN', log.timestamp || 0, data.faction, itemId, qty, logId(log)].join('|');
+                if (liveTransactions().some(function (tx) {
+                    return tx.factionMovementKey === key ||
+                        sameMovement(tx, 'ARMORY_IN', log.timestamp, data.faction, itemId, qty);
+                })) return;
+
+                const item = itemCatalog.find(function (x) { return String(x.id) === itemId; });
+                const mvEach = item ? Math.max(0, Number(item.marketValue || 0)) : 0;
+                const mvTotal = mvEach * qty;
+                // A recent unmatched personal purchase of the same item is stronger
+                // provenance evidence than an older faction-held lot. Without this guard,
+                // common items (Beer, meds, temps) can be misclassified as faction returns
+                // merely because an unrelated open faction lot of that item exists.
+                const eventMs = Number(log.timestamp || 0) * 1000;
+                const recentPersonalPurchases = liveTransactions().filter(function (p) {
+                    if (p.type !== 'PURCHASE' || p.status !== 'PENDING') return false;
+                    if (String(p.itemId || '') !== itemId) return false;
+                    const pMs = new Date(p.timestamp).getTime();
+                    return Number.isFinite(pMs) && Number.isFinite(eventMs) && pMs <= eventMs &&
+                        eventMs - pMs <= 7*24*60*60*1000;
+                });
+                const exactRecentPurchase = recentPersonalPurchases.filter(function (p) {
+                    return Number(p.qty || 0) === qty;
+                }).length === 1;
+                // A faction lot withdrawn in the preceding 10 minutes is stronger evidence
+                // of a return than an older unrelated purchase/open faction lot. This preserves
+                // v0.17.2's purchase protection while correctly pairing immediate returns.
+                const freshFactionSource = freshFactionHeldSourceForMovement(itemId, qty, log.timestamp);
+                const factionSource = freshFactionSource ||
+                    (exactRecentPurchase ? null : factionHeldSourceForMovement(itemId, qty, log.timestamp));
+                if (factionSource) {
+                    const returned = {
+                        id: uid('TX'), chainId: factionSource.chainId || factionSource.id, parentId: factionSource.id,
+                        type: 'ARMORY_IN',
+                        timestamp: log.timestamp ? new Date(Number(log.timestamp) * 1000).toISOString() : new Date().toISOString(),
+                        itemName: factionSource.itemName || (item ? item.name : ('Item #' + itemId)),
+                        itemId: itemId, qty: qty, actualTotal: 0, mvTotal: mvTotal, mvEach: mvEach,
+                        billableTotal: 0, amount: 0, source: 'Personal Inventory', destination: 'Faction Armory',
+                        personName: state.settings.playerName, personId: state.settings.playerId,
+                        notes: 'API-confirmed return of faction-owned inventory to faction armory. No reimbursement created.',
+                        ownership: 'FACTION', status: 'RETURNED', detectionMethod: 'API_FACTION_ARMORY_RETURN',
+                        factionId: String(data.faction), factionMovementKey: key,
+                        apiLogIds: [logId(log)].filter(Boolean), createdAt: new Date().toISOString()
+                    };
+                    state.transactions.push(returned);
+                    allocateFactionLotSlice(factionSource, returned, qty, 'FACTION_RETURN');
+                    changed = true;
+                    return;
+                }
+                state.transactions.push({
+                    id: uid('TX'), chainId: uid('CHAIN'), parentId: null,
+                    type: 'ARMORY_IN',
+                    timestamp: log.timestamp ? new Date(Number(log.timestamp) * 1000).toISOString() : new Date().toISOString(),
+                    itemName: item ? item.name : ('Item #' + itemId), itemId: itemId, qty: qty,
+                    actualTotal: 0, mvTotal: mvTotal, mvEach: mvEach,
+                    billableTotal: mvTotal, amount: mvTotal,
+                    source: 'Personal Inventory', destination: 'Faction Armory',
+                    personName: state.settings.playerName, personId: state.settings.playerId,
+                    notes: 'API-confirmed personal inventory deposit to faction armory. Full deposited quantity valued at movement-time MV.',
+                    ownership: 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT',
+                    provenanceStatus: 'PERSONAL_BASELINE_CONFIRMED',
+                    status: 'DEPOSITED', detectionMethod: 'API_FACTION_ARMORY_IN',
+                    factionId: String(data.faction), factionMovementKey: key,
+                    apiLogIds: [logId(log)].filter(Boolean), createdAt: new Date().toISOString()
+                });
+                changed = true;
+            });
         });
         return changed;
     }
@@ -3875,6 +3896,23 @@
                     ' · status '+String(tx.status||'')+' · source '+String(tx.source||'');
             }).join(' | ') : 'Faction property does not create reimbursement.');
 
+        const misclassifiedFreshFactionReturns = txs.filter(function(dep){
+            if(dep.type!=='ARMORY_IN'||dep.detectionMethod!=='API_FACTION_ARMORY_IN'||
+                dep.ownership!=='PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT') return false;
+            const depMs=new Date(dep.timestamp).getTime();
+            if(!Number.isFinite(depMs)) return false;
+            return txs.some(function(src){
+                if(src.type!=='ARMORY_OUT'||src.ownership!=='FACTION'||src.detectionMethod!=='API_FACTION_ARMORY_OUT') return false;
+                if(String(src.itemId||'')!==String(dep.itemId||'')||Number(src.qty||0)!==Number(dep.qty||0)) return false;
+                const srcMs=new Date(src.timestamp).getTime();
+                return Number.isFinite(srcMs)&&srcMs<=depMs&&depMs-srcMs<=10*60*1000;
+            });
+        });
+        add('Regression: fresh faction Armory return creates no reimbursement', misclassifiedFreshFactionReturns.length===0,
+            misclassifiedFreshFactionReturns.length ? misclassifiedFreshFactionReturns.map(function(dep){
+                return (dep.itemName||'Item')+' × '+Number(dep.qty||0)+' · '+dep.id+' · due '+money(reimbursementCalculation(dep).due);
+            }).join(' | ') : 'A same-item/same-qty faction withdrawal returned within 10 minutes is retained as faction-owned and owes $0.');
+
         const badDisplay = inv.filter(function(x){ return Number(x.qty||0) > Number(x.factionQty||0); });
         add('Display Case stock is faction-owned', badDisplay.length === 0,
             badDisplay.length ? badDisplay.map(function(x){return x.itemName;}).slice(0,5).join(', ') : 'Every Display Case unit is included in faction-owned quantity.');
@@ -4021,6 +4059,13 @@
         const ambiguousFactionReturnRisk=txs.filter(function(tx){
             if(tx.type!=='ARMORY_IN'||tx.ownership!=='FACTION'||tx.detectionMethod!=='API_FACTION_ARMORY_RETURN')return false;
             const t=new Date(tx.timestamp).getTime();
+            const provenFreshParent = tx.parentId && txs.some(function(src){
+                if(src.id!==tx.parentId||src.type!=='ARMORY_OUT'||src.ownership!=='FACTION')return false;
+                const srcMs=new Date(src.timestamp).getTime();
+                return Number.isFinite(srcMs)&&Number.isFinite(t)&&srcMs<=t&&t-srcMs<=10*60*1000&&
+                    String(src.itemId||'')===String(tx.itemId||'')&&Number(src.qty||0)>=Number(tx.qty||0);
+            });
+            if(provenFreshParent)return false;
             return txs.some(function(p){return p.type==='PURCHASE'&&p.status==='PENDING'&&String(p.itemId||'')===String(tx.itemId||'')&&
                 Number(p.qty||0)===Number(tx.qty||0)&&new Date(p.timestamp).getTime()<=t&&t-new Date(p.timestamp).getTime()<=7*24*60*60*1000;});
         });
@@ -5128,6 +5173,72 @@
         return archived > 0;
     }
 
+    function repairFreshFactionReturnMisclassificationV0175() {
+        state.migrations = state.migrations || {};
+        if (state.migrations.freshFactionReturnOrderingV0175) return false;
+        let repaired = 0;
+        const txs = liveTransactions();
+        const deposits = txs.filter(function (dep) {
+            if (dep.type !== 'ARMORY_IN' || dep.detectionMethod !== 'API_FACTION_ARMORY_IN') return false;
+            if (dep.ownership !== 'PERSONAL_CONTRIBUTION_PENDING_REIMBURSEMENT') return false;
+            if (dep.provenanceStatus !== 'PERSONAL_BASELINE_CONFIRMED') return false;
+            if (dep.status !== 'DEPOSITED' && dep.status !== 'RECORDED') return false;
+            if ((Array.isArray(dep.purchaseAllocationIds) && dep.purchaseAllocationIds.length) || dep.purchaseAllocationId) return false;
+            if (Array.isArray(dep.crimeRewardAllocationIds) && dep.crimeRewardAllocationIds.length) return false;
+            if (childrenOf(dep.id, 'REFUND').length) return false;
+            return true;
+        }).sort(function(a,b){ return new Date(a.timestamp)-new Date(b.timestamp); });
+
+        deposits.forEach(function (dep) {
+            const depMs = new Date(dep.timestamp).getTime();
+            if (!Number.isFinite(depMs)) return;
+            const matches = txs.filter(function (src) {
+                if (src.type !== 'ARMORY_OUT' || src.ownership !== 'FACTION') return false;
+                if (src.detectionMethod !== 'API_FACTION_ARMORY_OUT') return false;
+                if (src.status !== 'PENDING' && src.status !== 'HELD') return false;
+                if (String(src.itemId || '') !== String(dep.itemId || '')) return false;
+                if (Number(src.qty || 0) !== Number(dep.qty || 0)) return false;
+                if (src.factionId && dep.factionId && String(src.factionId) !== String(dep.factionId)) return false;
+                const srcMs = new Date(src.timestamp).getTime();
+                if (!Number.isFinite(srcMs) || srcMs > depMs || depMs - srcMs > 10*60*1000) return false;
+                if (childrenOf(src.id, 'ARMORY_IN').some(function(c){ return c.status !== 'VOID' && c.ownership === 'FACTION'; })) return false;
+                const lot = lotForSource(src.id) || ensureSourceLot(src);
+                return lot && Number(lot.qtyRemaining || 0) >= Number(dep.qty || 0);
+            }).sort(function(a,b){ return new Date(b.timestamp)-new Date(a.timestamp); });
+            if (matches.length !== 1) return;
+
+            ensureAccounting();
+            const hasActiveAllocation = state.accounting.allocations.some(function(a){
+                return a.status !== 'VOID' && a.movementId === dep.id;
+            });
+            if (hasActiveAllocation) return;
+
+            const src = matches[0];
+            dep.parentId = src.id;
+            dep.chainId = src.chainId || src.id;
+            dep.ownership = 'FACTION';
+            dep.provenanceStatus = 'FACTION_CONFIRMED';
+            dep.status = 'RETURNED';
+            dep.actualTotal = 0;
+            dep.billableTotal = 0;
+            dep.amount = 0;
+            dep.source = 'Personal Inventory';
+            dep.destination = 'Faction Armory';
+            dep.detectionMethod = 'API_FACTION_ARMORY_RETURN';
+            dep.notes = [dep.notes, 'v0.17.5 repair: exact same-item/same-quantity faction withdrawal within 10 minutes proves this was faction-owned stock returned to Armory; reimbursement removed.'].filter(Boolean).join(' | ');
+            if (allocateFactionLotSlice(src, dep, Number(dep.qty || 0), 'FACTION_RETURN')) repaired++;
+        });
+
+        state.migrations.freshFactionReturnOrderingV0175 = {
+            at: new Date().toISOString(), repaired: repaired,
+            rule: 'Repair only unallocated personal-baseline API Armory deposits with exactly one same-item/same-qty faction Armory withdrawal in the preceding 10 minutes and no reimbursement payment.'
+        };
+        if (repaired) state.detection.lastSource = 'v0.17.5 Armory return repair ·%' + repaired + ' false reimbursement(s) removed';
+        state.updatedAt = new Date().toISOString();
+        localStorage.setItem(STATE_KEY, JSON.stringify(state));
+        return repaired > 0;
+    }
+
     function repairShadowedRecentPurchaseDepositsV0173() {
         state.migrations = state.migrations || {};
         if (state.migrations.shadowedPurchaseDepositsV0173) return false;
@@ -5200,6 +5311,7 @@
     }
 
     function init() {
+        repairFreshFactionReturnMisclassificationV0175();
         repairShadowedRecentPurchaseDepositsV0173();
         repairCrimeAllocationFieldsV0152();
         repairRepeatedCrimeRewardAllocationsV0147();
