@@ -86,3 +86,4 @@ s=s[:m.start()]+advanced+s[m.end():]
 s=s.replace('Clear & Rebuild Cache only refreshes market/catalog data and does not touch inventory, claims, receipts, payments, or history. Reset Ledger Data clears ledger records but preserves Profile, API settings, and Whitelist. A local undo snapshot is created first.','Clear & Rebuild Cache refreshes item/market information only. Reset Ledger Data clears tracked item activity and reimbursements but keeps your profile, API settings, and whitelist. LedgerIQ saves a recovery copy first.',1)
 
 p.write_text(s)
+# trigger
