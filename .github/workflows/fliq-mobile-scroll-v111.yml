@@ -1,0 +1,16 @@
+name: FLIQ mobile scroll fix
+on: [push]
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Run FLIQ mobile scroll fix'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python tools/patch_mobile_scroll_v111.py
+      - run: node --check FactionLedgerIQ.user.js
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add FactionLedgerIQ.user.js
+          git commit -m "Fix mobile scrolling and summary labels" || exit 0
+          git push
