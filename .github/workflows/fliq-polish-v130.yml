@@ -1,28 +1,16 @@
-name: FLIQ polish v1.3.0
+name: FLIQ wording cleanup
 on: [push]
 permissions:
   contents: write
 jobs:
   apply:
-    if: github.event.head_commit.message == 'Run FactionLedgerIQ polish patch'
+    if: github.event.head_commit.message == 'Run FactionLedgerIQ wording cleanup'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Make regex replacement literal-safe
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('tools/patch_polish_v130.py')
-          s=p.read_text()
-          old=",receipt+'\\nfunction generateReceipt',s,count=1,flags=re.S)"
-          new=",lambda _m: receipt+'\\nfunction generateReceipt',s,count=1,flags=re.S)"
-          if old not in s:
-              raise SystemExit('receipt replacement anchor missing')
-          p.write_text(s.replace(old,new,1))
-          PY
       - run: python tools/patch_polish_v130.py
       - run: node --check FactionLedgerIQ.user.js
       - uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: Polish FactionLedgerIQ wording and leadership UI
+          commit_message: Finish plain-English FactionLedgerIQ wording
           file_pattern: FactionLedgerIQ.user.js
