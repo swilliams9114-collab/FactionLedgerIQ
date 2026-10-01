@@ -1,0 +1,16 @@
+name: FLIQ ultra compact receipts v1.4.3
+on: [push]
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Run v1.4.3 ultra compact receipt patch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: python tools/patch_ultra_compact_receipts_v143.py
+      - run: node --check FactionLedgerIQ.user.js
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'FactionLedgerIQ v1.4.3 ultra compact receipt codes'
+          file_pattern: 'FactionLedgerIQ.user.js'
