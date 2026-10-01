@@ -43,3 +43,4 @@ s=s.replace("${state.settings.displayTracking?'<select id=\"fliq-open-location\"
 s=s.replace("try{localMove(i.id,q,a==='display-in'?INV:DISP,a==='display-in'?DISP:INV);save();}","try{if(a==='display-in')moveToFactionDisplay(i.id,q);else moveFromFactionDisplay(i.id,q);save();}")
 
 p.write_text(s)
+# trigger
