@@ -9,3 +9,4 @@ if old not in s:
     raise SystemExit('API settings block not found')
 s=s.replace(old,new,1)
 p.write_text(s)
+# trigger
