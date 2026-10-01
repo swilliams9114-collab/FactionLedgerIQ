@@ -1,0 +1,16 @@
+name: FLIQ finance log receipts v1.4.5
+on: [push]
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Run v1.4.5 finance log receipt patch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: python tools/patch_finance_log_receipts_v145.py
+      - run: node --check FactionLedgerIQ.user.js
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'FactionLedgerIQ v1.4.5 finance log receipts'
+          file_pattern: 'FactionLedgerIQ.user.js'
