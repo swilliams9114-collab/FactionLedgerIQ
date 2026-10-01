@@ -1,0 +1,18 @@
+name: FLIQ IndexedDB recovery v1.2.5
+on: [push]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Run FactionLedgerIQ IndexedDB recovery patch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python tools/patch_indexeddb_recovery_v125.py
+      - run: node --check FactionLedgerIQ.user.js
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add FactionLedgerIQ.user.js
+          git commit -m "Move recovery snapshots to IndexedDB" || exit 0
+          git push
