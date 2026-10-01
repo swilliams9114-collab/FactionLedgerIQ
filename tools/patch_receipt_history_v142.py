@@ -1,5 +1,4 @@
 from pathlib import Path
-import re
 
 p=Path('FactionLedgerIQ.user.js')
 s=p.read_text()
@@ -36,15 +35,23 @@ old_ver="r.verification==='INDEPENDENT_API'?'Leadership confirmed':r.verificatio
 assert old_ver in s, 'audit verification label expression not found'
 s=s.replace(old_ver,"leadershipVerifyLabel(r.verification)",1)
 
-old_claim_tail="${paid.slice(0,30).map(c=>`<div class=\\\"fliq-list-item\\\"><b>${esc(c.itemName)}</b> ×${Number(c.qty||0).toLocaleString()} · ${money(c.amount)}<div class=\\\"fliq-muted\\\">${esc(fmt(c.reimbursedAt))} · ${esc(c.id)}</div></div>`).join('')||'<div class=\\\"fliq-muted\\\">No reimbursements have been marked paid yet.</div>'}</div></div>`;}"
-new_claim_tail=old_claim_tail[:-3]+"${paymentReceiptHistoryHtml('Payment Receipt History')}`;}"
-assert old_claim_tail in s, 'claimsHtml tail not found'
-s=s.replace(old_claim_tail,new_claim_tail,1)
+# Append payment receipt history to Money Owed without relying on escaped HTML details.
+cs=s.index('function claimsHtml()')
+ce=s.index('function auditHtml()',cs)
+block=s[cs:ce]
+pos=block.rfind('`;')
+assert pos!=-1, 'claimsHtml return end not found'
+block=block[:pos]+"${paymentReceiptHistoryHtml('Payment Receipt History')}"+block[pos:]
+s=s[:cs]+block+s[ce:]
 
-old_audit_tail="${paid.map(a=>`<div class=\\\"fliq-list-item\\\"><b>${esc(a.playerName||a.playerId)}</b> · ${esc(a.itemName)} ×${Number(a.qty||0).toLocaleString()} · ${money(a.amount)}<div class=\\\"fliq-muted\\\">${esc(a.claimId)} · ${esc(fmt(a.paidAt))}${a.verificationMethod?' · '+esc(a.verificationMethod==='MANUAL_LEADERSHIP'?'Manual check':'Leadership confirmed'):''}</div></div>`).join('')||'<div class=\\\"fliq-muted\\\">No leadership payments recorded yet.</div>'}</div></div>`;}"
-new_audit_tail=old_audit_tail[:-3]+"${paymentReceiptHistoryHtml('Payment Receipt History')}`;}"
-assert old_audit_tail in s, 'auditHtml tail not found'
-s=s.replace(old_audit_tail,new_audit_tail,1)
+# Append payment receipt history to Leadership.
+as_=s.index('function auditHtml()')
+ae=s.index('function settingsHtml()',as_)
+block=s[as_:ae]
+pos=block.rfind('`;')
+assert pos!=-1, 'auditHtml return end not found'
+block=block[:pos]+"${paymentReceiptHistoryHtml('Payment Receipt History')}"+block[pos:]
+s=s[:as_]+block+s[ae:]
 
 old_action="if(a==='view-receipt'){openReceiptBatch(String(t.dataset.id||''));return;}"
 new_action=old_action+"if(a==='view-payment-receipt'){openPaymentBatch(String(t.dataset.id||''));return;}"
