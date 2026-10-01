@@ -14,3 +14,4 @@ jobs:
         with:
           commit_message: Add Torn custom API key button
           file_pattern: FactionLedgerIQ.user.js
+# trigger
