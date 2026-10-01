@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FactionLedgerIQ
 // @namespace    FactionLedgerIQ
-// @version      1.3.1
+// @version      1.3.2
 // @description  Simple TornPDA-first faction inventory, raffle ownership, claims, receipts, and leadership audit.
 // @match        *://www.torn.com/*
 // @match        *://torn.com/*
@@ -11,7 +11,7 @@
 (function () {
 'use strict';
 
-const VERSION='1.3.1';
+const VERSION='1.3.2';
 const STATE_KEY='factionledgeriq_v1_state';
 const PRE_RESTORE_KEY='factionledgeriq_v1_pre_restore';
 const PRE_RESET_KEY='factionledgeriq_v1_pre_reset';
@@ -109,7 +109,7 @@ function runHealthCheck(){const checks=[],add=(name,severity,detail)=>checks.pus
  const reviews=(state.movements||[]).filter(m=>m&&m.status==='REVIEW'&&Number(m.unknownQty||0)>0);add('Ownership reviews',reviews.length?'WARN':'PASS',reviews.length?reviews.length+' movement(s) still need ownership classification.':'No unresolved ownership reviews.');
  if(state.diagnostics&&state.diagnostics.apiStatus==='Error')add('API status','WARN','Last API sync is in an error state: '+String(state.diagnostics.lastApiError||'Unknown API error'));else add('API status','PASS','No current API error is recorded.');
  const failCount=checks.filter(x=>x.severity==='FAIL').length,warnCount=checks.filter(x=>x.severity==='WARN').length;healthReport={runAt:new Date().toISOString(),status:failCount?'FAIL':warnCount?'WARNING':'PASS',failCount,warnCount,checks};render();toast(failCount?'Diagnostics found '+failCount+' failure(s)':warnCount?'Diagnostics passed with '+warnCount+' warning(s)':'Diagnostics passed');}
-function diagnosticsHtml(){const r=healthReport;if(!r)return `<div class="fliq-section"><div class="fliq-section-title"><span>Diagnostics / Health Check</span><span class="fliq-pill">NOT RUN</span></div><div class="fliq-muted">Read-only checks for duplicate IDs, impossible inventory balances, broken claim/receipt links, payment history conflicts, and unresolved ownership reviews.</div><div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" data-fliq="run-diagnostics">Run Diagnostics</button></div></div>`;const pill=r.status==='PASS'?'green':r.status==='FAIL'?'red':'gold';return `<div class="fliq-section"><div class="fliq-section-title"><span>Diagnostics / Health Check</span><span class="fliq-pill ${pill}">${r.status==='NEW'?'READY TO PAY':r.status==='ALREADY_PAID'?'ALREADY PAID':'NEEDS REVIEW'}</span></div><div class="fliq-muted">Last run: ${esc(fmt(r.runAt))} · ${r.failCount} failure(s) · ${r.warnCount} warning(s)</div><div class="fliq-list" style="margin-top:8px">${r.checks.map(c=>`<div class="fliq-list-item"><div class="fliq-item-top"><b>${esc(c.name)}</b><span class="fliq-pill ${c.severity==='PASS'?'green':c.severity==='FAIL'?'red':'gold'}">${esc(c.severity)}</span></div><div class="fliq-muted" style="margin-top:4px">${esc(c.detail)}</div></div>`).join('')}</div><div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" data-fliq="run-diagnostics">Run Again</button></div></div>`;}
+function diagnosticsHtml(){const r=healthReport;if(!r)return `<div class="fliq-section"><div class="fliq-section-title"><span>Diagnostics / Health Check</span><span class="fliq-pill">NOT RUN</span></div><div class="fliq-muted">Read-only checks for duplicate IDs, impossible inventory balances, broken claim/receipt links, payment history conflicts, and unresolved ownership reviews.</div><div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" data-fliq="run-diagnostics">Run Diagnostics</button></div></div>`;const pill=r.status==='PASS'?'green':r.status==='FAIL'?'red':'gold';return `<div class="fliq-section"><div class="fliq-section-title"><span>Diagnostics / Health Check</span><span class="fliq-pill ${pill}">${esc(r.status)}</span></div><div class="fliq-muted">Last run: ${esc(fmt(r.runAt))} · ${r.failCount} failure(s) · ${r.warnCount} warning(s)</div><div class="fliq-list" style="margin-top:8px">${r.checks.map(c=>`<div class="fliq-list-item"><div class="fliq-item-top"><b>${esc(c.name)}</b><span class="fliq-pill ${c.severity==='PASS'?'green':c.severity==='FAIL'?'red':'gold'}">${esc(c.severity)}</span></div><div class="fliq-muted" style="margin-top:4px">${esc(c.detail)}</div></div>`).join('')}</div><div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" data-fliq="run-diagnostics">Run Again</button></div></div>`;}
 function movementAllocations(m){return (m&&Array.isArray(m.allocations)?m.allocations:[]).filter(a=>a&&a.status!=='VOID'&&a.sourceType!=='INFERRED_PERSONAL');}
 
 function makeClaim(m,a,mvEach){if(a.owner!==P||!a.qty)return null;const paid=a.costBasisKnown?Number(a.costEach||0):0,owedEach=a.costBasisKnown?Math.max(paid,mvEach):mvEach,c={id:uid('CLM'),movementId:m.id,itemId:m.itemId,itemName:m.itemName,qty:Number(a.qty),paidEach:paid,costBasisKnown:a.costBasisKnown===true,mvEachFrozen:mvEach,amount:Math.round(owedEach*Number(a.qty)),status:'OPEN',createdAt:new Date().toISOString(),submittedAt:'',reimbursedAt:'',voidedAt:'',voidReason:''};state.claims.push(c);return c;}
