@@ -22,7 +22,7 @@ s=s.replace('waiting for classification.','waiting for you to identify what it i
 s=s.replace('Open + submitted','Waiting to be paid',1)
 
 # Remove the temporary one-time Display correction from normal Inventory UI.
-s,n=re.subn(r'<div class=\\"fliq-section\\"><div class=\\"fliq-section-title\\"><span>Existing Display Correction</span>.*?Correct Personal → Existing Display</button></div></div>', '', s, count=1, flags=re.S)
+s,n=re.subn(r'<div class="fliq-section"><div class="fliq-section-title"><span>Existing Display Correction</span>.*?Correct Personal → Existing Display</button></div></div>', '', s, count=1, flags=re.S)
 if n!=1: raise SystemExit('Display correction UI not found')
 
 # Make Display wording easier to understand.
@@ -31,10 +31,9 @@ s=s.replace('Add non-whitelisted Display item','Add another Display item to trac
 s=s.replace('Faction-owned when present in Display','Treated as faction-owned while tracked in Display',1)
 
 # Reimbursement page wording.
-old="function claimsHtml(){const cs=state.claims.filter(c=>c.status!=='VOID').sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)),open=cs.filter(c=>c.status==='OPEN'||c.status==='SUBMITTED'),paid=cs.filter(c=>c.status==='REIMBURSED');return `"
-if old not in s: raise SystemExit('claimsHtml anchor missing')
+if 'function claimsHtml()' not in s: raise SystemExit('claimsHtml anchor missing')
 s=s.replace('<span>Awaiting Reimbursement</span>','<span>Money Owed to You</span>',1)
-s=s.replace('<div class=\\"fliq-muted\\">${esc(c.id)}</div>','<div class=\\"fliq-muted\\">Reimbursement ID: ${esc(c.id)}</div>',1)
+s=s.replace('<div class="fliq-muted">${esc(c.id)}</div>','<div class="fliq-muted">Reimbursement ID: ${esc(c.id)}</div>',1)
 s=s.replace("${esc(c.status)}","${c.status==='SUBMITTED'?'SENT TO LEADERSHIP':'READY'}",1)
 s=s.replace('MV frozen: ${money(c.mvEachFrozen)} ea','Value used: ${money(c.mvEachFrozen)} each',1)
 s=s.replace(" · Paid '+money(c.paidEach)+' ea"," · You paid '+money(c.paidEach)+' each",1)
@@ -46,9 +45,9 @@ s=s.replace('Paste the leadership Discord reimbursement receipt','Paste the paym
 s=s.replace('Reimbursement History','Paid Reimbursements',1)
 s=s.replace('No reimbursements marked received yet.','No reimbursements have been marked paid yet.',1)
 
-# Compact, plain-English member receipt. Internal payload remains unchanged.
-receipt="""function movementReceipt(p){const l=['**FACTION LEDGER IQ — LEADERSHIP RECEIPT**','',`Player: ${p.player.name||'Unknown'}${p.player.id?' ['+p.player.id+']':''}`,p.factionName?'Faction: '+p.factionName:'',`Receipt: \\`${p.batchId}\\``,''].filter(x=>x!==undefined);p.movements.forEach(m=>{const cs=p.claims.filter(c=>c.movementId===m.movementId),amt=cs.reduce((n,c)=>n+Number(c.amount||0),0);l.push(`**${m.itemName} ×${Number(m.qty||0).toLocaleString()}**`);if(cs.length){const rate=cs.length===1?Number(cs[0].amount||0)/Math.max(1,Number(cs[0].qty||1)):0;if(rate)l.push('Cost used: '+money(rate)+' each');l.push('Amount owed: **'+money(amt)+'**','Reimbursement ID'+(cs.length>1?'s':'')+': '+cs.map(c=>'`'+c.id+'`').join(', '));}else{l.push('Amount owed: **$0**');}l.push('');});l.push('**TOTAL OWED:** '+money(p.claims.reduce((n,c)=>n+Number(c.amount||0),0)),'','FLIQ-AUDIT:'+encodePayload(p));return l.join('\\n');}"""
-s,n=re.subn(r"function movementReceipt\(p\)\{.*?\n\}\nfunction generateReceipt",receipt+'\nfunction generateReceipt',s,count=1,flags=re.S)
+# Compact member receipt: item, quantity, cost used, amount owed, and reimbursement ID.
+receipt="""function movementReceipt(p){const l=['**FACTION LEDGER IQ — LEADERSHIP RECEIPT**','',`Player: ${p.player.name||'Unknown'}${p.player.id?' ['+p.player.id+']':''}`,p.factionName?'Faction: '+p.factionName:'',`Receipt: \\`${p.batchId}\\``,''].filter(x=>x!==undefined);p.movements.forEach(m=>{const cs=p.claims.filter(c=>c.movementId===m.movementId),amt=cs.reduce((n,c)=>n+Number(c.amount||0),0);l.push(`**${m.itemName} ×${Number(m.qty||0).toLocaleString()}**`);if(cs.length){const rate=cs.length===1?Number(cs[0].amount||0)/Math.max(1,Number(cs[0].qty||1)):0;if(rate)l.push('Cost used: '+money(rate)+' each');l.push('Amount owed: **'+money(amt)+'**','Reimbursement ID'+(cs.length>1?'s':'')+': '+cs.map(c=>'`'+c.id+'`').join(', '));}else l.push('Amount owed: **$0**');l.push('');});l.push('**TOTAL OWED:** '+money(p.claims.reduce((n,c)=>n+Number(c.amount||0),0)),'','FLIQ-AUDIT:'+encodePayload(p));return l.join('\\n');}"""
+s,n=re.subn(r"function movementReceipt\(p\)\{.*?\}\nfunction generateReceipt",receipt+'\nfunction generateReceipt',s,count=1,flags=re.S)
 if n!=1: raise SystemExit('movementReceipt replace failed')
 s=s.replace('No unreported movements','No new item activity needs a receipt',1)
 s=s.replace("showReceipt('Discord Movement Receipt',text)","showReceipt('Leadership Receipt',text)")
@@ -76,14 +75,14 @@ s=s.replace('TOTAL REIMBURSED','TOTAL PAID')
 s=s.replace("toast('Claim marked reimbursed')","toast('Reimbursement marked paid')",1)
 s=s.replace("toast('Audit failed: '","toast('Receipt check failed: '",1)
 
-# Backup wording and hide destructive tools inside a collapsed Advanced Tools section.
+# Backup wording and hide destructive controls in a collapsed Advanced Tools section.
 s=s.replace('Backups include LedgerIQ inventory, movements, claims, receipts, raffle data, audit history, and settings.','Backups include your tracked items, item activity, reimbursements, receipts, raffle data, leadership payment history, and settings.',1)
-pat=r'<div class=\\"fliq-section\\"><div class=\\"fliq-section-title\\"><span>Recovery / Reset</span></div>(.*?)</div><div class=\\"fliq-actions\\"><button class=\\"fliq-btn fliq-btn-primary\\" data-fliq=\\"save-settings\\">'
+pat=r'<div class="fliq-section"><div class="fliq-section-title"><span>Recovery / Reset</span></div>(.*?)</div><div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" data-fliq="save-settings">'
 m=re.search(pat,s,flags=re.S)
 if not m: raise SystemExit('Recovery section not found')
-advanced='<details class=\\"fliq-section\\"><summary style=\\"font-weight:800;cursor:pointer\\">Advanced Tools</summary><div class=\\"fliq-muted\\" style=\\"margin-top:7px\\">Only use these for troubleshooting or recovery.</div>'+m.group(1)+'</details><div class=\\"fliq-actions\\"><button class=\\"fliq-btn fliq-btn-primary\\" data-fliq=\\"save-settings\\">'
+advanced='<details class="fliq-section"><summary style="font-weight:800;cursor:pointer">Advanced Tools</summary><div class="fliq-muted" style="margin-top:7px">Only use these for troubleshooting or recovery.</div>'+m.group(1)+'</details><div class="fliq-actions"><button class="fliq-btn fliq-btn-primary" data-fliq="save-settings">'
 s=s[:m.start()]+advanced+s[m.end():]
 s=s.replace('Clear & Rebuild Cache only refreshes market/catalog data and does not touch inventory, claims, receipts, payments, or history. Reset Ledger Data clears ledger records but preserves Profile, API settings, and Whitelist. A local undo snapshot is created first.','Clear & Rebuild Cache refreshes item/market information only. Reset Ledger Data clears tracked item activity and reimbursements but keeps your profile, API settings, and whitelist. LedgerIQ saves a recovery copy first.',1)
 
 p.write_text(s)
-# trigger
+# trigger2
