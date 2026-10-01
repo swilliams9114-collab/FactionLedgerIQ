@@ -41,3 +41,4 @@ if needle not in s: raise SystemExit('action anchor missing')
 s=s.replace(needle,repl,1)
 
 p.write_text(s)
+# trigger
