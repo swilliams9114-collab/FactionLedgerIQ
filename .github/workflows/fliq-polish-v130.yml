@@ -1,0 +1,16 @@
+name: FLIQ polish v1.3.0
+on: [push]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Run FactionLedgerIQ polish patch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python tools/patch_polish_v130.py
+      - run: node --check FactionLedgerIQ.user.js
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: Polish FactionLedgerIQ wording and leadership UI
+          file_pattern: FactionLedgerIQ.user.js
