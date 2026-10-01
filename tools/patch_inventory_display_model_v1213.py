@@ -49,3 +49,4 @@ if needle not in s: raise SystemExit('add-opening action anchor missing')
 s=s.replace(needle,insert,1)
 
 p.write_text(s)
+# trigger
