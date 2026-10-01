@@ -12,3 +12,4 @@ insert="if(a==='tab'){activeTab=t.dataset.tab||'home';render();return;}if(a==='c
 if needle not in s: raise SystemExit('action tab anchor not found')
 s=s.replace(needle,insert,1)
 p.write_text(s)
+# trigger
