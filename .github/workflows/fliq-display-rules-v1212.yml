@@ -1,0 +1,16 @@
+name: FLIQ Display rules v1.2.12
+on: [push]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Run FactionLedgerIQ Display rules patch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python tools/patch_display_rules_v1212.py
+      - run: node --check FactionLedgerIQ.user.js
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: Apply faction-owned Display Case rules
+          file_pattern: FactionLedgerIQ.user.js
