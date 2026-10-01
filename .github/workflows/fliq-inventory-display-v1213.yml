@@ -1,0 +1,16 @@
+name: FLIQ Inventory Display v1.2.13
+on: [push]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Run FactionLedgerIQ inventory display patch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python tools/patch_inventory_display_model_v1213.py
+      - run: node --check FactionLedgerIQ.user.js
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: Refine personal and Display tracking rules
+          file_pattern: FactionLedgerIQ.user.js
