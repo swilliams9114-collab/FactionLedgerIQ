@@ -1,0 +1,16 @@
+name: FLIQ Discord compact receipts v1.4.4
+on: [push]
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Run v1.4.4 compact receipt patch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: python tools/patch_discord_compact_v144.py
+      - run: node --check FactionLedgerIQ.user.js
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'FactionLedgerIQ v1.4.4 Discord compact receipts'
+          file_pattern: 'FactionLedgerIQ.user.js'
