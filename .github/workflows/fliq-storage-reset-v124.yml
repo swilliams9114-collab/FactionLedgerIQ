@@ -1,0 +1,18 @@
+name: FLIQ storage reset v1.2.4
+on: [push]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Run FactionLedgerIQ storage reset patch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python tools/patch_storage_reset_v124.py
+      - run: node --check FactionLedgerIQ.user.js
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add FactionLedgerIQ.user.js
+          git commit -m "Fix reset recovery storage quota" || exit 0
+          git push
