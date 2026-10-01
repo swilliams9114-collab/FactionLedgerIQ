@@ -16,3 +16,4 @@ jobs:
           git add FactionLedgerIQ.user.js
           git commit -m "Add safe reset and recovery controls" || exit 0
           git push
+# retrigger after patch-target fix
