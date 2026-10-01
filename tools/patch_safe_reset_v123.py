@@ -27,9 +27,9 @@ new_settings="<div class=\"fliq-section\"><div class=\"fliq-section-title\"><spa
 if old_settings not in s: raise SystemExit('settings end anchor not found')
 s=s.replace(old_settings,new_settings,1)
 
-old_action="if(a==='undo-restore'){try{undoLastRestore();}catch(e){toast(String(e&&e.message||e));}return;}if(a==='sync')"
-new_action="if(a==='undo-restore'){try{undoLastRestore();}catch(e){toast(String(e&&e.message||e));}return;}if(a==='clear-cache'){try{t.disabled=true;await clearRefreshableCache();}catch(e){toast(String(e&&e.message||e));t.disabled=false;}return;}if(a==='reset-ledger'){try{resetLedgerDataFromUi();}catch(e){toast(String(e&&e.message||e));}return;}if(a==='undo-ledger-reset'){try{undoLastLedgerReset();}catch(e){toast(String(e&&e.message||e));}return;}if(a==='sync')"
-if old_action not in s: raise SystemExit('action anchor not found')
-s=s.replace(old_action,new_action,1)
+insert="if(a==='clear-cache'){try{t.disabled=true;await clearRefreshableCache();}catch(e){toast(String(e&&e.message||e));t.disabled=false;}return;}if(a==='reset-ledger'){try{resetLedgerDataFromUi();}catch(e){toast(String(e&&e.message||e));}return;}if(a==='undo-ledger-reset'){try{undoLastLedgerReset();}catch(e){toast(String(e&&e.message||e));}return;}"
+needle="if(a==='sync'){t.disabled=true;await poll(true);return;}"
+if needle not in s: raise SystemExit('sync action anchor not found')
+s=s.replace(needle,insert+needle,1)
 
 p.write_text(s)
