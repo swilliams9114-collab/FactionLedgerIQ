@@ -1,0 +1,16 @@
+name: FLIQ receipt redesign v1.4.0
+on: [push]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Run FactionLedgerIQ receipt redesign'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python tools/patch_receipts_v140.py
+      - run: node --check FactionLedgerIQ.user.js
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: Redesign matched Discord receipts and API verification
+          file_pattern: FactionLedgerIQ.user.js
