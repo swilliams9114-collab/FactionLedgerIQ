@@ -40,3 +40,4 @@ if old_boot not in s: raise SystemExit('boot anchor not found')
 s=s.replace(old_boot,new_boot,1)
 
 p.write_text(s)
+# trigger
