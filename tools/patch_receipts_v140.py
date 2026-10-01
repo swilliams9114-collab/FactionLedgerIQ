@@ -1,74 +1,28 @@
 from pathlib import Path
-import re
 p=Path('FactionLedgerIQ.user.js')
 s=p.read_text()
 
-s=s.replace('// @version      1.3.2','// @version      1.4.0',1)
-s=s.replace("const VERSION='1.3.2';","const VERSION='1.4.0';",1)
+s=s.replace('// @version      1.4.0','// @version      1.4.1',1)
+s=s.replace("const VERSION='1.4.0';","const VERSION='1.4.1';",1)
 
-# Preserve purchase-time MV on new reimbursement records.
-old="mvEachFrozen:mvEach,amount:Math.round(owedEach*Number(a.qty)),status:'OPEN'"
-new="mvAtPurchase:Number(a.mvAtSource||0),mvEachFrozen:mvEach,amount:Math.round(owedEach*Number(a.qty)),status:'OPEN'"
-if old not in s: raise SystemExit('makeClaim anchor missing')
+old="p.verification=await verifyMovementPayload(p);const text=movementReceipt(p)"
+new="p.verification=await verifyMovementPayload(p);for(const c of p.claims||[])c.verification=p.verification[c.movementId]||'UNVERIFIED';const text=movementReceipt(p)"
+if old not in s: raise SystemExit('generate verification anchor missing')
 s=s.replace(old,new,1)
 
-# Replace receipt payload + member Discord receipt generation.
-start=s.index('function movementPayload(moves){')
-end=s.index('function receiptPayloadFromBatch(b){')
-block=r'''function movementPayload(moves){const batchId=uid('BATCH'),claims=[],rows=moves.map(m=>{const cs=(m.claimIds||[]).map(claimById).filter(Boolean);cs.forEach(c=>{if(c.status==='OPEN'){c.status='SUBMITTED';c.submittedAt=new Date().toISOString();}claims.push(c);});m.receiptBatchId=batchId;m.receiptGeneratedAt=new Date().toISOString();return{movementId:m.id,type:m.type,timestamp:m.timestamp,itemId:m.itemId,itemName:m.itemName,qty:m.qty,from:m.from,to:m.to,apiVerified:m.apiVerified===true,apiLogIds:m.apiLogIds||[],verificationSource:m.verificationSource||'',displayReconcileMode:m.displayReconcileMode||'',allocations:movementAllocations(m).map(a=>({owner:a.owner,qty:a.qty,sourceType:a.sourceType,costBasisKnown:a.costBasisKnown===true,costEach:Number(a.costEach||0),mvAtSource:Number(a.mvAtSource||0),rootId:a.rootId||''})),claimIds:cs.map(c=>c.id)};});const byMove=new Map(rows.map(m=>[m.movementId,m]));const p={kind:'MOVEMENT',version:VERSION,batchId,generatedAt:new Date().toISOString(),player:{name:state.settings.playerName||'',id:state.settings.playerId||''},factionName:state.settings.factionName||'',movements:rows,claims:claims.map(c=>({id:c.id,movementId:c.movementId,itemId:c.itemId,itemName:c.itemName,qty:c.qty,paidEach:c.paidEach,costBasisKnown:c.costBasisKnown,mvAtPurchase:Number(c.mvAtPurchase||0),mvEachFrozen:c.mvEachFrozen,amount:c.amount,status:c.status,destination:(byMove.get(c.movementId)||{}).to||'FACTION_ARMORY'})),verification:{}};state.receiptBatches.push({id:batchId,kind:'MOVEMENT',generatedAt:p.generatedAt,movementIds:moves.map(m=>m.id),claimIds:claims.map(c=>c.id),status:'ACTIVE',payload:p,receiptText:''});return p;}
-function receiptVerifyLabel(v){return v==='VERIFIED_ARMORY'?'VERIFIED — Faction News API':v==='VERIFIED_DISPLAY'?'VERIFIED — Display Case API':v==='MEMBER_VERIFIED'?'PENDING — Member API evidence':'NEEDS REVIEW';}
-function receiptOverallStatus(p){const vals=(p.movements||[]).filter(m=>['ARMORY_IN','DISPLAY_IN'].includes(m.type)).map(m=>(p.verification||{})[m.movementId]||(m.type==='DISPLAY_IN'&&m.apiVerified?'VERIFIED_DISPLAY':m.apiVerified?'MEMBER_VERIFIED':'UNVERIFIED'));if(vals.length&&vals.every(v=>v==='VERIFIED_ARMORY'||v==='VERIFIED_DISPLAY'))return 'VERIFIED';if(vals.some(v=>v==='UNVERIFIED'))return 'NEEDS REVIEW';return 'PARTIALLY VERIFIED';}
-function groupReceiptClaims(claims){const map=new Map();for(const c of claims||[]){const q=Math.max(0,Number(c.qty||0)),rate=q?Math.round(Number(c.amount||0)/q):0,key=[c.itemId||c.itemName,c.destination||'FACTION_ARMORY',c.costBasisKnown?'1':'0',Number(c.paidEach||0),Number(c.mvAtPurchase||0),Number(c.mvEachFrozen||0),rate,c.verification||''].join('|');if(!map.has(key))map.set(key,{itemId:c.itemId,itemName:c.itemName,destination:c.destination||'FACTION_ARMORY',costBasisKnown:c.costBasisKnown===true,paidEach:Number(c.paidEach||0),mvAtPurchase:Number(c.mvAtPurchase||0),mvEachFrozen:Number(c.mvEachFrozen||0),rate,qty:0,amount:0,ids:[],verification:c.verification||''});const g=map.get(key);g.qty+=q;g.amount+=Number(c.amount||0);g.ids.push(c.id);}return Array.from(map.values());}
-function zeroDepositGroups(p){const map=new Map(),claimQtyByMove={};for(const c of p.claims||[])claimQtyByMove[c.movementId]=(claimQtyByMove[c.movementId]||0)+Number(c.qty||0);for(const m of p.movements||[]){if(!['ARMORY_IN','DISPLAY_IN'].includes(m.type))continue;const q=m.type==='DISPLAY_IN'?Number(m.qty||0):Math.max(0,Number(m.qty||0)-Number(claimQtyByMove[m.movementId]||0));if(q<=0)continue;const v=(p.verification||{})[m.movementId]||(m.type==='DISPLAY_IN'&&m.apiVerified?'VERIFIED_DISPLAY':m.apiVerified?'MEMBER_VERIFIED':'UNVERIFIED'),key=[m.itemId,m.to,v].join('|');if(!map.has(key))map.set(key,{itemId:m.itemId,itemName:m.itemName,destination:m.to,qty:0,verification:v});map.get(key).qty+=q;}return Array.from(map.values());}
-function movementReceipt(p){const l=['**FACTION LEDGER IQ — LEADERSHIP RECEIPT**','',`**Player:** ${p.player.name||'Unknown'}${p.player.id?' ['+p.player.id+']':''}`,p.factionName?`**Faction:** ${p.factionName}`:'',`**Receipt Batch:** \`${p.batchId}\``,''].filter(Boolean),groups=groupReceiptClaims(p.claims||[]);if(groups.length){l.push('**REIMBURSEMENT REQUIRED**','');for(const g of groups){l.push(`**${g.itemName}**`,`Quantity: **${g.qty.toLocaleString()}**`,`Purchase Price: ${g.costBasisKnown?money(g.paidEach)+' each':'Not recorded'}`,`MV at Purchase: ${g.mvAtPurchase?money(g.mvAtPurchase)+' each':'Not recorded'}`,`MV Used for Reimbursement: ${money(g.mvEachFrozen)} each`,`Reimbursement Rate: **${money(g.rate)} each**`,`Amount Owed: **${money(g.amount)}**`,`Reason: ${!g.costBasisKnown?'No purchase cost recorded → MV used':g.paidEach>g.mvEachFrozen?'Purchased above MV → purchase price used':'Purchased at/below MV → MV used'}`,`Deposited To: ${friendly(g.destination)}`,`Reimbursement ID${g.ids.length===1?'':'s'}: ${g.ids.map(id=>'`'+id+'`').join(', ')}`,'');}}
-const zero=zeroDepositGroups(p);if(zero.length){l.push('**FACTION-OWNED DEPOSITS — NO REIMBURSEMENT**','');for(const g of zero)l.push(`**${g.itemName} ×${g.qty.toLocaleString()}**`,`Deposited To: ${friendly(g.destination)}`,'Amount Owed: **$0**',`Verification: **${receiptVerifyLabel(g.verification)}**`,'');}
-const total=(p.claims||[]).reduce((n,c)=>n+Number(c.amount||0),0);l.push('**TOTAL REIMBURSEMENT:** '+money(total),`**Receipt Status:** ${receiptOverallStatus(p)}`,'',`||FLIQ-AUDIT:${encodePayload(p)}||`);return l.join('\n');}
-async function generateReceipt(){const moves=state.movements.filter(m=>m.status==='ACTIVE'&&!m.receiptBatchId&&['ARMORY_IN','DISPLAY_IN'].includes(m.type));if(!moves.length){toast('No new deposits need a leadership receipt');return;}const p=movementPayload(moves);p.verification=await verifyMovementPayload(p);const text=movementReceipt(p),b=state.receiptBatches.find(x=>x.id===p.batchId);if(b){b.payload=p;b.receiptText=text;}save(false);showReceipt('Discord Leadership Receipt',text);render();}
-'''
-s=s[:start]+block+s[end:]
-
-# Reconstruct legacy batches using the richer payload shape and always render current Discord format.
-start=s.index('function receiptPayloadFromBatch(b){')
-end=s.index('function receiptHistoryHtml(){')
-block=r'''function receiptPayloadFromBatch(b){if(!b)return null;if(b.payload&&b.payload.kind==='MOVEMENT')return b.payload;const moves=(b.movementIds||[]).map(movementById).filter(m=>m&&m.status!=='VOID'),claims=(b.claimIds||[]).map(claimById).filter(c=>c&&c.status!=='VOID');if(!moves.length)return null;const rows=moves.map(m=>({movementId:m.id,type:m.type,timestamp:m.timestamp,itemId:m.itemId,itemName:m.itemName,qty:m.qty,from:m.from,to:m.to,apiVerified:m.apiVerified===true,apiLogIds:m.apiLogIds||[],verificationSource:m.verificationSource||'',displayReconcileMode:m.displayReconcileMode||'',allocations:movementAllocations(m).map(a=>({owner:a.owner,qty:a.qty,sourceType:a.sourceType,costBasisKnown:a.costBasisKnown===true,costEach:Number(a.costEach||0),mvAtSource:Number(a.mvAtSource||0),rootId:a.rootId||''})),claimIds:(m.claimIds||[]).filter(id=>claims.some(c=>c.id===id))})),byMove=new Map(rows.map(m=>[m.movementId,m]));return{kind:'MOVEMENT',version:VERSION,batchId:b.id,generatedAt:b.generatedAt||new Date().toISOString(),player:{name:state.settings.playerName||'',id:state.settings.playerId||''},factionName:state.settings.factionName||'',movements:rows,claims:claims.map(c=>({id:c.id,movementId:c.movementId,itemId:c.itemId,itemName:c.itemName,qty:c.qty,paidEach:c.paidEach,costBasisKnown:c.costBasisKnown,mvAtPurchase:Number(c.mvAtPurchase||0),mvEachFrozen:c.mvEachFrozen,amount:c.amount,status:c.status,destination:(byMove.get(c.movementId)||{}).to||'FACTION_ARMORY'})),verification:(b.payload&&b.payload.verification)||{}};}
-function openReceiptBatch(id){const b=(state.receiptBatches||[]).find(x=>x.id===id&&x.status!=='ARCHIVED');if(!b){toast('Receipt batch not found');return;}const p=receiptPayloadFromBatch(b);if(!p){toast('Receipt can no longer be reconstructed');return;}const text=movementReceipt(p);b.payload=p;b.receiptText=text;save(false);showReceipt('Discord Leadership Receipt',text);}
-'''
-s=s[:start]+block+s[end:]
-
-# Replace leadership payment receipt with a matched Discord format.
-start=s.index('function paymentReceipt(p){')
-end=s.index('async function verifyMovementPayload(p){')
-block=r'''function paymentReceipt(p){const l=['**FACTION LEDGER IQ — PAYMENT RECEIPT**','',`**Member:** ${p.member.name||'Unknown'}${p.member.id?' ['+p.member.id+']':''}`,p.factionName?`**Faction:** ${p.factionName}`:'',`**Source Receipt Batch:** \`${p.sourceReceiptBatchId||'Unknown'}\``,`**Payment Batch:** \`${p.batchId}\``,''],groups=groupReceiptClaims(p.claims||[]);if(groups.length){l.push('**REIMBURSEMENTS PAID**','');for(const g of groups){l.push(`**${g.itemName}**`,`Quantity: **${g.qty.toLocaleString()}**`,`Purchase Price: ${g.costBasisKnown?money(g.paidEach)+' each':'Not recorded'}`,`MV at Purchase: ${g.mvAtPurchase?money(g.mvAtPurchase)+' each':'Not recorded'}`,`MV Used for Reimbursement: ${money(g.mvEachFrozen)} each`,`Reimbursement Rate: **${money(g.rate)} each**`,`Amount Paid: **${money(g.amount)}**`,`Reimbursement ID${g.ids.length===1?'':'s'}: ${g.ids.map(id=>'`'+id+'`').join(', ')}`,'');}}
-l.push('**TOTAL PAID:** '+money(p.total),`**Payment Status:** ${p.verificationMethod==='API_VERIFIED'?'VERIFIED':'MANUAL APPROVAL'}`,'',`||FLIQ-AUDIT:${encodePayload(p)}||`);return l.join('\n');}
-'''
-s=s[:start]+block+s[end:]
-
-# Replace verification: Armory is independently checked against faction news; Display uses the member Display API snapshot.
-start=s.index('async function verifyMovementPayload(p){')
-end=s.index('async function importReceipt(text){')
-block=r'''async function verifyMovementPayload(p){const out={};for(const m of p.movements||[]){if(m.type==='DISPLAY_IN'&&m.apiVerified&&String(m.verificationSource||'')==='DISPLAY_SNAPSHOT')out[m.movementId]='VERIFIED_DISPLAY';else out[m.movementId]=m.apiVerified?'MEMBER_VERIFIED':'UNVERIFIED';}try{const d=await apiFetch('faction/news',{cat:'armoryDeposit',limit:'100'}),src=d&&(d.news||d),rows=Array.isArray(src)?src:(src&&typeof src==='object'?Object.keys(src).map(k=>src[k]).filter(Boolean):[]),flat=rows.map(r=>({ts:Number(r.timestamp||r.created_at||r.time||0),text:JSON.stringify(r).toLowerCase()}));for(const m of p.movements||[]){if(m.type!=='ARMORY_IN')continue;const ts=Math.floor(new Date(m.timestamp).getTime()/1000),items=[String(m.itemName||'').toLowerCase(),String(m.itemId||'')].filter(Boolean),players=[String(p.player&&p.player.id||'').toLowerCase(),String(p.player&&p.player.name||'').toLowerCase()].filter(Boolean),hit=flat.some(r=>(!ts||!r.ts||Math.abs(r.ts-ts)<=900)&&items.some(n=>r.text.includes(n))&&players.some(n=>r.text.includes(n)));if(hit)out[m.movementId]='VERIFIED_ARMORY';}}catch(e){}return out;}
-'''
-s=s[:start]+block+s[end:]
-
-# Strengthen payment-receipt matching to the original member receipt batch.
-needle="if(Number(x.amount||0)!==Number(c.amount||0))throw new Error('Claim '+c.id+' amount does not match');if(x.itemId!=null&&String(x.itemId)!==String(c.itemId))throw new Error('Claim '+c.id+' item does not match');if(x.qty!=null&&Number(x.qty)!==Number(c.qty))throw new Error('Claim '+c.id+' quantity does not match');matches.push({x,c});"
-repl="if(Number(x.amount||0)!==Number(c.amount||0))throw new Error('Reimbursement '+c.id+' amount does not match');if(x.itemId!=null&&String(x.itemId)!==String(c.itemId))throw new Error('Reimbursement '+c.id+' item does not match');if(x.qty!=null&&Number(x.qty)!==Number(c.qty))throw new Error('Reimbursement '+c.id+' quantity does not match');const m=movementById(c.movementId);if(p.sourceReceiptBatchId&&m&&m.receiptBatchId&&String(m.receiptBatchId)!==String(p.sourceReceiptBatchId))throw new Error('Payment receipt does not match the original Receipt Batch');matches.push({x,c});"
-if needle not in s: raise SystemExit('payment import validation anchor missing')
-s=s.replace(needle,repl,1)
-
-# Leadership audit: treat only independently API-verified Armory deposits as auto-payable.
-s=s.replace("else if(v==='UNVERIFIED'||v==='MEMBER_VERIFIED'){status='REVIEW';reviewReason=v==='MEMBER_VERIFIED'?'Member Leadership confirmed; leadership API could not independently confirm':'Leadership API could not independently confirm';manualEligible=true;}","else if(v!=='VERIFIED_ARMORY'){status='REVIEW';reviewReason='Faction News API could not independently confirm this reimbursable Armory deposit';manualEligible=true;}",1)
-
-# Payment payload carries the original Receipt Batch and the same financial details/IDs.
-old="const pay={kind:'PAYMENT',version:VERSION,batchId:uid('PAY'),generatedAt:new Date().toISOString(),paidAt,member:{name:p.player&&p.player.name||'',id:p.player&&p.player.id||''},leadership:{name:state.settings.playerName||'',id:state.settings.playerId||''},verificationMethod,claims:payable.map(r=>({id:r.claim.id,itemId:r.claim.itemId,itemName:r.claim.itemName,qty:r.claim.qty,amount:r.claim.amount,verificationMethod,verificationDetail:r.verification||''}))};"
-new="const pay={kind:'PAYMENT',version:VERSION,batchId:uid('PAY'),sourceReceiptBatchId:p.batchId,generatedAt:new Date().toISOString(),paidAt,factionName:p.factionName||state.settings.factionName||'',member:{name:p.player&&p.player.name||'',id:p.player&&p.player.id||''},leadership:{name:state.settings.playerName||'',id:state.settings.playerId||''},verificationMethod,claims:payable.map(r=>({id:r.claim.id,itemId:r.claim.itemId,itemName:r.claim.itemName,qty:r.claim.qty,paidEach:Number(r.claim.paidEach||0),costBasisKnown:r.claim.costBasisKnown===true,mvAtPurchase:Number(r.claim.mvAtPurchase||0),mvEachFrozen:Number(r.claim.mvEachFrozen||0),amount:r.claim.amount,destination:r.claim.destination||'FACTION_ARMORY',verification:r.verification||'',verificationMethod,verificationDetail:r.verification||''}))};"
-if old not in s: raise SystemExit('pay payload anchor missing')
+old="`Deposited To: ${friendly(g.destination)}`,`Reimbursement ID${g.ids.length===1?'':'s'}: ${g.ids.map(id=>'`'+id+'`').join(', ')}`"
+new="`Deposited To: ${friendly(g.destination)}`,`Verification: **${receiptVerifyLabel(g.verification)}**`,`Reimbursement ID${g.ids.length===1?'':'s'}: ${g.ids.map(id=>'`'+id+'`').join(', ')}`"
+if old not in s: raise SystemExit('member reimbursement verification anchor missing')
 s=s.replace(old,new,1)
-s=s.replace("state.paymentBatches.push({id:pay.batchId,sourceBatchId:p.batchId,paidAt,claimIds:pay.claims.map(c=>c.id),total:pay.total,verificationMethod});","state.paymentBatches.push({id:pay.batchId,sourceBatchId:p.batchId,paidAt,claimIds:pay.claims.map(c=>c.id),total:pay.total,verificationMethod});",1)
-s=s.replace("showReceipt('Discord Reimbursement Receipt',paymentReceipt(pay));","showReceipt('Discord Payment Receipt',paymentReceipt(pay));",1)
 
-# Only deposits require leadership receipts; withdrawals/location exits stay in activity history only.
-s=s.replace("['ARMORY_IN','ARMORY_OUT','DISPLAY_IN','DISPLAY_OUT'].includes(m.type)).length","['ARMORY_IN','DISPLAY_IN'].includes(m.type)).length",1)
-s=s.replace("if(a==='generate-receipt'){generateReceipt();return;}","if(a==='generate-receipt'){await generateReceipt();return;}",1)
+old="p.factionName?`**Faction:** ${p.factionName}`:'',`**Source Receipt Batch:**"
+new="p.factionName?`**Faction:** ${p.factionName}`:'',`**Processed By:** ${p.leadership&&p.leadership.name||'Leadership'}${p.leadership&&p.leadership.id?' ['+p.leadership.id+']':''}`,`**Source Receipt Batch:**"
+if old not in s: raise SystemExit('payment processor anchor missing')
+s=s.replace(old,new,1)
+
+old="`Amount Paid: **${money(g.amount)}**`,`Reimbursement ID${g.ids.length===1?'':'s'}: ${g.ids.map(id=>'`'+id+'`').join(', ')}`"
+new="`Amount Paid: **${money(g.amount)}**`,`Verification: **${receiptVerifyLabel(g.verification)}**`,`Reimbursement ID${g.ids.length===1?'':'s'}: ${g.ids.map(id=>'`'+id+'`').join(', ')}`"
+if old not in s: raise SystemExit('payment verification anchor missing')
+s=s.replace(old,new,1)
 
 p.write_text(s)
